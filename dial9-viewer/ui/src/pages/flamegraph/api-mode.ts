@@ -156,6 +156,7 @@ export function runApiMode(params: URLSearchParams, els: PageEls): void {
 
   function queryState(): ApiQueryState {
     const band = minimap?.band() ?? { minPollNs: null, maxPollNs: null };
+    const currentParams = new URLSearchParams(window.location.search);
     return {
       dataDir,
       source: { ...source, bucket: scopeBucket || source.bucket },
@@ -171,6 +172,7 @@ export function runApiMode(params: URLSearchParams, els: PageEls): void {
       spanTypeUid: scopeSpanTypeUid,
       minSpanNs: scopeMinSpanNs,
       maxSpanNs: scopeMaxSpanNs,
+      inspect: currentParams.get("inspect_full") || currentParams.get("inspect"),
     };
   }
 
@@ -319,6 +321,16 @@ export function runApiMode(params: URLSearchParams, els: PageEls): void {
   function baseStats(resp: FlamegraphResponse): string {
     const meta = resp.metadata;
     const bits = [`${resp.total_samples.toLocaleString()} samples`];
+    if (
+      "format" in resp.tree &&
+      resp.tree.format === "flat-v1" &&
+      resp.tree.omitted_nodes > 0
+    ) {
+      bits.push(
+        `${resp.tree.nodes.length.toLocaleString()} / ` +
+          `${resp.tree.total_nodes.toLocaleString()} nodes shown`,
+      );
+    }
     if (meta.hosts > 1) bits.push(`${meta.hosts} hosts`);
     if (meta.min_timestamp_ns && meta.max_timestamp_ns) {
       const dur = formatHumanDuration(meta.max_timestamp_ns - meta.min_timestamp_ns);
