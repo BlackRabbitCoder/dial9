@@ -311,7 +311,7 @@ pub struct CpuProfiler {
     /// Original config retained for segment metadata emission.
     config: CpuProfilingConfig,
     /// The effective backend that was selected after Auto resolution.
-    effective_backend: ActiveCpuBackend,
+    active_backend: ActiveCpuBackend,
     /// Whether segment metadata has been emitted yet (emit-once).
     metadata_emitted: bool,
     /// Effective snapshot state, set when `segment_processor()` builds the processor; `None`
@@ -326,7 +326,7 @@ impl std::fmt::Debug for CpuProfiler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CpuProfiler")
             .field("pid", &self.pid)
-            .field("backend", &self.effective_backend)
+            .field("backend", &self.active_backend)
             .finish_non_exhaustive()
     }
 }
@@ -359,14 +359,14 @@ impl CpuProfiler {
         };
         // Ask this sampler, not the process-wide ctimer flag: another
         // profiler's ctimer sets that flag.
-        let effective_backend = sampler.backend();
+        let active_backend = sampler.backend();
         Ok(Self {
             sampler,
             pid: std::process::id(),
             tid_to_name: FxHashMap::default(),
             stopped_tids: Vec::new(),
             config,
-            effective_backend,
+            active_backend,
             metadata_emitted: false,
             kallsyms_snapshot: None,
             samples_seen: 0,
@@ -375,7 +375,7 @@ impl CpuProfiler {
 
     /// Backend selected at start; `Auto` resolves to one of them.
     pub fn active_backend(&self) -> ActiveCpuBackend {
-        self.effective_backend
+        self.active_backend
     }
 
     /// CPU samples from this process drained since start. Updated on the flush
@@ -492,11 +492,11 @@ impl Source for CpuProfiler {
             self.config.frequency_hz.to_string(),
         ));
         // Report the *effective* backend (perf or ctimer), never "auto".
-        // The Auto variant resolves at construction time; self.effective_backend
+        // The Auto variant resolves at construction time; self.active_backend
         // captures the actual selection.
         out.push((
             "cpu.profile.backend".to_string(),
-            self.effective_backend.as_str().to_string(),
+            self.active_backend.as_str().to_string(),
         ));
         // "false": requested, but fell back to live /proc/kallsyms.
         if let Some(active) = self.kallsyms_snapshot {
@@ -510,7 +510,7 @@ impl Source for CpuProfiler {
         // (CLOCK_THREAD_CPUTIME_ID), regardless of what EventSource was
         // originally requested. Report the *effective* source honestly.
         #[allow(unreachable_patterns)]
-        let event_source_name = if self.effective_backend == ActiveCpuBackend::Ctimer {
+        let event_source_name = if self.active_backend == ActiveCpuBackend::Ctimer {
             "sw_cpu_clock"
         } else {
             match self.config.event_source {
