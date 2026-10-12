@@ -437,12 +437,14 @@ export function createActions(store: BrowserStore, els: BrowserEls): BrowserActi
             sampleKeys: null,
           };
         }
+        if (generation !== browseGeneration) return;
         store.update("browse", { status });
         return;
       }
       renderHeatmapState();
       applyPendingSelection();
     } catch (err) {
+      if (generation !== browseGeneration) return;
       store.update("browse", {
         status: {
           visible: true,
@@ -811,8 +813,7 @@ export function createActions(store: BrowserStore, els: BrowserEls): BrowserActi
     }
   }
 
-  // Wipe the browse pane back to its initial empty state; used when
-  // credentials are cleared.
+  // Wipe the browse pane when credentials are cleared or the prefix changes.
   function resetBrowsePane(): void {
     serviceDiscoveryGeneration++;
     browseGeneration++;
@@ -829,10 +830,13 @@ export function createActions(store: BrowserStore, els: BrowserEls): BrowserActi
       fullDomain: null,
       selection: null,
       heatmapVisible: false,
+      warning: null,
       status: {
         visible: true,
         kind: "normal",
-        text: "Select a bucket to find services.",
+        text: els.bucketInput.value.trim()
+          ? "Search to find services."
+          : "Select a bucket to find services.",
         sampleKeys: null,
       },
     });
