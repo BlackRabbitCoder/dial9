@@ -120,8 +120,8 @@ pub struct Sample {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ActiveCpuBackend {
-    /// `perf_event_open`: samples every thread descended from the one that
-    /// started the profiler.
+    /// `perf_event_open`. A `CpuProfiler` on it samples every thread
+    /// descended from the one that started it.
     #[non_exhaustive]
     Perf,
     /// Per-thread CPU timers: samples only threads dial9 tracks.

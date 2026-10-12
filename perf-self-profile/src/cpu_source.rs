@@ -574,8 +574,7 @@ impl SchedProfiler {
     }
 
     /// Scheduler samples drained since start. Updated on the flush thread each
-    /// flush cycle while recording; unchanged while paused. Next to
-    /// [`CpuProfiler::samples_seen`], shows whether scheduler sampling works.
+    /// flush cycle while recording; unchanged while paused.
     pub fn samples_seen(&self) -> u64 {
         self.samples_seen
     }
