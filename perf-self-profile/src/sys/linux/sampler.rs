@@ -7,7 +7,7 @@ use std::io;
 
 use super::ctimer_sampler::CtimerSampler;
 use super::perf_sampler::PerfSamplerImpl;
-use crate::sampler::{ActiveCpuBackend, Sample, SamplerConfig};
+use crate::sampler::{ActiveCpuBackend, EventSource, Sample, SamplerConfig};
 
 pub(super) trait SamplerBackend: Send {
     fn track_current_thread(&mut self) -> io::Result<()>;
@@ -34,15 +34,23 @@ impl std::fmt::Debug for PerfSampler {
 /// `"; <how to allow it>"` when `err` from a bare `perf_event_open` call says
 /// it was denied, else `""`. Ends up in the profiler's start error, and from
 /// there in the trace. Period-mode events don't set `exclude_kernel`, so they
-/// need paranoid 1.
-fn enable_perf_hint(err: &io::Error) -> &'static str {
-    match err.raw_os_error() {
-        Some(libc::EACCES | libc::EPERM) => {
-            "; to enable it, set kernel.perf_event_paranoid to 1 or lower, grant \
-             CAP_PERFMON (CAP_SYS_ADMIN before Linux 5.8), or allow perf_event_open \
-             in the container's seccomp profile"
+/// need paranoid 1; raw tracepoints can need -1. Paranoid is host-wide, so the
+/// hint names its cost, and leaves it out for tracepoints.
+fn enable_perf_hint(err: &io::Error, source: EventSource) -> &'static str {
+    if !matches!(err.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+        return "";
+    }
+    match source {
+        EventSource::Tracepoint(_) => {
+            "; to enable it, grant CAP_PERFMON (before Linux 5.8, the broader \
+             CAP_SYS_ADMIN) or allow perf_event_open in the container's seccomp profile"
         }
-        _ => "",
+        _ => {
+            "; to enable it, grant CAP_PERFMON (before Linux 5.8, the broader \
+             CAP_SYS_ADMIN), allow perf_event_open in the container's seccomp profile, \
+             or set kernel.perf_event_paranoid to 1, which lets every user on the host \
+             profile the kernel"
+        }
     }
 }
 
@@ -166,7 +174,7 @@ impl PerfSampler {
                     format!(
                         "perf_event_open blocked ({e}) and event-based sampling \
                          has no userspace fallback (requires kernel support){}",
-                        enable_perf_hint(&e)
+                        enable_perf_hint(&e, config.event_source)
                     ),
                 )),
             },
@@ -247,17 +255,27 @@ impl PerfSampler {
 mod tests {
     use super::*;
 
-    /// A denied `perf_event_open` says how to allow it; a missing one doesn't.
+    /// A denied `perf_event_open` says how to allow it, with no paranoid
+    /// level for tracepoints; a missing one doesn't.
     #[test]
     fn denied_perf_errors_say_how_to_enable_it() {
         for errno in [libc::EACCES, libc::EPERM] {
             let err = io::Error::from_raw_os_error(errno);
-            let hint = enable_perf_hint(&err);
-            assert!(hint.contains("perf_event_paranoid to 1"), "{errno}: {hint}");
+            let ctxsw = enable_perf_hint(&err, EventSource::SwContextSwitches);
+            assert!(
+                ctxsw.contains("perf_event_paranoid to 1,"),
+                "{errno}: {ctxsw}"
+            );
+            let tracepoint = enable_perf_hint(&err, EventSource::Tracepoint(0));
+            assert!(tracepoint.contains("CAP_PERFMON"), "{errno}: {tracepoint}");
+            assert!(
+                !tracepoint.contains("perf_event_paranoid"),
+                "{errno}: {tracepoint}"
+            );
         }
         for errno in [libc::ENOSYS, libc::EOPNOTSUPP] {
             let err = io::Error::from_raw_os_error(errno);
-            assert_eq!(enable_perf_hint(&err), "");
+            assert_eq!(enable_perf_hint(&err, EventSource::SwContextSwitches), "");
         }
     }
 
