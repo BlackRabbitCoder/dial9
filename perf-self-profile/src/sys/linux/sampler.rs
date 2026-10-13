@@ -75,9 +75,18 @@ impl PerfSampler {
     /// Start sampling using only the perf backend. No ctimer fallback.
     ///
     /// Returns an error if `perf_event_open` is blocked or fails for any reason.
+    /// A denied open's error says how to allow it.
     #[cfg(feature = "cpu-profiling")]
     pub(crate) fn start_perf_only(config: SamplerConfig) -> io::Result<Self> {
-        let perf = PerfSamplerImpl::start_for_pid(0, &config)?;
+        let perf =
+            PerfSamplerImpl::start_for_pid(0, &config).map_err(|e| {
+                match enable_perf_hint(&e, config.event_source) {
+                    "" => e,
+                    hint => {
+                        io::Error::new(e.kind(), format!("perf_event_open blocked ({e}){hint}"))
+                    }
+                }
+            })?;
         Ok(Self {
             inner: Box::new(perf),
         })

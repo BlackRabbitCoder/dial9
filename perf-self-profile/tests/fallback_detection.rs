@@ -181,8 +181,8 @@ fn auto_reports_perf_while_another_profiler_runs_ctimer() {
 }
 
 /// With perf blocked, `with_cpu_profiling` (perf backend) and
-/// `with_sched_events` register `StartFailed` placeholders. The scheduler
-/// profiler's error says how to allow `perf_event_open`.
+/// `with_sched_events` register `StartFailed` placeholders. Both errors say
+/// how to allow `perf_event_open`.
 #[cfg(feature = "cpu-profiling")]
 #[test]
 fn failed_profilers_register_placeholders_when_perf_event_open_blocked() {
@@ -193,7 +193,7 @@ fn failed_profilers_register_placeholders_when_perf_event_open_blocked() {
         StartFailed,
     };
 
-    in_fork("placeholders not registered", || {
+    in_fork("placeholders missing or without the perf hint", || {
         install_seccomp_blocking_perf_event_open();
         let rec = recorder(MemoryBuffer::new(64 * 1024).expect("writer"))
             .with_cpu_profiling(CpuProfilingConfig::with_perf_backend())
@@ -201,8 +201,8 @@ fn failed_profilers_register_placeholders_when_perf_event_open_blocked() {
             .build();
         let h = rec.handle();
         let ok = h
-            .with_source(|_: &mut StartFailed<CpuProfiler>| ())
-            .is_some()
+            .with_source(|f: &mut StartFailed<CpuProfiler>| f.message().to_string())
+            .is_some_and(|m| m.contains("CAP_PERFMON"))
             && h.with_source(|f: &mut StartFailed<SchedProfiler>| f.message().to_string())
                 .is_some_and(|m| m.contains("perf_event_paranoid"))
             && h.with_source(|_: &mut CpuProfiler| ()).is_none()
