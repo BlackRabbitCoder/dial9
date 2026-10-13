@@ -270,16 +270,27 @@ impl PerfSamplerImpl {
                 attr.set_sample_id_all(1);
                 if !is_event_based {
                     attr.set_inherit(1);
-                    if !config.include_kernel {
-                        attr.set_exclude_kernel(1);
-                        attr.set_exclude_hv(1);
-                    }
+                }
+                if excludes_kernel(config) {
+                    attr.set_exclude_kernel(1);
+                    attr.set_exclude_hv(1);
                 }
             }
         }
 
         Ok(attr)
     }
+}
+
+/// Whether events opened for `config` exclude the kernel, which lets them open
+/// under `perf_event_paranoid` 2.
+pub(super) fn excludes_kernel(config: &SamplerConfig) -> bool {
+    matches!(config.sampling, crate::SamplingMode::FrequencyHz(_))
+        && !matches!(
+            config.event_source,
+            EventSource::SwContextSwitches | EventSource::Tracepoint(_)
+        )
+        && !config.include_kernel
 }
 
 impl super::sampler::SamplerBackend for PerfSamplerImpl {
