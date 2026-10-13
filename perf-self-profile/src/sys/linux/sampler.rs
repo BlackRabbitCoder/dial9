@@ -32,8 +32,9 @@ impl std::fmt::Debug for PerfSampler {
 }
 
 /// `"; <how to allow it>"` when `err` says `perf_event_open` was denied, else
-/// `""`. Names the loosest `perf_event_paranoid` that opens `config`'s events,
-/// and none for tracepoints, which can need -1.
+/// `""`. Names the highest `perf_event_paranoid` that opens `config`'s events.
+/// Tracepoints get none: they can need `perf_event_paranoid` -1, which lets
+/// every user on the host read raw tracepoint data.
 fn enable_perf_hint(err: &io::Error, config: &SamplerConfig) -> &'static str {
     if !matches!(err.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
         return "";
