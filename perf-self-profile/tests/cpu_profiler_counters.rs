@@ -51,7 +51,7 @@ fn count_samples(batches: &[Vec<u8>], source: u8) -> u64 {
     n
 }
 
-/// A forced ctimer backend reports itself, and `samples_seen` counts exactly
+/// A forced ctimer backend reports itself, and `samples_drained` counts exactly
 /// the CPU samples a drain writes. ctimer needs no perf access.
 #[test]
 fn ctimer_reports_its_backend_and_counts_drained_samples() {
@@ -64,7 +64,7 @@ fn ctimer_reports_its_backend_and_counts_drained_samples() {
     let shared = rec.shared().expect("live recorder").clone();
     let read = || {
         handle
-            .with_source(|p: &mut CpuProfiler| (p.active_backend(), p.samples_seen()))
+            .with_source(|p: &mut CpuProfiler| (p.active_backend(), p.samples_drained()))
             .expect("ctimer needs no perf access, so the profiler starts")
     };
     let (backend, samples) = read();
@@ -90,13 +90,13 @@ fn ctimer_reports_its_backend_and_counts_drained_samples() {
     }
     drop(tracking);
 
-    let (_, seen) = read();
-    assert!(seen > 0, "no CPU samples within 5s of burning");
-    assert_eq!(seen, count_samples(&batches, CPU_PROFILE));
+    let (_, drained) = read();
+    assert!(drained > 0, "no CPU samples within 5s of burning");
+    assert_eq!(drained, count_samples(&batches, CPU_PROFILE));
     rec.graceful_shutdown(Duration::ZERO);
 }
 
-/// The scheduler profiler's `samples_seen` counts exactly the scheduler
+/// The scheduler profiler's `samples_drained` counts exactly the scheduler
 /// samples a drain writes. Skips where perf is blocked, like the crate's other
 /// perf tests.
 #[test]
@@ -108,7 +108,7 @@ fn sched_profiler_counts_drained_samples() {
         .build();
     let handle = rec.handle().clone();
     let shared = rec.shared().expect("live recorder").clone();
-    let read = || handle.with_source(|p: &mut SchedProfiler| p.samples_seen());
+    let read = || handle.with_source(|p: &mut SchedProfiler| p.samples_drained());
     if read().is_none() {
         eprintln!("skipping: the scheduler profiler didn't start (perf blocked?)");
         rec.graceful_shutdown(Duration::ZERO);
@@ -129,8 +129,8 @@ fn sched_profiler_counts_drained_samples() {
     }
     drop(tracking);
 
-    let seen = read().expect("still registered");
-    assert!(seen > 0, "no scheduler samples within 5s of sleeping");
-    assert_eq!(seen, count_samples(&batches, SCHED_EVENT));
+    let drained = read().expect("still registered");
+    assert!(drained > 0, "no scheduler samples within 5s of sleeping");
+    assert_eq!(drained, count_samples(&batches, SCHED_EVENT));
     rec.graceful_shutdown(Duration::ZERO);
 }

@@ -319,7 +319,7 @@ pub struct CpuProfiler {
     /// claim.
     kallsyms_snapshot: Option<bool>,
     /// CPU samples from this process drained since start.
-    samples_seen: u64,
+    samples_drained: u64,
 }
 
 impl std::fmt::Debug for CpuProfiler {
@@ -368,7 +368,7 @@ impl CpuProfiler {
             active_backend,
             metadata_emitted: false,
             kallsyms_snapshot: None,
-            samples_seen: 0,
+            samples_drained: 0,
         })
     }
 
@@ -379,8 +379,8 @@ impl CpuProfiler {
 
     /// CPU samples from this process drained since start. Updated on the flush
     /// thread each flush cycle while recording; unchanged while paused.
-    pub fn samples_seen(&self) -> u64 {
-        self.samples_seen
+    pub fn samples_drained(&self) -> u64 {
+        self.samples_drained
     }
 
     /// Drain all pending perf samples as raw (tid, callchain) tuples.
@@ -393,7 +393,7 @@ impl CpuProfiler {
             if sample.pid != pid {
                 return;
             }
-            self.samples_seen += 1;
+            self.samples_drained += 1;
             if !self.tid_to_name.contains_key(&sample.tid)
                 && let Some(name) = read_thread_name(sample.tid)
             {
@@ -542,7 +542,7 @@ pub struct SchedProfiler {
     /// Whether segment metadata has been emitted yet (emit-once).
     metadata_emitted: bool,
     /// Scheduler samples drained since start.
-    samples_seen: u64,
+    samples_drained: u64,
 }
 
 impl std::fmt::Debug for SchedProfiler {
@@ -566,14 +566,14 @@ impl SchedProfiler {
             sampler,
             config,
             metadata_emitted: false,
-            samples_seen: 0,
+            samples_drained: 0,
         })
     }
 
     /// Scheduler samples drained since start. Updated on the flush thread each
     /// flush cycle while recording; unchanged while paused.
-    pub fn samples_seen(&self) -> u64 {
-        self.samples_seen
+    pub fn samples_drained(&self) -> u64 {
+        self.samples_drained
     }
 
     pub(crate) fn track_current_thread(&mut self) -> io::Result<()> {
@@ -586,7 +586,7 @@ impl SchedProfiler {
 
     pub(crate) fn drain(&mut self, mut f: impl FnMut(RawCpuSample)) {
         self.sampler.for_each_sample(|sample| {
-            self.samples_seen += 1;
+            self.samples_drained += 1;
             f(RawCpuSample {
                 tid: sample.tid,
                 timestamp_nanos: sample.time,
