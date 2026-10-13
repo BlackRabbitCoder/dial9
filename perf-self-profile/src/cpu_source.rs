@@ -490,9 +490,6 @@ impl Source for CpuProfiler {
             "cpu.profile.frequency_hz".to_string(),
             self.config.frequency_hz.to_string(),
         ));
-        // Report the *effective* backend (perf or ctimer), never "auto".
-        // The Auto variant resolves at construction time; self.active_backend
-        // captures the actual selection.
         out.push((
             "cpu.profile.backend".to_string(),
             self.active_backend.as_str().to_string(),
