@@ -35,22 +35,22 @@ impl std::fmt::Debug for PerfSampler {
 /// `""`. Names the highest `perf_event_paranoid` that opens `config`'s events.
 /// Tracepoints get none: they can need `perf_event_paranoid` -1, which lets
 /// every user on the host read raw tracepoint data.
-fn enable_perf_hint(err: &io::Error, config: &SamplerConfig) -> &'static str {
+fn allow_perf_hint(err: &io::Error, config: &SamplerConfig) -> &'static str {
     if !matches!(err.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
         return "";
     }
     match config.event_source {
         EventSource::Tracepoint(_) => {
-            "; to enable it, grant CAP_PERFMON (before Linux 5.8, the broader \
+            "; to allow it, grant CAP_PERFMON (before Linux 5.8, the broader \
              CAP_SYS_ADMIN) or allow perf_event_open in the container's seccomp profile"
         }
         _ if excludes_kernel(config) => {
-            "; to enable it, grant CAP_PERFMON (before Linux 5.8, the broader \
+            "; to allow it, grant CAP_PERFMON (before Linux 5.8, the broader \
              CAP_SYS_ADMIN), allow perf_event_open in the container's seccomp profile, \
              or set kernel.perf_event_paranoid to 2"
         }
         _ => {
-            "; to enable it, grant CAP_PERFMON (before Linux 5.8, the broader \
+            "; to allow it, grant CAP_PERFMON (before Linux 5.8, the broader \
              CAP_SYS_ADMIN), allow perf_event_open in the container's seccomp profile, \
              or set kernel.perf_event_paranoid to 1, which lets every user on the host \
              profile the kernel"
@@ -84,7 +84,7 @@ impl PerfSampler {
     pub(crate) fn start_perf_only(config: SamplerConfig) -> io::Result<Self> {
         let perf =
             PerfSamplerImpl::start_for_pid(0, &config).map_err(|e| {
-                match enable_perf_hint(&e, &config) {
+                match allow_perf_hint(&e, &config) {
                     "" => e,
                     hint => {
                         io::Error::new(e.kind(), format!("perf_event_open blocked ({e}){hint}"))
@@ -187,7 +187,7 @@ impl PerfSampler {
                     format!(
                         "perf_event_open blocked ({e}) and event-based sampling \
                          has no userspace fallback (requires kernel support){}",
-                        enable_perf_hint(&e, &config)
+                        allow_perf_hint(&e, &config)
                     ),
                 )),
             },
@@ -272,7 +272,7 @@ mod tests {
     /// user-space-only events, 1 for the rest and none for tracepoints; a
     /// missing one doesn't.
     #[test]
-    fn denied_perf_errors_say_how_to_enable_it() {
+    fn denied_perf_errors_say_how_to_allow_it() {
         use crate::SamplingMode;
 
         let ctxsw = SamplerConfig::default()
@@ -288,19 +288,19 @@ mod tests {
         for errno in [libc::EACCES, libc::EPERM] {
             let err = io::Error::from_raw_os_error(errno);
             for (config, level) in [(&ctxsw, "1,"), (&cpu, "2"), (&cpu_kernel, "1,")] {
-                let hint = enable_perf_hint(&err, config);
+                let hint = allow_perf_hint(&err, config);
                 assert!(
                     hint.contains(&format!("perf_event_paranoid to {level}")),
                     "{errno}: {hint}"
                 );
             }
-            let hint = enable_perf_hint(&err, &tracepoint);
+            let hint = allow_perf_hint(&err, &tracepoint);
             assert!(hint.contains("CAP_PERFMON"), "{errno}: {hint}");
             assert!(!hint.contains("perf_event_paranoid"), "{errno}: {hint}");
         }
         for errno in [libc::ENOSYS, libc::EOPNOTSUPP] {
             let err = io::Error::from_raw_os_error(errno);
-            assert_eq!(enable_perf_hint(&err, &ctxsw), "");
+            assert_eq!(allow_perf_hint(&err, &ctxsw), "");
         }
     }
 
