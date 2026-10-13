@@ -358,7 +358,7 @@ impl CpuProfiler {
             )?,
         };
         // `Auto` resolves inside the sampler, which reports what it picked.
-        let active_backend = sampler.backend();
+        let active_backend = sampler.active_backend();
         Ok(Self {
             sampler,
             pid: std::process::id(),

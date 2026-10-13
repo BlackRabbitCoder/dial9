@@ -40,7 +40,7 @@ impl PerfSampler {
     }
 
     /// The backend this sampler runs on. Unreachable: no instance exists.
-    pub fn backend(&self) -> crate::sampler::ActiveCpuBackend {
+    pub fn active_backend(&self) -> crate::sampler::ActiveCpuBackend {
         match self._never {}
     }
 

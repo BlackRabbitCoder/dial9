@@ -17,7 +17,7 @@ pub(super) trait SamplerBackend: Send {
     fn drain_samples(&mut self) -> Vec<Sample>;
     fn disable(&self);
     fn enable(&self);
-    fn backend(&self) -> ActiveCpuBackend;
+    fn active_backend(&self) -> ActiveCpuBackend;
 }
 
 /// CPU sampler dispatching to perf_event_open or ctimer (fallback).
@@ -233,8 +233,8 @@ impl PerfSampler {
     }
 
     /// The backend this sampler runs on.
-    pub fn backend(&self) -> ActiveCpuBackend {
-        self.inner.backend()
+    pub fn active_backend(&self) -> ActiveCpuBackend {
+        self.inner.active_backend()
     }
 
     pub fn stop_tracking_current_thread(&mut self) {

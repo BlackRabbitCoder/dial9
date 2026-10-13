@@ -294,7 +294,7 @@ pub(super) fn excludes_kernel(config: &SamplerConfig) -> bool {
 }
 
 impl super::sampler::SamplerBackend for PerfSamplerImpl {
-    fn backend(&self) -> crate::sampler::ActiveCpuBackend {
+    fn active_backend(&self) -> crate::sampler::ActiveCpuBackend {
         crate::sampler::ActiveCpuBackend::Perf
     }
 

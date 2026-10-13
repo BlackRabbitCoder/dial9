@@ -71,7 +71,7 @@ impl CtimerSampler {
 }
 
 impl SamplerBackend for CtimerSampler {
-    fn backend(&self) -> crate::sampler::ActiveCpuBackend {
+    fn active_backend(&self) -> crate::sampler::ActiveCpuBackend {
         crate::sampler::ActiveCpuBackend::Ctimer
     }
 
