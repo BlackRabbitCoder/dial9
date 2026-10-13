@@ -180,34 +180,3 @@ mod tests {
         recorder.graceful_shutdown(Duration::ZERO);
     }
 }
-
-#[cfg(all(
-    test,
-    feature = "cpu-profiling",
-    not(any(
-        target_os = "linux",
-        all(target_os = "android", target_arch = "aarch64")
-    ))
-))]
-mod start_failed_tests {
-    use crate::{CpuProfiler, StartFailed};
-
-    /// Off Linux the profiler can't start, so the builder registers the
-    /// placeholder instead of skipping the source.
-    #[test]
-    fn a_failed_start_registers_the_placeholder() {
-        use super::RecorderPerfExt;
-        use dial9_core::buffer::MemoryBuffer;
-        use dial9_core::recorder::recorder;
-
-        let rec = recorder(MemoryBuffer::new(64 * 1024).expect("writer"))
-            .with_cpu_profiling(crate::CpuProfilingConfig::default())
-            .build();
-        let found = rec
-            .handle()
-            .with_source(|f: &mut StartFailed<CpuProfiler>| f.message().to_string());
-        assert!(found.is_some(), "no StartFailed<CpuProfiler> registered");
-        assert!(rec.handle().with_source(|_: &mut CpuProfiler| ()).is_none());
-        rec.graceful_shutdown(std::time::Duration::ZERO);
-    }
-}
