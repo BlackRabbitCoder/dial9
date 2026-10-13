@@ -310,7 +310,7 @@ pub struct CpuProfiler {
     stopped_tids: Vec<u32>,
     /// Original config retained for segment metadata emission.
     config: CpuProfilingConfig,
-    /// The effective backend that was selected after Auto resolution.
+    /// The active backend, selected after Auto resolution.
     active_backend: ActiveCpuBackend,
     /// Whether segment metadata has been emitted yet (emit-once).
     metadata_emitted: bool,
@@ -502,7 +502,7 @@ impl Source for CpuProfiler {
             ));
         }
         out.extend(sys::system_metadata());
-        // When ctimer is the effective backend, it always samples thread CPU time
+        // When ctimer is the active backend, it always samples thread CPU time
         // (CLOCK_THREAD_CPUTIME_ID), regardless of what EventSource was
         // originally requested. Report the *effective* source honestly.
         #[allow(unreachable_patterns)]
@@ -758,11 +758,11 @@ mod metadata_tests {
     use super::*;
     use dial9_core::source::Source;
 
-    /// CpuProfiler::segment_metadata must report the effective backend
+    /// CpuProfiler::segment_metadata must report the active backend
     /// ("perf" or "ctimer"), never "auto", even when CpuBackend::Auto was
     /// configured. This test runs on Linux where `start` resolves Auto.
     #[test]
-    fn cpu_profiler_metadata_reports_effective_backend_not_auto() {
+    fn cpu_profiler_metadata_reports_active_backend_not_auto() {
         // CpuProfiler::start may fail in CI without perf access and without
         // ctimer (rare). If it succeeds, the metadata must not say "auto".
         let config = CpuProfilingConfig::default(); // backend = Auto
@@ -780,7 +780,7 @@ mod metadata_tests {
             .expect("metadata must contain cpu.profile.backend");
         assert!(
             backend.1 == "perf" || backend.1 == "ctimer",
-            "effective backend must be 'perf' or 'ctimer', got '{}'",
+            "active backend must be 'perf' or 'ctimer', got '{}'",
             backend.1
         );
         assert_ne!(
