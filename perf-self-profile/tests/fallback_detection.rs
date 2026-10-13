@@ -107,43 +107,42 @@ fn uses_perf_path_when_available() {
     );
 }
 
-// Fork so the seccomp filter (sticky) stays isolated from the rest of
-// the test run.
-#[test]
-fn falls_back_to_ctimer_when_perf_event_open_blocked() {
+/// Run `child` in a forked process and assert it returned `true`. Forked
+/// tests keep the seccomp filter (sticky) and process-wide ctimer state out of
+/// the rest of the test run.
+fn in_fork(what: &str, child: impl FnOnce() -> bool) {
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
-
     if pid == 0 {
+        // A panic must not unwind into the forked copy of the test harness.
+        let code = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(child)) {
+            Ok(true) => 0,
+            Ok(false) => 1,
+            Err(_) => 2,
+        };
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status), "child did not exit normally");
+    match libc::WEXITSTATUS(status) {
+        0 => {}
+        2 => panic!("child panicked, see its stderr"),
+        _ => panic!("{what}"),
+    }
+}
+
+#[test]
+fn falls_back_to_ctimer_when_perf_event_open_blocked() {
+    in_fork("fallback did not trigger", || {
         install_seccomp_blocking_perf_event_open();
         let sampler = PerfSampler::start(
             SamplerConfig::default()
                 .event_source(EventSource::SwCpuClock)
                 .sampling(SamplingMode::FrequencyHz(999)),
         );
-        let ok = sampler.is_ok() && is_ctimer_active();
-        unsafe { libc::_exit(!ok as i32) };
-    }
-
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-    assert!(libc::WIFEXITED(status), "child did not exit normally");
-    assert_eq!(libc::WEXITSTATUS(status), 0, "fallback did not trigger");
-}
-
-/// Run `child` in a forked process and assert it returned `true`.
-#[cfg(feature = "cpu-profiling")]
-fn in_fork(what: &str, child: impl FnOnce() -> bool) {
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0, "fork failed");
-    if pid == 0 {
-        let ok = child();
-        unsafe { libc::_exit(!ok as i32) };
-    }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-    assert!(libc::WIFEXITED(status), "child did not exit normally");
-    assert_eq!(libc::WEXITSTATUS(status), 0, "{what}");
+        sampler.is_ok() && is_ctimer_active()
+    });
 }
 
 /// The `Auto` backend reports ctimer when perf is blocked: the path production
