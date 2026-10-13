@@ -117,6 +117,9 @@ pub struct Sample {
 
 /// CPU sampling backend a [`PerfSampler`](crate::PerfSampler) runs on, after
 /// `Auto` resolves.
+///
+/// Variants are `#[non_exhaustive]` so they can gain fields: match them as
+/// `ActiveCpuBackend::Ctimer { .. }`, or compare [`as_str`](Self::as_str).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ActiveCpuBackend {
@@ -124,7 +127,8 @@ pub enum ActiveCpuBackend {
     /// descended from the one that started it.
     #[non_exhaustive]
     Perf,
-    /// Per-thread CPU timers: samples only threads dial9 tracks.
+    /// Per-thread CPU timers. A `CpuProfiler` on it samples only threads dial9
+    /// tracks and, on Linux, the thread that started it.
     #[non_exhaustive]
     Ctimer,
 }
