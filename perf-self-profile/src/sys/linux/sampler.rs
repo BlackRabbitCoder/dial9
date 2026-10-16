@@ -278,20 +278,21 @@ mod tests {
             .include_kernel(include_kernel)
     }
 
-    /// A denied `perf_event_open` says how to allow it, with paranoid 2 for
-    /// user-space-only events, 1 for the rest and none for tracepoints.
+    /// A denied `perf_event_open` error says how to allow it. It names
+    /// `perf_event_paranoid` 2 for user-space-only events, 1 for the rest, and
+    /// no level for tracepoints.
     #[rstest]
     #[case::ctxsw(
         config(EventSource::SwContextSwitches, SamplingMode::Period(1), false),
-        Some("1,")
+        Some(1)
     )]
     #[case::cpu(
         config(EventSource::SwCpuClock, SamplingMode::FrequencyHz(99), false),
-        Some("2")
+        Some(2)
     )]
     #[case::cpu_kernel(
         config(EventSource::SwCpuClock, SamplingMode::FrequencyHz(99), true),
-        Some("1,")
+        Some(1)
     )]
     #[case::tracepoint(
         config(EventSource::Tracepoint(0), SamplingMode::Period(1), false),
@@ -300,11 +301,11 @@ mod tests {
     fn denied_perf_errors_say_how_to_allow_it(
         #[values(libc::EACCES, libc::EPERM)] errno: i32,
         #[case] config: SamplerConfig,
-        #[case] paranoid: Option<&str>,
+        #[case] paranoid_level: Option<u8>,
     ) {
         let hint = allow_perf_hint(&io::Error::from_raw_os_error(errno), &config);
         assert!(hint.contains("CAP_PERFMON"), "{hint}");
-        match paranoid {
+        match paranoid_level {
             Some(level) => assert!(
                 hint.contains(&format!("perf_event_paranoid to {level}")),
                 "{hint}"
@@ -316,7 +317,7 @@ mod tests {
     /// No hint when the kernel doesn't support `perf_event_open`: granting
     /// access wouldn't help.
     #[rstest]
-    fn missing_perf_errors_give_no_hint(#[values(libc::ENOSYS, libc::EOPNOTSUPP)] errno: i32) {
+    fn unsupported_perf_errors_give_no_hint(#[values(libc::ENOSYS, libc::EOPNOTSUPP)] errno: i32) {
         let ctxsw = config(
             EventSource::SwContextSwitches,
             SamplingMode::Period(1),

@@ -1,7 +1,7 @@
 //! The profilers' backends and sample counters, read through the recorder.
 //!
 //! Its own test binary: ctimer writes to a process-wide sample buffer that the
-//! library's unit tests exercise directly, so running there would race them.
+//! library's unit tests also use, so these tests would race them there.
 #![cfg(all(target_os = "linux", feature = "cpu-profiling"))]
 
 use dial9_core::buffer::MemoryBuffer;
@@ -51,35 +51,37 @@ fn count_samples(batches: &[Vec<u8>], source: u8) -> u64 {
     n
 }
 
-/// A forced ctimer backend reports itself, and `samples_drained` counts exactly
-/// the CPU samples a drain writes. ctimer needs no perf access.
+/// A profiler forced onto ctimer reports `Ctimer`, and `samples_drained`
+/// equals the CPU samples written to the trace. ctimer needs no perf access,
+/// so this runs where perf is blocked.
 #[test]
 fn ctimer_reports_its_backend_and_counts_drained_samples() {
-    // Paused so the flush thread doesn't drain: the test drives the drain.
+    // Paused so the flush thread doesn't drain: the test drains, so it sees
+    // every sample it counts.
     let rec = recorder(MemoryBuffer::new(16 << 20).expect("writer"))
         .with_cpu_profiling(CpuProfilingConfig::with_ctimer_backend())
         .paused()
         .build();
     let handle = rec.handle().clone();
     let shared = rec.shared().expect("live recorder").clone();
-    let read = || {
+    let backend_and_drained = || {
         handle
             .with_source(|p: &mut CpuProfiler| (p.active_backend(), p.samples_drained()))
             .expect("ctimer profiler starts without perf access")
     };
-    let (backend, samples) = read();
+    let (backend, samples) = backend_and_drained();
     assert!(
         matches!(backend, ActiveCpuBackend::Ctimer { .. }),
         "{backend:?}"
     );
     assert_eq!(samples, 0);
 
-    // ctimer samples only tracked threads. Burn and drain in rounds: a thread
-    // starved of CPU on a busy host may need more than one.
+    // ctimer samples only tracked threads. Spin 50ms, then drain; repeat, since
+    // a busy host may starve this thread for a round.
     let tracking = handle.track_current_thread().expect("track this thread");
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut batches = Vec::new();
-    while read().1 == 0 && Instant::now() < deadline {
+    while backend_and_drained().1 == 0 && Instant::now() < deadline {
         let start = Instant::now();
         let mut x = 0u64;
         while start.elapsed() < Duration::from_millis(50) {
@@ -90,8 +92,8 @@ fn ctimer_reports_its_backend_and_counts_drained_samples() {
     }
     drop(tracking);
 
-    let (_, drained) = read();
-    assert!(drained > 0, "no CPU samples within 5s of burning");
+    let (_, drained) = backend_and_drained();
+    assert!(drained > 0, "no CPU samples within 5s of spinning");
     assert_eq!(drained, count_samples(&batches, CPU_PROFILE));
     rec.graceful_shutdown(Duration::ZERO);
 }
@@ -101,27 +103,28 @@ fn ctimer_reports_its_backend_and_counts_drained_samples() {
 /// perf tests.
 #[test]
 fn sched_profiler_counts_drained_samples() {
-    // Paused so the flush thread doesn't drain: the test drives the drain.
+    // Paused so the flush thread doesn't drain: the test drains, so it sees
+    // every sample it counts.
     let rec = recorder(MemoryBuffer::new(16 << 20).expect("writer"))
         .with_sched_events(SchedEventConfig::default())
         .paused()
         .build();
     let handle = rec.handle().clone();
     let shared = rec.shared().expect("live recorder").clone();
-    let read = || handle.with_source(|p: &mut SchedProfiler| p.samples_drained());
-    if read().is_none() {
+    let samples_drained = || handle.with_source(|p: &mut SchedProfiler| p.samples_drained());
+    if samples_drained().is_none() {
         eprintln!("skipping: the scheduler profiler didn't start (perf blocked?)");
         rec.graceful_shutdown(Duration::ZERO);
         return;
     }
-    assert_eq!(read(), Some(0));
+    assert_eq!(samples_drained(), Some(0));
 
-    // Joining a just-spawned thread blocks this tracked thread, switching it
-    // out, which is what it samples.
+    // The scheduler profiler samples context switches. Joining a just-spawned
+    // thread blocks this tracked thread, which switches it out.
     let tracking = handle.track_current_thread().expect("track this thread");
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut batches = Vec::new();
-    while read() == Some(0) && Instant::now() < deadline {
+    while samples_drained() == Some(0) && Instant::now() < deadline {
         for _ in 0..20 {
             std::thread::spawn(|| {}).join().expect("empty thread");
         }
@@ -130,7 +133,7 @@ fn sched_profiler_counts_drained_samples() {
     }
     drop(tracking);
 
-    let drained = read().expect("still registered");
+    let drained = samples_drained().expect("still registered");
     assert!(drained > 0, "no scheduler samples within 5s of blocking");
     assert_eq!(drained, count_samples(&batches, SCHED_EVENT));
     rec.graceful_shutdown(Duration::ZERO);

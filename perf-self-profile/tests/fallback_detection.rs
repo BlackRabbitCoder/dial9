@@ -107,10 +107,10 @@ fn uses_perf_path_when_available() {
     );
 }
 
-/// Run `child` in a forked process and assert it returned `true`. Forked
-/// tests keep the seccomp filter (sticky) and process-wide ctimer state out of
-/// the rest of the test run.
-fn in_fork(what: &str, child: impl FnOnce() -> bool) {
+/// Run `child` in a forked process and panic with `failure` if it returns
+/// `false`, or with "child panicked" if it panics. Forking keeps the seccomp
+/// filter (sticky) and process-wide ctimer state out of the rest of the run.
+fn in_fork(failure: &str, child: impl FnOnce() -> bool) {
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
     if pid == 0 {
@@ -128,7 +128,7 @@ fn in_fork(what: &str, child: impl FnOnce() -> bool) {
     match libc::WEXITSTATUS(status) {
         0 => {}
         2 => panic!("child panicked, see its stderr"),
-        _ => panic!("{what}"),
+        _ => panic!("{failure}"),
     }
 }
 
@@ -145,11 +145,11 @@ fn falls_back_to_ctimer_when_perf_event_open_blocked() {
     });
 }
 
-/// The `Auto` backend reports ctimer when perf is blocked: the path production
-/// takes, as opposed to forcing ctimer.
+/// With perf blocked, a default (`Auto`) profiler falls back to ctimer and
+/// reports it. Unlike forcing ctimer, this is the fallback users hit.
 #[cfg(feature = "cpu-profiling")]
 #[test]
-fn auto_backend_reports_ctimer_when_perf_event_open_blocked() {
+fn auto_reports_ctimer_when_perf_event_open_blocked() {
     use dial9_perf_self_profile::{ActiveCpuBackend, CpuProfiler, CpuProfilingConfig};
 
     in_fork("Auto did not report ctimer", || {
@@ -159,8 +159,8 @@ fn auto_backend_reports_ctimer_when_perf_event_open_blocked() {
     });
 }
 
-/// Another profiler's ctimer doesn't make a perf profiler report ctimer.
-/// Forked: ctimer is process-wide.
+/// An `Auto` profiler on perf reports perf while another profiler runs ctimer.
+/// ctimer state is process-wide, so a backend read from it would say ctimer.
 #[cfg(feature = "cpu-profiling")]
 #[test]
 fn auto_reports_perf_while_another_profiler_runs_ctimer() {
@@ -170,7 +170,7 @@ fn auto_reports_perf_while_another_profiler_runs_ctimer() {
         eprintln!("skipping: perf_event_open blocked in this env");
         return;
     }
-    in_fork("Auto on perf reported ctimer", || {
+    in_fork("Auto on perf did not report perf", || {
         let _ctimer = CpuProfiler::start(CpuProfilingConfig::with_ctimer_backend())
             .expect("ctimer profiler starts without perf access");
         CpuProfiler::start(CpuProfilingConfig::default())
@@ -178,9 +178,9 @@ fn auto_reports_perf_while_another_profiler_runs_ctimer() {
     });
 }
 
-/// With perf blocked, `with_cpu_profiling` (perf backend) and
-/// `with_sched_events` register `StartFailed` placeholders. Both errors say
-/// how to allow `perf_event_open`.
+/// With perf blocked, `with_cpu_profiling` and `with_sched_events` register
+/// `StartFailed` placeholders whose errors say how to allow `perf_event_open`.
+/// The CPU profiler is forced onto perf: `Auto` would fall back to ctimer.
 #[cfg(feature = "cpu-profiling")]
 #[test]
 fn failed_profilers_register_placeholders_when_perf_event_open_blocked() {
