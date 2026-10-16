@@ -65,7 +65,7 @@ fn ctimer_reports_its_backend_and_counts_drained_samples() {
     let read = || {
         handle
             .with_source(|p: &mut CpuProfiler| (p.active_backend(), p.samples_drained()))
-            .expect("ctimer needs no perf access, so the profiler starts")
+            .expect("ctimer profiler starts without perf access")
     };
     let (backend, samples) = read();
     assert!(

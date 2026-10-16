@@ -171,9 +171,8 @@ fn auto_reports_perf_while_another_profiler_runs_ctimer() {
         return;
     }
     in_fork("Auto on perf reported ctimer", || {
-        let Ok(_ctimer) = CpuProfiler::start(CpuProfilingConfig::with_ctimer_backend()) else {
-            return false;
-        };
+        let _ctimer = CpuProfiler::start(CpuProfilingConfig::with_ctimer_backend())
+            .expect("ctimer profiler starts without perf access");
         CpuProfiler::start(CpuProfilingConfig::default())
             .is_ok_and(|p| matches!(p.active_backend(), ActiveCpuBackend::Perf { .. }))
     });
