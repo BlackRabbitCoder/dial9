@@ -59,7 +59,7 @@ pub struct BackgroundTaskConfig {
     /// and the pipeline only runs on an explicit dump request. Wired by the
     /// facade builder; absent for continuous processing.
     trigger: Option<crate::dump::DumpRx>,
-    /// Stage order and worker state for `Dial9Handle::pipeline_status`. Set by
+    /// Processor order and pipeline state for `Dial9Handle::pipeline_status`. Set by
     /// the recorder builder.
     #[builder(skip)]
     state: Option<crate::primitives::sync::Arc<state::PipelineState>>,
@@ -132,15 +132,17 @@ async fn run_background_task_inner(
     shutdown: tokio::sync::oneshot::Receiver<Duration>,
     fs: Arc<Fs>,
 ) {
-    let processors = std::mem::take(&mut config.processors);
-    let metrics_sink = config.metrics_sink.clone();
-    let trigger = config.trigger.take();
     let state = config.state.take();
     // Declared before `run_fut` so it drops after it: a reader that sees
     // `Stopped` knows no stage code is still running (tasks they spawned may
     // be). Each exit below records its cause first; a panic outside `run_fut`
     // skips that, and the guard records `Panicked`.
     let stopped = state.clone().map(state::StoppedOnDrop);
+    // Stage-owning locals also drop before the guard if setup panics before
+    // `run_fut` is constructed.
+    let processors = std::mem::take(&mut config.processors);
+    let metrics_sink = config.metrics_sink.clone();
+    let trigger = config.trigger.take();
     let record = |cause| {
         if let Some(stopped) = &stopped {
             stopped.record(cause);
@@ -242,6 +244,9 @@ where
             // guard, which would leave the status `Initializing`. Created in
             // the thread so a failed spawn doesn't drop it.
             let _stopped = pipeline_state.map(state::StoppedOnDrop);
+            // Move the captured stages into a local so they drop before the
+            // stop guard if the thread-start hook panics.
+            let config = config;
             let teardown = thread_init();
             run_background_task(config, shutdown, fs);
             teardown();

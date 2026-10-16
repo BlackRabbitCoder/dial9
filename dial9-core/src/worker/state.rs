@@ -1,7 +1,7 @@
-//! Stage order and worker lifecycle, published for
+//! Processor order and pipeline lifecycle, published for
 //! [`Dial9Handle::pipeline_status`](crate::handle::Dial9Handle::pipeline_status).
 
-use crate::pipeline::{PipelineStage, PipelineStatus, StopCause, WorkerState};
+use crate::pipeline::{PipelineProcessor, PipelineStatus, StopCause};
 // Shuttle-aware, so the exit guard racing shutdown is explored.
 use crate::primitives::sync::atomic::{AtomicUsize, Ordering};
 use crate::primitives::sync::{Arc, Mutex};
@@ -18,17 +18,17 @@ pub(crate) struct PipelineShared {
     /// application code through
     /// [`Dial9Handle::dump_trigger`](crate::handle::Dial9Handle::dump_trigger).
     pub(crate) dump_trigger: Option<crate::dump::DumpTrigger>,
-    /// Stage order and worker state, when a pipeline worker runs.
+    /// Processor order and pipeline state, when a pipeline worker runs.
     pub(crate) state: Option<Arc<PipelineState>>,
 }
 
 /// Written by the worker, read by any handle.
 #[derive(Debug)]
 pub(crate) struct PipelineState {
-    /// Stages in pipeline order, fixed at build. Shared with every status,
+    /// Processors in pipeline order, fixed at build. Shared with every status,
     /// so reading one doesn't allocate.
-    stages: std::sync::Arc<[PipelineStage]>,
-    /// Index into `stages` of the stage initializing, or one of the
+    processors: std::sync::Arc<[PipelineProcessor]>,
+    /// Index into `processors` of the processor initializing, or one of the
     /// constants above.
     phase: AtomicUsize,
     /// Why the worker stopped. Recorded before `phase` becomes `STOPPED`, so a
@@ -37,20 +37,23 @@ pub(crate) struct PipelineState {
 }
 
 impl PipelineState {
-    pub(crate) fn new(stages: Vec<&'static str>) -> Self {
+    pub(crate) fn new(processors: Vec<&'static str>) -> Self {
         Self {
-            stages: stages.into_iter().map(PipelineStage::new).collect(),
+            processors: processors.into_iter().map(PipelineProcessor::new).collect(),
             phase: AtomicUsize::new(NOT_STARTED),
             cause: Mutex::new(None),
         }
     }
 
-    // Release/Acquire keeps the status consistent with the stages: a reader that
+    // Release/Acquire keeps the status consistent with the processors: a reader that
     // sees `Running` also sees what their `initialize()` built, such as the S3
     // stage's client.
-    pub(crate) fn set_initializing(&self, stage: usize) {
-        debug_assert!(stage < self.stages.len(), "stage index out of range");
-        self.phase.store(stage, Ordering::Release);
+    pub(crate) fn set_initializing(&self, processor: usize) {
+        debug_assert!(
+            processor < self.processors.len(),
+            "processor index out of range"
+        );
+        self.phase.store(processor, Ordering::Release);
     }
 
     pub(crate) fn set_running(&self) {
@@ -58,8 +61,10 @@ impl PipelineState {
     }
 
     pub(crate) fn status(&self) -> PipelineStatus {
-        let worker = match self.phase.load(Ordering::Acquire) {
-            STOPPED => WorkerState::Stopped {
+        let processors = std::sync::Arc::clone(&self.processors);
+        match self.phase.load(Ordering::Acquire) {
+            STOPPED => PipelineStatus::Stopped {
+                processors,
                 cause: self
                     .cause
                     .lock()
@@ -67,19 +72,16 @@ impl PipelineState {
                     .clone()
                     .expect("the stop guard records a cause before publishing STOPPED"),
             },
-            RUNNING => WorkerState::Running,
-            i => WorkerState::Initializing {
-                stage: self.stages.get(i).cloned(),
+            RUNNING => PipelineStatus::Running { processors },
+            i => PipelineStatus::Initializing {
+                processor: self.processors.get(i).cloned(),
+                processors,
             },
-        };
-        PipelineStatus {
-            stages: std::sync::Arc::clone(&self.stages),
-            worker,
         }
     }
 }
 
-/// Marks the worker [`Stopped`](WorkerState::Stopped) when dropped, so every
+/// Marks the worker [`Stopped`](PipelineStatus::Stopped) when dropped, so every
 /// exit path is covered: normal exit, initialization error, panic, drain
 /// timeout.
 pub(crate) struct StoppedOnDrop(pub(crate) Arc<PipelineState>);
@@ -90,16 +92,16 @@ impl StoppedOnDrop {
         self.0.cause.lock().unwrap().get_or_insert(cause);
     }
 
-    /// Record that the stage being initialized failed.
+    /// Record that the processor being initialized failed.
     pub(crate) fn record_initialize_failed(&self) {
         let phase = self.0.phase.load(Ordering::Acquire);
-        let stage = self
+        let processor = self
             .0
-            .stages
+            .processors
             .get(phase)
             .cloned()
-            .expect("an initialize() error comes from the stage `phase` points at");
-        self.record(StopCause::InitializeFailed { stage });
+            .expect("an initialize() error comes from the processor `phase` points at");
+        self.record(StopCause::InitializeFailed { processor });
     }
 }
 
@@ -117,7 +119,7 @@ mod tests {
     use super::{PipelineState, StoppedOnDrop};
     use crate::buffer::MemoryBuffer;
     use crate::pipeline::{
-        PipelineStage, ProcessError, SegmentData, SegmentProcessor, StopCause, WorkerState,
+        PipelineProcessor, PipelineStatus, ProcessError, SegmentData, SegmentProcessor, StopCause,
     };
     use crate::recorder::recorder;
     use crate::recording::Recorder;
@@ -130,6 +132,8 @@ mod tests {
         Pin<Box<dyn Future<Output = Result<SegmentData, ProcessError>> + Send + 'a>>;
     type InitFuture<'a> = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>>;
 
+    const INIT_DELAY: Duration = Duration::from_millis(200);
+
     /// Passes segments through; `initialize()` hangs, fails, or returns.
     struct Stage {
         name: &'static str,
@@ -141,9 +145,9 @@ mod tests {
         Ok,
         Hang,
         Fail,
-        /// Returns after a delay, so shutdown can start while it runs.
+        /// Returns after a virtual delay in a paused-time test.
         SlowOk,
-        /// Fails after a delay, so shutdown can start while it runs.
+        /// Fails after a virtual delay in a paused-time test.
         SlowFail,
     }
 
@@ -159,11 +163,11 @@ mod tests {
                     "test stage failed to initialize",
                 )))),
                 Init::SlowOk => Box::pin(async {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(INIT_DELAY).await;
                     Ok(())
                 }),
                 Init::SlowFail => Box::pin(async {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(INIT_DELAY).await;
                     Err(std::io::Error::other("test stage failed to initialize"))
                 }),
             }
@@ -183,66 +187,72 @@ mod tests {
             .build()
     }
 
-    fn wait_for(rec: &Recorder, want: WorkerState) -> WorkerState {
+    fn wait_for(rec: &Recorder, want: impl Fn(&PipelineStatus) -> bool) -> PipelineStatus {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let state = rec
-                .handle()
-                .pipeline_status()
-                .unwrap()
-                .worker_state()
-                .clone();
-            if state == want || Instant::now() > deadline {
-                return state;
+            let status = rec.handle().pipeline_status();
+            if want(&status) {
+                return status;
             }
+            assert!(Instant::now() < deadline, "unexpected status: {status:?}");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
 
     #[test]
-    fn stages_in_pipeline_order_then_running_then_stopped() {
+    fn processors_in_pipeline_order_then_running_then_stopped() {
         let rec = build(&[("First", Init::Ok), ("Second", Init::Ok)]);
-        let status = rec.handle().pipeline_status().unwrap();
-        let names: Vec<_> = status.stages().iter().map(PipelineStage::name).collect();
+        let status = rec.handle().pipeline_status();
+        let names: Vec<_> = status
+            .processors()
+            .iter()
+            .map(PipelineProcessor::name)
+            .collect();
         assert_eq!(names, ["First", "Second"]);
-        assert_eq!(wait_for(&rec, WorkerState::Running), WorkerState::Running);
+        let running = wait_for(&rec, |s| matches!(s, PipelineStatus::Running { .. }));
         let handle = rec.handle().clone();
         rec.graceful_shutdown(Duration::from_secs(5));
-        assert_eq!(
-            handle.pipeline_status().unwrap().worker_state(),
-            &WorkerState::Stopped {
-                cause: StopCause::Exited
+        let stopped = handle.pipeline_status();
+        assert!(matches!(
+            stopped,
+            PipelineStatus::Stopped {
+                cause: StopCause::Exited,
+                ..
             }
-        );
+        ));
+        assert_eq!(stopped.processors(), running.processors());
+        // Earlier snapshots don't change when the live pipeline changes.
+        assert!(matches!(running, PipelineStatus::Running { .. }));
     }
 
     #[test]
-    fn names_the_stage_whose_initialize_hangs() {
+    fn names_the_processor_whose_initialize_hangs() {
         let rec = build(&[("First", Init::Ok), ("Hanging", Init::Hang)]);
-        let want = WorkerState::Initializing {
-            stage: Some(PipelineStage::new("Hanging")),
-        };
-        assert_eq!(wait_for(&rec, want.clone()), want);
+        wait_for(&rec, |s| {
+            matches!(s, PipelineStatus::Initializing {
+                processor: Some(processor), ..
+            } if processor.name() == "Hanging")
+        });
         let handle = rec.handle().clone();
         // The drain timeout drops the hung `initialize()`.
         rec.graceful_shutdown(Duration::from_millis(10));
-        assert_eq!(
-            handle.pipeline_status().unwrap().worker_state(),
-            &WorkerState::Stopped {
-                cause: StopCause::DrainTimedOut
+        assert!(matches!(
+            handle.pipeline_status(),
+            PipelineStatus::Stopped {
+                cause: StopCause::DrainTimedOut,
+                ..
             }
-        );
+        ));
     }
 
     #[test]
     fn failed_initialize_is_stopped() {
         let rec = build(&[("First", Init::Ok), ("Failing", Init::Fail)]);
-        let want = WorkerState::Stopped {
-            cause: StopCause::InitializeFailed {
-                stage: PipelineStage::new("Failing"),
-            },
-        };
-        assert_eq!(wait_for(&rec, want.clone()), want);
+        wait_for(&rec, |s| {
+            matches!(s, PipelineStatus::Stopped {
+                cause: StopCause::InitializeFailed { processor }, ..
+            } if processor.name() == "Failing")
+        });
         rec.graceful_shutdown(Duration::from_secs(5));
     }
 
@@ -260,23 +270,56 @@ mod tests {
                 || {}
             })
             .build();
-        let want = WorkerState::Stopped {
-            cause: StopCause::Panicked,
-        };
-        assert_eq!(wait_for(&rec, want.clone()), want);
+        wait_for(&rec, |s| {
+            matches!(
+                s,
+                PipelineStatus::Stopped {
+                    cause: StopCause::Panicked,
+                    ..
+                }
+            )
+        });
         rec.graceful_shutdown(Duration::from_secs(5));
     }
 
     #[test]
-    fn no_pipeline_and_disconnected_have_no_status() {
+    fn no_pipeline_and_disconnected_have_distinct_statuses() {
         let rec = recorder(MemoryBuffer::new(1 << 20).unwrap()).build();
-        assert!(rec.handle().pipeline_status().is_none());
+        assert_eq!(
+            rec.handle().pipeline_status(),
+            PipelineStatus::NotConfigured
+        );
+        assert!(rec.handle().pipeline_status().processors().is_empty());
         rec.graceful_shutdown(Duration::from_secs(5));
+        assert_eq!(
+            crate::handle::Dial9Handle::disabled().pipeline_status(),
+            PipelineStatus::Disconnected,
+        );
         assert!(
             crate::handle::Dial9Handle::disabled()
                 .pipeline_status()
-                .is_none()
+                .processors()
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn paused_recording_still_reports_the_configured_pipeline() {
+        let rec = recorder(MemoryBuffer::new(1 << 20).unwrap())
+            .processors(vec![Box::new(Stage {
+                name: "Pending",
+                init: Init::Hang,
+            })])
+            .paused()
+            .build();
+        assert!(!rec.handle().is_enabled());
+        assert!(rec.handle().is_connected());
+        wait_for(&rec, |s| {
+            matches!(s, PipelineStatus::Initializing {
+                processor: Some(processor), ..
+            } if processor.name() == "Pending")
+        });
+        rec.graceful_shutdown(Duration::ZERO);
     }
 
     /// A panic unwinding past the guard is reported as `Panicked`.
@@ -289,42 +332,73 @@ mod tests {
             panic!("worker panicked");
         });
         assert!(result.is_err());
-        assert_eq!(
-            state.status().worker_state(),
-            &WorkerState::Stopped {
-                cause: StopCause::Panicked
+        assert!(matches!(
+            state.status(),
+            PipelineStatus::Stopped {
+                cause: StopCause::Panicked,
+                ..
             }
-        );
+        ));
     }
 
-    /// A stage still in `initialize()` when shutdown starts finishes during
+    /// A processor still in `initialize()` when shutdown starts finishes during
     /// the drain, and the worker exits normally.
-    #[test]
-    fn initialize_finishing_during_the_drain_is_exited() {
-        let rec = build(&[("Slow", Init::SlowOk)]);
-        let handle = rec.handle().clone();
-        rec.graceful_shutdown(Duration::from_secs(5));
-        assert_eq!(
-            handle.pipeline_status().unwrap().worker_state(),
-            &WorkerState::Stopped {
-                cause: StopCause::Exited
-            }
-        );
+    #[tokio::test(start_paused = true)]
+    async fn initialize_finishing_during_the_drain_is_exited() {
+        initialize_during_drain(Init::SlowOk, StopCause::Exited).await;
     }
 
-    /// A stage whose `initialize()` fails during the drain is named.
-    #[test]
-    fn initialize_failing_during_the_drain_is_initialize_failed() {
-        let rec = build(&[("Slow", Init::SlowFail)]);
-        let handle = rec.handle().clone();
-        rec.graceful_shutdown(Duration::from_secs(5));
-        assert_eq!(
-            handle.pipeline_status().unwrap().worker_state(),
-            &WorkerState::Stopped {
-                cause: StopCause::InitializeFailed {
-                    stage: PipelineStage::new("Slow")
-                }
-            }
-        );
+    /// A processor whose `initialize()` fails during the drain is named.
+    #[tokio::test(start_paused = true)]
+    async fn initialize_failing_during_the_drain_is_initialize_failed() {
+        initialize_during_drain(
+            Init::SlowFail,
+            StopCause::InitializeFailed {
+                processor: PipelineProcessor::new("Slow"),
+            },
+        )
+        .await;
+    }
+
+    async fn initialize_during_drain(init: Init, cause: StopCause) {
+        let state = Arc::new(PipelineState::new(vec!["Slow"]));
+        let mut config = super::super::BackgroundTaskConfig::builder()
+            .processors(vec![
+                Box::new(Stage { name: "Slow", init }) as Box<dyn SegmentProcessor>
+            ])
+            .build();
+        config.set_state(state.clone());
+        let fs = crate::fs::Fs::new_in_memory(1 << 20, 4096).unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let worker = super::super::run_background_task_inner(config, shutdown_rx, fs);
+        tokio::pin!(worker);
+
+        // Poll initialization until its timer is pending, without allowing
+        // paused time to advance automatically.
+        assert!(poll_once(worker.as_mut()).await.is_pending());
+        let initializing = state.status();
+        assert!(matches!(
+            &initializing,
+            PipelineStatus::Initializing { processor: Some(processor), .. }
+                if processor.name() == "Slow"
+        ));
+
+        shutdown_tx.send(Duration::from_secs(5)).unwrap();
+        // Initialization is still pending, so the ready shutdown message
+        // enters the drain arm before we advance the initializer's timer.
+        assert!(poll_once(worker.as_mut()).await.is_pending());
+        assert_eq!(state.status(), initializing);
+        tokio::time::advance(INIT_DELAY).await;
+        // Completing in one poll proves this result finishes during the
+        // drain, without silently advancing to its five-second deadline.
+        assert!(poll_once(worker.as_mut()).await.is_ready());
+        match state.status() {
+            PipelineStatus::Stopped { cause: actual, .. } => assert_eq!(actual, cause),
+            other => panic!("pipeline didn't stop after initialization: {other:?}"),
+        }
+    }
+
+    async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
     }
 }

@@ -134,9 +134,13 @@ impl Dial9Handle {
             .and_then(|i| i.shared.pipeline().dump_trigger.clone())
     }
 
-    /// The pipeline's stages and its worker's state. `None` on a disabled
-    /// handle or a recorder without a pipeline worker. Reads shared state;
-    /// the worker isn't involved.
+    /// A snapshot of the pipeline's lifecycle and ordered processors.
+    /// A disconnected handle reports `Disconnected`; a recorder without
+    /// a pipeline worker reports `NotConfigured`. Pausing recording doesn't
+    /// disconnect the handle or change the pipeline's lifecycle.
+    ///
+    /// Reads shared state; the worker isn't involved. Call again to refresh
+    /// the snapshot.
     ///
     /// Shutdown stops recording before the worker stops, so this can still
     /// report `Running` after [`is_stopped`](Self::is_stopped) returns `true`,
@@ -144,32 +148,30 @@ impl Dial9Handle {
     ///
     /// ```no_run
     /// # fn f(handle: dial9_core::handle::Dial9Handle) {
-    /// use dial9_core::pipeline::WorkerState;
+    /// use dial9_core::pipeline::PipelineStatus;
     ///
-    /// let Some(status) = handle.pipeline_status() else {
-    ///     eprintln!("no pipeline worker");
-    ///     return;
-    /// };
-    /// match status.worker_state() {
-    ///     WorkerState::Running { .. } => {}
-    ///     WorkerState::Initializing { stage, .. } => {
-    ///         eprintln!("waiting on {:?}", stage.as_ref().map(|s| s.name()))
+    /// match handle.pipeline_status() {
+    ///     PipelineStatus::Disconnected { .. } => eprintln!("no recorder"),
+    ///     PipelineStatus::NotConfigured { .. } => eprintln!("no pipeline worker"),
+    ///     PipelineStatus::Running { .. } => {}
+    ///     PipelineStatus::Initializing { processor, .. } => {
+    ///         eprintln!("waiting on {:?}", processor.as_ref().map(|p| p.name()))
     ///     }
     ///     other => eprintln!("pipeline not running: {other:?}"),
     /// }
     /// # }
     /// ```
     #[cfg(feature = "pipeline")]
-    pub fn pipeline_status(&self) -> Option<crate::pipeline::PipelineStatus> {
-        Some(
-            self.inner
-                .as_ref()?
-                .shared
-                .pipeline()
-                .state
-                .as_ref()?
-                .status(),
-        )
+    pub fn pipeline_status(&self) -> crate::pipeline::PipelineStatus {
+        use crate::pipeline::PipelineStatus;
+
+        let Some(inner) = &self.inner else {
+            return PipelineStatus::Disconnected;
+        };
+        match &inner.shared.pipeline().state {
+            Some(state) => state.status(),
+            None => PipelineStatus::NotConfigured,
+        }
     }
 
     /// Return the [`Dial9Handle`] to record through, resolved in order:
