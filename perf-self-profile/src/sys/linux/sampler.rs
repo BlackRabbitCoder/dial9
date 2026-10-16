@@ -268,40 +268,62 @@ impl PerfSampler {
 mod tests {
     use super::*;
 
-    /// A denied `perf_event_open` says how to allow it, with paranoid 2 for
-    /// user-space-only events, 1 for the rest and none for tracepoints; a
-    /// missing one doesn't.
-    #[test]
-    fn denied_perf_errors_say_how_to_allow_it() {
-        use crate::SamplingMode;
+    use crate::SamplingMode;
+    use rstest::rstest;
 
-        let ctxsw = SamplerConfig::default()
-            .event_source(EventSource::SwContextSwitches)
-            .sampling(SamplingMode::Period(1));
-        let cpu = SamplerConfig::default()
-            .event_source(EventSource::SwCpuClock)
-            .sampling(SamplingMode::FrequencyHz(99));
-        let cpu_kernel = cpu.clone().include_kernel(true);
-        let tracepoint = SamplerConfig::default()
-            .event_source(EventSource::Tracepoint(0))
-            .sampling(SamplingMode::Period(1));
-        for errno in [libc::EACCES, libc::EPERM] {
-            let err = io::Error::from_raw_os_error(errno);
-            for (config, level) in [(&ctxsw, "1,"), (&cpu, "2"), (&cpu_kernel, "1,")] {
-                let hint = allow_perf_hint(&err, config);
-                assert!(
-                    hint.contains(&format!("perf_event_paranoid to {level}")),
-                    "{errno}: {hint}"
-                );
-            }
-            let hint = allow_perf_hint(&err, &tracepoint);
-            assert!(hint.contains("CAP_PERFMON"), "{errno}: {hint}");
-            assert!(!hint.contains("perf_event_paranoid"), "{errno}: {hint}");
+    fn config(source: EventSource, sampling: SamplingMode, include_kernel: bool) -> SamplerConfig {
+        SamplerConfig::default()
+            .event_source(source)
+            .sampling(sampling)
+            .include_kernel(include_kernel)
+    }
+
+    /// A denied `perf_event_open` says how to allow it, with paranoid 2 for
+    /// user-space-only events, 1 for the rest and none for tracepoints.
+    #[rstest]
+    #[case::ctxsw(
+        config(EventSource::SwContextSwitches, SamplingMode::Period(1), false),
+        Some("1,")
+    )]
+    #[case::cpu(
+        config(EventSource::SwCpuClock, SamplingMode::FrequencyHz(99), false),
+        Some("2")
+    )]
+    #[case::cpu_kernel(
+        config(EventSource::SwCpuClock, SamplingMode::FrequencyHz(99), true),
+        Some("1,")
+    )]
+    #[case::tracepoint(
+        config(EventSource::Tracepoint(0), SamplingMode::Period(1), false),
+        None
+    )]
+    fn denied_perf_errors_say_how_to_allow_it(
+        #[values(libc::EACCES, libc::EPERM)] errno: i32,
+        #[case] config: SamplerConfig,
+        #[case] paranoid: Option<&str>,
+    ) {
+        let hint = allow_perf_hint(&io::Error::from_raw_os_error(errno), &config);
+        assert!(hint.contains("CAP_PERFMON"), "{hint}");
+        match paranoid {
+            Some(level) => assert!(
+                hint.contains(&format!("perf_event_paranoid to {level}")),
+                "{hint}"
+            ),
+            None => assert!(!hint.contains("perf_event_paranoid"), "{hint}"),
         }
-        for errno in [libc::ENOSYS, libc::EOPNOTSUPP] {
-            let err = io::Error::from_raw_os_error(errno);
-            assert_eq!(allow_perf_hint(&err, &ctxsw), "");
-        }
+    }
+
+    /// No hint when the kernel doesn't support `perf_event_open`: granting
+    /// access wouldn't help.
+    #[rstest]
+    fn missing_perf_errors_give_no_hint(#[values(libc::ENOSYS, libc::EOPNOTSUPP)] errno: i32) {
+        let ctxsw = config(
+            EventSource::SwContextSwitches,
+            SamplingMode::Period(1),
+            false,
+        );
+        let hint = allow_perf_hint(&io::Error::from_raw_os_error(errno), &ctxsw);
+        assert_eq!(hint, "");
     }
 
     #[test]
