@@ -14,6 +14,9 @@ these rules for all public APIs:
   optional or defaulted to avoid breaking existing callers.
 - **Mark config structs `#[non_exhaustive]`** if not using `#[bon::builder]`,
   so adding fields is not a breaking change.
+- **Do not implement `Copy` on public enums.** Variants may gain owned fields
+  later; implementing `Copy` commits every future field to being `Copy` too.
+  Prefer borrowing or explicit cloning.
 - **Make extensible public enums and their variants `#[non_exhaustive]`.**
   Use named fields for variant payloads instead of tuple fields. Provide
   constructors and setters for downstream callers, because non-exhaustive
