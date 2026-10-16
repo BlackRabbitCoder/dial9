@@ -17,6 +17,10 @@ these rules for all public APIs:
 - **Do not implement `Copy` on public enums.** Variants may gain owned fields
   later; implementing `Copy` commits every future field to being `Copy` too.
   Prefer borrowing or explicit cloning.
+- **Make extensible public enums and their variants `#[non_exhaustive]`.**
+  Use named fields for variant payloads instead of tuple fields. Provide
+  constructors and setters for downstream callers, because non-exhaustive
+  variants cannot be constructed outside their crate. Give new fields defaults.
 - **Think about semver hazards:** adding a required parameter, removing a
   public type, or changing a trait signature are all breaking. When in doubt,
   keep it private or behind a builder.

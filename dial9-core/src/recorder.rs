@@ -309,13 +309,35 @@ impl<M: BufferMode> RecorderBuilder<M> {
             }
         };
 
+        // Prepare both states before the worker can fail initialization:
+        // recording failures and pipeline status must reach the same handle.
+        #[cfg(feature = "pipeline")]
+        let pipeline_state = (!processors.is_empty() && writer.fs_handle().is_some()).then(|| {
+            Arc::new(crate::worker::state::PipelineState::new(
+                processors
+                    .iter()
+                    .map(|processor| processor.name())
+                    .collect(),
+            ))
+        });
+        let shared = SharedState::new(start_time_ns);
+        // The dump trigger pairs with the `trigger` receiver handed to the worker.
+        #[cfg(feature = "pipeline")]
+        let shared = shared.with_pipeline(crate::worker::state::PipelineShared {
+            dump_trigger: self.pending_dump_trigger,
+            state: pipeline_state.clone(),
+        });
+        let shared = Arc::new(shared);
+        for source in sources {
+            shared.push_source(source);
+        }
+
         // The worker borrows `&writer`, so it must be spawned before the writer
         // moves into `Recorder::start`.
         #[cfg(feature = "pipeline")]
-        let (worker, pipeline_state) = if processors.is_empty() {
-            (None, None)
+        let worker = if processors.is_empty() {
+            None
         } else {
-            let stages = processors.iter().map(|p| p.name()).collect();
             let poll = self
                 .worker_poll_interval
                 .unwrap_or(crate::worker::DEFAULT_POLL_INTERVAL);
@@ -323,37 +345,23 @@ impl<M: BufferMode> RecorderBuilder<M> {
                 .metrics_sink
                 .clone()
                 .unwrap_or_else(metrique::writer::sink::DevNullSink::boxed);
-            let config = crate::worker::BackgroundTaskConfig::builder()
+            let mut config = crate::worker::BackgroundTaskConfig::builder()
                 .maybe_trace_dir(M::IS_DISK.then(|| writer.trace_dir().to_path_buf()))
                 .maybe_trace_stem(M::IS_DISK.then(|| writer.trace_stem().to_string()))
                 .poll_interval(poll)
                 .processors(processors)
                 .metrics_sink(metrics)
                 .maybe_trigger(self.trigger)
+                .recording_state(shared.clone())
                 .build();
-            let state = Arc::new(crate::worker::state::PipelineState::new(stages));
-            let mut config = config;
-            config.set_state(state.clone());
+            if let Some(state) = pipeline_state {
+                config.set_state(state);
+            }
             let (tx, rx) = tokio::sync::oneshot::channel();
             let hook = self.thread_init.clone();
-            let worker = crate::worker::spawn(&writer, config, rx, move || hook())
-                .map(|wt| crate::recording::WorkerHandle::new(tx, wt));
-            // No worker, no status: a status here would stay `Initializing`.
-            let state = worker.is_some().then_some(state);
-            (worker, state)
+            crate::worker::spawn(&writer, config, rx, move || hook())
+                .map(|wt| crate::recording::WorkerHandle::new(tx, wt))
         };
-
-        let shared = SharedState::new(start_time_ns);
-        // The dump trigger pairs with the `trigger` receiver handed to the worker.
-        #[cfg(feature = "pipeline")]
-        let shared = shared.with_pipeline(crate::worker::state::PipelineShared {
-            dump_trigger: self.pending_dump_trigger,
-            state: pipeline_state,
-        });
-        let shared = Arc::new(shared);
-        for source in sources {
-            shared.push_source(source);
-        }
 
         let hook = self.thread_init.clone();
         #[allow(unused_mut)]
