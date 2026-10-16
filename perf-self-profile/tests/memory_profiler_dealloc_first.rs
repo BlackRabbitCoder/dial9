@@ -12,8 +12,6 @@ use dial9_trace_format::decoder::Decoder;
 use serde_json::Value;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 thread_local! {
     static PROFILE_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -49,30 +47,7 @@ fn first_dealloc_suppresses_collector_allocations_and_preserves_sampling() {
     let rec = recorder(MemoryBuffer::new(1 << 20).expect("memory buffer"))
         .paused()
         .build();
-    let ready = Arc::new(AtomicBool::new(false));
-    let run = Arc::new(AtomicBool::new(false));
-    let worker_ready = Arc::clone(&ready);
-    let worker_run = Arc::clone(&run);
     let old_allocation = vec![0u8; 512];
-
-    // Start before installing the profiler so the worker's first hook is a
-    // free of previously untracked memory, with no collector or sampling TLS.
-    let worker = std::thread::spawn(move || {
-        let tid = current_tid();
-        worker_ready.store(true, Ordering::Release);
-        while !worker_run.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
-        PROFILE_THREAD.with(|enabled| enabled.set(true));
-        drop(old_allocation);
-        let allocation = vec![0u8; 1536];
-        std::hint::black_box(&allocation);
-        drop(allocation);
-        tid
-    });
-    while !ready.load(Ordering::Acquire) {
-        std::hint::spin_loop();
-    }
     let _guard = MemoryProfiler::from_config(
         MemoryProfilingConfig::builder()
             .sample_rate_bytes(1)
@@ -81,7 +56,19 @@ fn first_dealloc_suppresses_collector_allocations_and_preserves_sampling() {
     )
     .install(rec.handle().clone())
     .expect("memory profiler install");
-    run.store(true, Ordering::Release);
+
+    // Setup uses System until this flag is set, so the worker's first hook is
+    // a free of previously untracked memory, with no collector or sampling TLS.
+    let worker = std::thread::spawn(move || {
+        let tid = current_tid();
+        PROFILE_THREAD.with(|enabled| enabled.set(true));
+        std::hint::black_box(&old_allocation);
+        drop(old_allocation);
+        let allocation = vec![0u8; 1536];
+        std::hint::black_box(&allocation);
+        drop(allocation);
+        tid
+    });
     let tid = worker
         .join()
         .expect("worker thread, including TLS teardown");
