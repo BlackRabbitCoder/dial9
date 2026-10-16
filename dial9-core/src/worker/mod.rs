@@ -59,6 +59,8 @@ pub struct BackgroundTaskConfig {
     /// and the pipeline only runs on an explicit dump request. Wired by the
     /// facade builder; absent for continuous processing.
     trigger: Option<crate::dump::DumpRx>,
+    #[builder(setters(vis = "pub(crate)"))]
+    recording_state: Option<crate::primitives::sync::Arc<crate::shared_state::SharedState>>,
     /// Processor order and pipeline state for `Dial9Handle::pipeline_status`. Set by
     /// the recorder builder.
     #[builder(skip)]
@@ -143,6 +145,7 @@ async fn run_background_task_inner(
     let processors = std::mem::take(&mut config.processors);
     let metrics_sink = config.metrics_sink.clone();
     let trigger = config.trigger.take();
+    let recording_state = config.recording_state.take();
     let record = |cause| {
         if let Some(stopped) = &stopped {
             stopped.record(cause);
@@ -168,7 +171,14 @@ async fn run_background_task_inner(
             trigger,
             state.as_deref(),
         )
-        .await?;
+        .await
+        .inspect_err(|error| {
+            if let Some(shared) = &recording_state
+                && disables_recording(error)
+            {
+                shared.disable_permanently();
+            }
+        })?;
         worker.run().await;
         io::Result::Ok(())
     };
@@ -454,6 +464,46 @@ fn record_dump_error(dumps: &mut [ActiveDump], matched: &[usize], kind: ProcessE
     }
 }
 
+#[derive(Debug)]
+struct ProcessorInitializationError {
+    processor_name: &'static str,
+    source: io::Error,
+}
+
+impl std::fmt::Display for ProcessorInitializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "processor {} initialization failed: {}",
+            self.processor_name, self.source
+        )
+    }
+}
+
+impl std::error::Error for ProcessorInitializationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn disables_recording(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if error.is::<crate::pipeline::DisableRecording>() {
+            return true;
+        }
+        // io::Error::source skips its payload, which may itself be the marker.
+        let source = error
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::get_ref)
+            .map(|error| error as &dyn std::error::Error)
+            .or_else(|| error.source());
+        match source {
+            Some(source) => error = source,
+            None => return false,
+        }
+    }
+}
+
 impl WorkerLoop {
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) async fn new(
@@ -499,7 +549,10 @@ impl WorkerLoop {
             processor.initialize().await.map_err(|error| {
                 io::Error::new(
                     error.kind(),
-                    format!("processor {processor_name} initialization failed: {error}"),
+                    ProcessorInitializationError {
+                        processor_name,
+                        source: error,
+                    },
                 )
             })?;
         }
