@@ -21,6 +21,7 @@ members = [
 ]
 exclude = [
     "dial9-trace-format/fuzz",
+    "examples/cuda-profiling",
 ]
 
 [workspace.package]

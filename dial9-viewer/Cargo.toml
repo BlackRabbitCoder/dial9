@@ -94,7 +94,7 @@ dial9-metrique = { workspace = true, features = ["tokio"] }
 dial9-utils = { workspace = true, features = ["span"] }
 time = "0.3"
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"], optional = true }
+aws-sdk-s3 = { version = "1.145", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"], optional = true }
 anyhow = "1"
 bon = "3"
 s3s = { version = "0.14.1", optional = true }
@@ -104,8 +104,8 @@ tempfile = { version = "3", optional = true }
 
 # Aggregator dependencies
 dial9-trace-format = { workspace = true, features = ["serde-deserialize"] }
-arrow = { version = "54", default-features = false }
-parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
+arrow = { version = "59.2", default-features = false }
+parquet = { version = "59.2", default-features = false, features = ["arrow", "zstd"] }
 blake3 = "1"
 lasso = "0.7"
 rustc-hash = "2"

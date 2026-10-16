@@ -20,7 +20,7 @@ bon = "3"
 # aws-smithy stack to enable it.
 tokio = { version = "1", features = ["fs", "sync"], default-features = false }
 tracing = "0.1.44"
-aws-sdk-s3 = { version = "1", default-features = false, features = [
+aws-sdk-s3 = { version = "1.145", default-features = false, features = [
     "behavior-version-latest",
     "sigv4a",
     "rt-tokio",
