@@ -116,13 +116,14 @@ fn sched_profiler_counts_drained_samples() {
     }
     assert_eq!(read(), Some(0));
 
-    // Sleeping switches this tracked thread out, which is what it samples.
+    // Joining a just-spawned thread blocks this tracked thread, switching it
+    // out, which is what it samples.
     let tracking = handle.track_current_thread().expect("track this thread");
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut batches = Vec::new();
     while read() == Some(0) && Instant::now() < deadline {
         for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::spawn(|| {}).join().expect("empty thread");
         }
         shared.flush_sources();
         batches.extend(drain_encoded_batches(&shared));
@@ -130,7 +131,7 @@ fn sched_profiler_counts_drained_samples() {
     drop(tracking);
 
     let drained = read().expect("still registered");
-    assert!(drained > 0, "no scheduler samples within 5s of sleeping");
+    assert!(drained > 0, "no scheduler samples within 5s of blocking");
     assert_eq!(drained, count_samples(&batches, SCHED_EVENT));
     rec.graceful_shutdown(Duration::ZERO);
 }
