@@ -32,14 +32,14 @@ impl std::fmt::Debug for PerfSampler {
 }
 
 /// `"; <how to allow it>"` when `err` says `perf_event_open` was denied, else
-/// `""`. Names the highest `perf_event_paranoid` that opens `config`'s events.
+/// `None`. Names the highest `perf_event_paranoid` that opens `config`'s events.
 /// Tracepoints get none: they can need `perf_event_paranoid` -1, which lets
 /// every user on the host read raw tracepoint data.
-fn allow_perf_hint(err: &io::Error, config: &SamplerConfig) -> &'static str {
+fn error_to_hint_text(err: &io::Error, config: &SamplerConfig) -> Option<&'static str> {
     if !matches!(err.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
-        return "";
+        return None;
     }
-    match config.event_source {
+    Some(match config.event_source {
         EventSource::Tracepoint(_) => {
             "; to allow it, grant CAP_PERFMON (before Linux 5.8, the broader \
              CAP_SYS_ADMIN) or allow perf_event_open in the container's seccomp profile"
@@ -55,7 +55,7 @@ fn allow_perf_hint(err: &io::Error, config: &SamplerConfig) -> &'static str {
              or set kernel.perf_event_paranoid to 1, which lets every user on the host \
              profile the kernel"
         }
-    }
+    })
 }
 
 /// Returns `true` if the error indicates `perf_event_open` is blocked by
@@ -84,9 +84,9 @@ impl PerfSampler {
     pub(crate) fn start_perf_only(config: SamplerConfig) -> io::Result<Self> {
         let perf =
             PerfSamplerImpl::start_for_pid(0, &config).map_err(|e| {
-                match allow_perf_hint(&e, &config) {
-                    "" => e,
-                    hint => {
+                match error_to_hint_text(&e, &config) {
+                    None => e,
+                    Some(hint) => {
                         io::Error::new(e.kind(), format!("perf_event_open blocked ({e}){hint}"))
                     }
                 }
@@ -182,14 +182,16 @@ impl PerfSampler {
                     );
                     Self::with_ctimer(&config)
                 }
-                SamplingMode::Period(_) => Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
+                SamplingMode::Period(_) => {
+                    let mut message = format!(
                         "perf_event_open blocked ({e}) and event-based sampling \
-                         has no userspace fallback (requires kernel support){}",
-                        allow_perf_hint(&e, &config)
-                    ),
-                )),
+                         has no userspace fallback (requires kernel support)"
+                    );
+                    if let Some(hint) = error_to_hint_text(&e, &config) {
+                        message.push_str(hint);
+                    }
+                    Err(io::Error::new(io::ErrorKind::Unsupported, message))
+                }
             },
             Err(e) => Err(e),
         }
@@ -303,7 +305,8 @@ mod tests {
         #[case] config: SamplerConfig,
         #[case] paranoid_level: Option<u8>,
     ) {
-        let hint = allow_perf_hint(&io::Error::from_raw_os_error(errno), &config);
+        let hint = error_to_hint_text(&io::Error::from_raw_os_error(errno), &config)
+            .expect("denied perf has a hint");
         assert!(hint.contains("CAP_PERFMON"), "{hint}");
         match paranoid_level {
             Some(level) => assert!(
@@ -323,8 +326,8 @@ mod tests {
             SamplingMode::Period(1),
             false,
         );
-        let hint = allow_perf_hint(&io::Error::from_raw_os_error(errno), &ctxsw);
-        assert_eq!(hint, "");
+        let hint = error_to_hint_text(&io::Error::from_raw_os_error(errno), &ctxsw);
+        assert_eq!(hint, None);
     }
 
     #[test]

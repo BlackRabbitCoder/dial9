@@ -14,6 +14,9 @@ these rules for all public APIs:
   optional or defaulted to avoid breaking existing callers.
 - **Mark config structs `#[non_exhaustive]`** if not using `#[bon::builder]`,
   so adding fields is not a breaking change.
+- **Do not implement `Copy` on public enums.** Variants may gain owned fields
+  later; implementing `Copy` commits every future field to being `Copy` too.
+  Prefer borrowing or explicit cloning.
 - **Think about semver hazards:** adding a required parameter, removing a
   public type, or changing a trait signature are all breaking. When in doubt,
   keep it private or behind a builder.

@@ -120,7 +120,7 @@ pub struct Sample {
 ///
 /// Variants are `#[non_exhaustive]` so they can gain fields: match them as
 /// `ActiveCpuBackend::Ctimer { .. }`, or compare [`as_str`](Self::as_str).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ActiveCpuBackend {
     /// `perf_event_open`. A `CpuProfiler` on it samples every thread
@@ -135,7 +135,7 @@ pub enum ActiveCpuBackend {
 
 impl ActiveCpuBackend {
     /// `"perf"` or `"ctimer"`, as written to segment metadata.
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Perf => "perf",
             Self::Ctimer => "ctimer",

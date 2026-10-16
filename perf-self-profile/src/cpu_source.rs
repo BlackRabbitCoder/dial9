@@ -373,8 +373,8 @@ impl CpuProfiler {
     }
 
     /// Backend selected at start; `Auto` resolves to one of them.
-    pub fn active_backend(&self) -> ActiveCpuBackend {
-        self.active_backend
+    pub fn active_backend(&self) -> &ActiveCpuBackend {
+        &self.active_backend
     }
 
     /// CPU samples from this process drained since start. Updated on the flush
@@ -393,7 +393,7 @@ impl CpuProfiler {
             if sample.pid != pid {
                 return;
             }
-            self.samples_drained += 1;
+            self.samples_drained = self.samples_drained.saturating_add(1);
             if !self.tid_to_name.contains_key(&sample.tid)
                 && let Some(name) = read_thread_name(sample.tid)
             {
@@ -586,7 +586,7 @@ impl SchedProfiler {
 
     pub(crate) fn drain(&mut self, mut f: impl FnMut(RawCpuSample)) {
         self.sampler.for_each_sample(|sample| {
-            self.samples_drained += 1;
+            self.samples_drained = self.samples_drained.saturating_add(1);
             f(RawCpuSample {
                 tid: sample.tid,
                 timestamp_nanos: sample.time,

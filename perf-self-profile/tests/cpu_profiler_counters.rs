@@ -66,7 +66,7 @@ fn ctimer_reports_its_backend_and_counts_drained_samples() {
     let shared = rec.shared().expect("live recorder").clone();
     let backend_and_drained = || {
         handle
-            .with_source(|p: &mut CpuProfiler| (p.active_backend(), p.samples_drained()))
+            .with_source(|p: &mut CpuProfiler| (p.active_backend().clone(), p.samples_drained()))
             .expect("ctimer profiler starts without perf access")
     };
     let (backend, samples) = backend_and_drained();
