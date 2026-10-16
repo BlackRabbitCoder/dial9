@@ -29,6 +29,10 @@
 //! `initialize()` never resolves, so the worker future can never complete
 //! on its own and `primitives::time::timeout`'s `Elapsed` branch is the
 //! only way the scenario ever returns.
+//!
+//! `shuttle_pipeline_state_races_shutdown` also drives
+//! `run_background_task_inner`, checking that the published worker state only
+//! moves forward and ends `Stopped`.
 
 use super::*;
 use crate::pipeline::ProcessError;
@@ -285,9 +289,13 @@ crate::shuttle_test! {
     // shuttle's harness for `shuttle_select!`.
     fn shuttle_background_task_contains_init_panic() {
         let fs = Fs::new_in_memory(1 << 20, 4096).unwrap();
-        let config = BackgroundTaskConfig::builder()
+        let state = crate::primitives::sync::Arc::new(state::PipelineState::new(vec![
+            "PanickingInitializer",
+        ]));
+        let mut config = BackgroundTaskConfig::builder()
             .processors(vec![Box::new(PanickingInitializer) as Box<dyn SegmentProcessor>])
             .build();
+        config.set_state(state.clone());
         let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         let worker = crate::primitives::thread::spawn(move || {
@@ -302,6 +310,13 @@ crate::shuttle_test! {
              run_background_task_inner's top-level catch_unwind, not \
              propagate to its caller"
         );
+        assert!(matches!(
+            state.status(),
+            crate::pipeline::PipelineStatus::Stopped {
+                cause: crate::pipeline::StopCause::Panicked,
+                ..
+            }
+        ));
     }
 }
 
@@ -350,5 +365,69 @@ crate::shuttle_test! {
 
         sender.join().unwrap();
         worker.join().unwrap();
+    }
+}
+
+crate::shuttle_test! {
+    default;
+    // Under any interleaving, readers see the state only move forward
+    // (initializing, running, stopped), and it ends stopped.
+    fn shuttle_pipeline_state_races_shutdown() {
+        use crate::pipeline::PipelineStatus;
+        use state::PipelineState;
+
+        fn rank(state: &PipelineStatus) -> u8 {
+            match state {
+                PipelineStatus::Initializing { .. } => 0,
+                PipelineStatus::Running { .. } => 1,
+                PipelineStatus::Stopped { .. } => 2,
+                other => panic!("configured pipeline has no worker: {other:?}"),
+            }
+        }
+
+        let fs = Fs::new_in_memory(1 << 20, 4096).unwrap();
+        let state =
+            crate::primitives::sync::Arc::new(PipelineState::new(vec!["CountingProcessor"]));
+        let mut config = BackgroundTaskConfig::builder()
+            .processors(vec![
+                Box::new(CountingProcessor(Arc::new(AtomicUsize::new(0))))
+                    as Box<dyn SegmentProcessor>,
+            ])
+            .build();
+        config.set_state(state.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let worker = crate::primitives::thread::spawn(move || {
+            shuttle::future::block_on(run_background_task_inner(config, shutdown_rx, fs));
+        });
+        let reader = crate::primitives::thread::spawn({
+            let state = state.clone();
+            move || {
+                let mut last = 0;
+                for _ in 0..4 {
+                    let now = rank(&state.status());
+                    assert!(now >= last, "worker state moved backwards: {last} -> {now}");
+                    last = now;
+                }
+            }
+        });
+
+        shutdown_tx
+            .send(Duration::ZERO)
+            .expect("worker holds the shutdown receiver until it exits");
+        worker.join().unwrap();
+        reader.join().unwrap();
+        // Shutdown with no drain time: the worker exits or the drain times
+        // out, depending on the schedule.
+        assert!(matches!(
+            state.status(),
+            PipelineStatus::Stopped {
+                cause: crate::pipeline::StopCause::Exited | crate::pipeline::StopCause::DrainTimedOut,
+                ..
+            }
+        ));
+        let status = state.status();
+        let names: Vec<_> = status.processors().iter().map(|p| p.name()).collect();
+        assert_eq!(names, ["CountingProcessor"]);
     }
 }
