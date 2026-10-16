@@ -169,7 +169,7 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hostname = "0.4"
-aws-sdk-s3 = { version = "1", default-features = false, features = [
+aws-sdk-s3 = { version = "1.145", default-features = false, features = [
     "behavior-version-latest",
     "default-https-client",
     "http-1x",
