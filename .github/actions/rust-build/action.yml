@@ -8,6 +8,14 @@ inputs:
         required: false
         description: "whether to save the cache (e.g. only on main)"
         default: "true"
+    tokio-version:
+        required: false
+        description: "exact Tokio version to resolve before running tests"
+        default: ""
+    test-manifest:
+        required: false
+        description: "standalone consumer manifest for minimum-version tests"
+        default: ""
 
 runs:
     using: "composite"
@@ -35,10 +43,24 @@ runs:
         - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
           with:
               toolchain: ${{ inputs.toolchain }}
+        - name: Resolve the minimum supported Tokio version
+          if: inputs.tokio-version != ''
+          shell: bash
+          env:
+              TOKIO_VERSION: ${{ inputs.tokio-version }}
+              TEST_MANIFEST: ${{ inputs.test-manifest }}
+          run: |
+              manifest_args=()
+              if [ -n "$TEST_MANIFEST" ]; then
+                  manifest_args=(--manifest-path "$TEST_MANIFEST")
+              fi
+              cargo update "${manifest_args[@]}" -p tokio --precise "$TOKIO_VERSION"
+              cargo tree "${manifest_args[@]}" --locked -p tokio --depth 0
         - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
           with:
               save-if: ${{ inputs.save-if }}
               cache-bin: "false"
+              key: ${{ inputs.tokio-version }}
         - uses: taiki-e/install-action@184183c2401be73c3bf42c2e61268aa5855379c1 # v2
           with:
               tool: nextest
@@ -52,15 +74,29 @@ runs:
           shell: bash
           env:
               RUSTFLAGS: "--cfg tokio_unstable -C force-frame-pointers=yes"
+              TOKIO_VERSION: ${{ inputs.tokio-version }}
+              TEST_MANIFEST: ${{ inputs.test-manifest }}
           run: |
-              if [ "${{ inputs.toolchain }}" = nightly ]; then
+              if [ "${{ inputs.toolchain }}" = nightly ] && [ -z "$TOKIO_VERSION" ]; then
                   rm -fv Cargo.lock
+              fi
+              lock_args=()
+              manifest_args=()
+              if [ -n "$TOKIO_VERSION" ]; then
+                  lock_args=(--locked)
+              fi
+              if [ -n "$TEST_MANIFEST" ]; then
+                  manifest_args=(--manifest-path "$TEST_MANIFEST")
               fi
               # tokio's `taskdump` feature only compiles on linux aarch64/x86/x86_64.
               # On macOS drop it from --all-features; leave everything else intact.
               if [ "$RUNNER_OS" = "Linux" ]; then
                   # Raise locked-memory limit for large perf ring buffers
                   sudo prlimit --pid $$ --memlock=unlimited:unlimited
+              fi
+              if [ -n "$TOKIO_VERSION" ]; then
+                  cargo nextest run "${manifest_args[@]}" --locked --all-features
+              elif [ "$RUNNER_OS" = "Linux" ]; then
                   cargo test --all-targets --all-features
               else
                   cargo test --all-targets --features __nonlinux_all_features
@@ -70,14 +106,27 @@ runs:
               # threads, so unrelated tests would race for the guard; nextest's
               # one-process-per-test model avoids that without changing any
               # test to work around it.
-              cargo nextest run -p dial9-core --lib
+              if [ -z "$TEST_MANIFEST" ]; then
+                  cargo nextest run "${lock_args[@]}" -p dial9-core --lib
+              fi
         - name: Test optimized caller stacks on both CPU sampling backends
           if: runner.os == 'Linux'
           shell: bash
           env:
               DIAL9_REQUIRE_PERF: "1"
               RUSTFLAGS: "--cfg tokio_unstable -C force-frame-pointers=yes"
+              TOKIO_VERSION: ${{ inputs.tokio-version }}
+              TEST_MANIFEST: ${{ inputs.test-manifest }}
           run: |
               sudo prlimit --pid $$ --memlock=unlimited:unlimited
-              cargo test --release -p dial9-perf-self-profile \
-                --features cpu-profiling --test call_site_inline_stack
+              lock_args=()
+              if [ -n "$TOKIO_VERSION" ]; then
+                  lock_args=(--locked)
+              fi
+              if [ -n "$TEST_MANIFEST" ]; then
+                  cargo test --manifest-path "$TEST_MANIFEST" --locked --release \
+                    --all-features --test call_site_inline_stack
+              else
+                  cargo test "${lock_args[@]}" --release -p dial9-perf-self-profile \
+                    --features cpu-profiling --test call_site_inline_stack
+              fi

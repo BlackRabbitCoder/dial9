@@ -47,7 +47,7 @@ dial9-metrique = { workspace = true, optional = true }
 dial9-viewer = { workspace = true, optional = true, default-features = false }
 anyhow = { version = "1", optional = true }
 
-tokio = { version = "1.52.0", optional = true, default-features = false, features = [
+tokio = { version = "1.51.0", optional = true, default-features = false, features = [
     "rt",
     "rt-multi-thread",
 ] }
@@ -130,6 +130,7 @@ analysis = ["deserialize", "tokio", "dial9-tokio-telemetry/analysis"]
 worker-s3 = ["tokio", "dep:dial9-destinations-s3", "dial9-tokio-telemetry/worker-s3"]
 
 ## Async backtraces at Tokio yield points (Linux only).
+## Requires Tokio >= 1.53.2.
 taskdump = ["tokio", "dial9-tokio-telemetry/taskdump"]
 
 ## TCP accept-queue depth sampling as a standalone `Source` (Linux only).
