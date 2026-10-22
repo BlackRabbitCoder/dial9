@@ -70,6 +70,7 @@ impl<A: GlobalAlloc> Dial9Allocator<A> {
 // invocations are allocation-free by construction — see
 // [`crate::memory_profiling::hook`] module docs and design §6.
 unsafe impl<A: GlobalAlloc> GlobalAlloc for Dial9Allocator<A> {
+    #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: `layout` validity contract forwarded to the inner allocator.
         let ptr = unsafe { self.0.alloc(layout) };
@@ -84,6 +85,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Dial9Allocator<A> {
         ptr
     }
 
+    #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: `on_dealloc` is allocation-free (see hook module docs) — it
         // performs no allocations, takes no locks, and only accesses lock-free
@@ -96,6 +98,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Dial9Allocator<A> {
         unsafe { self.0.dealloc(ptr, layout) };
     }
 
+    #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
         let active = crate::memory_profiling::profiler::ACTIVE.get();
         // The old block's liveset entry must come out BEFORE forwarding to
@@ -127,6 +130,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Dial9Allocator<A> {
         new_ptr
     }
 
+    #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded to the inner allocator.
         let ptr = unsafe { self.0.alloc_zeroed(layout) };

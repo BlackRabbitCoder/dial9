@@ -6,8 +6,9 @@
 //! Usage: `cargo bench -p dial9-tokio-telemetry --features memory-profiling \
 //!     --bench memory_profiling_bench`
 //!
-//! Three groups (per design §10):
+//! Four groups:
 //! - tight_alloc: high-frequency small allocs, measures fast-path cost.
+//! - zeroed_alloc: exercises the alloc_zeroed path.
 //! - realloc_growth: Vec::push pattern, exercises the realloc path.
 //! - mixed_sizes: varying sizes across the sample-rate boundary.
 //!
@@ -24,6 +25,7 @@
 use criterion::{Criterion, Throughput};
 use dial9_tokio_telemetry::memory_profiling::Dial9Allocator;
 use std::alloc::{GlobalAlloc, Layout};
+use std::hint::black_box;
 
 fn bench_tight_alloc(c: &mut Criterion) {
     let allocator = Dial9Allocator::system();
@@ -34,9 +36,26 @@ fn bench_tight_alloc(c: &mut Criterion) {
     group.bench_function("alloc_dealloc_64b", |b| {
         b.iter(|| {
             // SAFETY: layout is valid, we dealloc immediately.
-            let ptr = unsafe { allocator.alloc(layout) };
+            let ptr = unsafe { allocator.alloc(black_box(layout)) };
             assert!(!ptr.is_null());
-            unsafe { allocator.dealloc(ptr, layout) };
+            unsafe { allocator.dealloc(black_box(ptr), layout) };
+        });
+    });
+    group.finish();
+}
+
+fn bench_zeroed_alloc(c: &mut Criterion) {
+    let allocator = Dial9Allocator::system();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+
+    let mut group = c.benchmark_group("zeroed_alloc");
+    group.throughput(Throughput::Bytes(64));
+    group.bench_function("alloc_zeroed_dealloc_64b", |b| {
+        b.iter(|| {
+            // SAFETY: layout is valid, we dealloc immediately.
+            let ptr = unsafe { allocator.alloc_zeroed(black_box(layout)) };
+            assert!(!ptr.is_null());
+            unsafe { allocator.dealloc(black_box(ptr), layout) };
         });
     });
     group.finish();
@@ -52,20 +71,21 @@ fn bench_realloc_growth(c: &mut Criterion) {
         b.iter(|| {
             let layout = Layout::from_size_align(64, 8).unwrap();
             // SAFETY: layout is valid.
-            let mut ptr = unsafe { allocator.alloc(layout) };
+            let mut ptr = unsafe { allocator.alloc(black_box(layout)) };
             assert!(!ptr.is_null());
             let mut current_layout = layout;
             let mut size = 128usize;
             while size <= 4096 {
                 // SAFETY: ptr was allocated with current_layout, new_size > 0.
-                let new_ptr = unsafe { allocator.realloc(ptr, current_layout, size) };
+                let new_ptr =
+                    unsafe { allocator.realloc(black_box(ptr), current_layout, black_box(size)) };
                 assert!(!new_ptr.is_null());
                 ptr = new_ptr;
                 current_layout = Layout::from_size_align(size, 8).unwrap();
                 size *= 2;
             }
             // SAFETY: ptr was allocated with current_layout.
-            unsafe { allocator.dealloc(ptr, current_layout) };
+            unsafe { allocator.dealloc(black_box(ptr), current_layout) };
         });
     });
     group.finish();
@@ -83,10 +103,10 @@ fn bench_mixed_sizes(c: &mut Criterion) {
             for &size in sizes {
                 let layout = Layout::from_size_align(size, 8).unwrap();
                 // SAFETY: layout is valid.
-                let ptr = unsafe { allocator.alloc(layout) };
+                let ptr = unsafe { allocator.alloc(black_box(layout)) };
                 assert!(!ptr.is_null());
                 // SAFETY: ptr was allocated with this layout.
-                unsafe { allocator.dealloc(ptr, layout) };
+                unsafe { allocator.dealloc(black_box(ptr), layout) };
             }
         });
     });
@@ -139,6 +159,7 @@ fn main() {
 
     let mut criterion = Criterion::default().configure_from_args();
     bench_tight_alloc(&mut criterion);
+    bench_zeroed_alloc(&mut criterion);
     bench_realloc_growth(&mut criterion);
     bench_mixed_sizes(&mut criterion);
     criterion.final_summary();
