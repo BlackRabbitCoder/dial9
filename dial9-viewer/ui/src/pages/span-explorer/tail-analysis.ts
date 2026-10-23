@@ -1,4 +1,4 @@
-import { html, nothing, render, svg } from "lit-html";
+import { html, nothing, render, type TemplateResult } from "lit-html";
 import {
   buildExemplarViewerUrl,
   TIME_CATEGORIES,
@@ -15,6 +15,10 @@ import type {
 import { buildApiUrl, type PageScope, type ViewState } from "./scope.js";
 import { fetchRawTraceBytes } from "./raw.js";
 import { renderPropertyHistograms } from "./categorical-histograms.js";
+import { correlationLabel } from "./correlation-label.js";
+import { renderNumericPlot } from "./numeric-plot.js";
+import { renderPropertyCohorts } from "./property-cohorts.js";
+import { formatHumanDuration } from "../../lib/trace/api_format.js";
 import "./tail-analysis.css";
 
 interface Context {
@@ -26,13 +30,15 @@ interface Context {
   onBand: (minMs: number | null, maxMs: number | null) => void;
 }
 const number = (n: number | null, digits = 2) =>
-  n == null || !Number.isFinite(n) ? "unavailable" : n.toLocaleString(undefined, { maximumFractionDigits: digits });
-const ms = (n: number | null) => `${number(n, 3)}${n == null ? "" : " ms"}`;
+  n == null || !Number.isFinite(n) ? "unavailable"
+    : n !== 0 && Math.abs(n) < 10 ** -digits ? n.toPrecision(3)
+    : n.toLocaleString(undefined, { maximumFractionDigits: digits });
+const ms = (n: number | null) => n == null ? "unavailable" : formatHumanDuration(n * 1e6);
 const percent = (n: number) => `${number(n * 100, 1)}%`;
 function value(n: number | null, unit: string | null): string {
   if (n == null) return "unavailable";
   if (unit === "ns") return ms(n / 1e6);
-  if (unit === "us" || unit === "µs") return ms(n / 1000);
+  if (unit === "us" || unit === "µs" || unit === "μs") return ms(n / 1000);
   if (unit === "ms") return ms(n);
   if (unit === "s") return ms(n * 1000);
   if (unit === "bytes") return n >= 1e6 ? `${number(n / 1e6)} MB` : n >= 1000 ? `${number(n / 1000)} kB` : `${number(n)} bytes`;
@@ -55,6 +61,7 @@ export class SpanTailAnalysis {
   private categoryKey = "";
   private categoryMode: "overlay" | "stacked" = "overlay";
   private expandedKey: string | null = null;
+  private info: { title: string; body: TemplateResult; trigger: HTMLElement } | null = null;
   private sourceCount = 0;
   private sourceUsed = 0;
   private truncated = false;
@@ -77,6 +84,7 @@ export class SpanTailAnalysis {
       this.categoryKey = "";
       this.categoryMode = "overlay";
       this.expandedKey = null;
+      this.info = null;
       this.key = key;
       this.selection = { percentile: 99, groupKey: null, groupValue: null, minMs: null, maxMs: null };
     }
@@ -111,6 +119,7 @@ export class SpanTailAnalysis {
     this.request = request;
     const firstReport = this.report == null;
     this.expandedKey = null;
+    this.info = null;
     this.busy = true;
     this.status = "Computing latency comparison…";
     this.draw();
@@ -129,18 +138,21 @@ export class SpanTailAnalysis {
       }
       let options: RequestInit = { headers: context.headers, signal: request.signal };
       if (context.scope.trace) {
-        if (!this.rawBytes) this.rawBytes = await fetchRawTraceBytes(context.scope.trace, location.origin, context.headers);
+        const rawBytes = this.rawBytes ?? await fetchRawTraceBytes(context.scope.trace, location.origin, context.headers,
+          (url, init) => fetch(url, { ...init, signal: request.signal }));
         if (generation !== this.generation) return;
+        this.rawBytes = rawBytes;
         // A raw trace has its own complete scope. Its bytes are decoded by Rust.
         url.searchParams.delete("start_ns");
         url.searchParams.delete("end_ns");
-        options = { method: "POST", headers: { "content-type": "application/octet-stream" }, body: this.rawBytes, signal: request.signal };
+        options = { method: "POST", headers: { "content-type": "application/octet-stream" }, body: rawBytes, signal: request.signal };
       }
       const response = await fetch(url, options);
       if (!response.ok) throw new Error(`Backend analysis failed (${response.status}): ${await response.text()}`);
       const reply: TailResponse = await response.json();
       if (generation !== this.generation) return;
-      this.report = reply.report;
+      // Old cached reports may still include fields that repeat elapsed time.
+      this.report = { ...reply.report, signals: reply.report.signals.filter(signal => !signal.duplicatesLatency) };
       this.sourceUsed = reply.filesUsed;
       this.sourceCount = reply.filesMatched;
       this.truncated = reply.truncated;
@@ -180,78 +192,84 @@ export class SpanTailAnalysis {
     this.container?.querySelector<HTMLDialogElement>(".tail-plot-dialog")?.showModal();
   }
 
+  private explain(event: Event, title: string, body: TemplateResult): void {
+    const trigger = event.currentTarget as HTMLElement;
+    trigger.focus();
+    this.info = { title, body, trigger };
+    this.draw();
+    this.container?.querySelector<HTMLDialogElement>(".tail-info-dialog")?.showModal();
+  }
+
+  private observationExplanation(signal: TailSignal): TemplateResult {
+    const selected = this.selection.minMs != null || this.selection.maxMs != null;
+    const groups = [
+      { name: "Typical", count: signal.typicalCount, coverage: signal.typicalCoverage },
+      { name: selected ? "Selected" : "Slow", count: signal.slowCount, coverage: signal.slowCoverage },
+    ];
+    return html`<p>${signal.key}</p>
+      <dl class="tail-info-values">${groups.map(group => html`<dt>${group.name}</dt>
+        <dd>${number(group.count, 0)} recorded values · ${percent(group.coverage)} coverage</dd>`)}</dl>
+      <ul>${groups.flatMap(group => [
+        group.count < 20 ? html`<li>${group.name} has ${group.count} recorded values; at least 20 are required.</li>` : nothing,
+        group.coverage < .5 ? html`<li>${group.name} records this field for ${percent(group.coverage)} of spans; at least 50% coverage is required.</li>` : nothing,
+      ])}</ul>
+      <p>The badge appears below either threshold in either group. Missing values are excluded; they are never treated as zero. The visible difference can be unstable with few observations or selective recording.</p>`;
+  }
+
   private plot(signal: TailSignal, large = false) {
-    const points = signal.points;
-    if (!points.length) return html`<div class="tail-empty-plot">No trace-linked points available</div>`;
-    let maxX = this.report?.examples[0]?.elapsedMs ?? 1e-9, minY = 0, maxY = 1e-9;
-    // The same elapsed-time scale across panels makes their shapes comparable.
-    for (const field of this.report?.signals ?? []) {
-      for (const [x] of field.points) maxX = Math.max(maxX, x);
-    }
-    // A bounded point sample can end before the requested comparison range.
-    maxX = Math.max(maxX, this.report!.boundaryMs, this.selection.maxMs ?? 0);
-    for (const [, y] of points) { minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
-    const band = this.selection.minMs != null || this.selection.maxMs != null;
-    const width = large ? 700 : 400, height = large ? 330 : 205;
-    const left = large ? 80 : 57, right = width - 18, top = band ? 46 : 32, bottom = height - 39;
-    const px = (x: number) => left + x / maxX * (right - left);
-    const py = (y: number) => bottom - (y - minY) / (maxY - minY) * (bottom - top);
-    const boundary = this.report!.boundaryMs;
-    const marker = (x: number, label: string, y: number) => {
-      if (x > maxX) return nothing;
-      const end = px(x) > (left + right) / 2;
-      return svg`<g class="tail-boundary">
-        <path d="M${px(x)} ${top}V${bottom}" stroke="#f6ae65" stroke-dasharray="3 4" opacity=".8"></path>
-        <text class="tail-cutoff-label" x=${end ? px(x) - 4 : Math.max(left + 28, px(x) + 4)} y=${y} text-anchor=${end ? "end" : "start"}>${label}</text>
-      </g>`;
-    };
-    return html`<svg class="tail-scatter" viewBox="0 0 ${width} ${height}" role="img"
-      aria-label="${signal.key} (${signal.unit ?? "unit not recorded"}) against total span elapsed time in milliseconds; linear axes; ${band ? `custom selection from ${ms(boundary)} to ${this.selection.maxMs == null ? "∞" : ms(this.selection.maxMs)}` : `p${this.selection.percentile} cutoff at ${ms(boundary)}`}">
-      ${[0, 0.5, 1].map(f => svg`
-        <path d="M${left} ${py(minY + f * (maxY - minY))}H${right}" stroke="#344354" stroke-dasharray="2 3"></path>
-        <text x=${px(f * maxX)} y=${bottom + 18} text-anchor="middle">${number(f * maxX, maxX < 1 ? 3 : 1)}</text>
-        <text x=${left - 6} y=${py(minY + f * (maxY - minY)) + 4} text-anchor="end">${signal.unit === "bytes" ? value(minY + f * (maxY - minY), "bytes") : number(minY + f * (maxY - minY), maxY < 1 ? 3 : 1)}</text>`)}
-      <path d="M${left} ${top}V${bottom}H${right}" fill="none" stroke="#687584"></path>
-      <text x=${left} y="13" class="tail-axis-unit">${signal.unit ?? "unit not recorded"}</text>
-      ${marker(boundary, band ? `Start: ${ms(boundary)}` : `p${this.selection.percentile} cutoff: ${ms(boundary)}`, 27)}
-      ${band && this.selection.maxMs != null ? marker(this.selection.maxMs, `End: ${ms(this.selection.maxMs)}`, 41) : nothing}
-      ${points.map(([x, y, row]) => svg`<circle cx=${px(x)} cy=${py(y)} r=${large ? 3 : 2.4}
-        fill=${x >= boundary && (this.selection.maxMs == null || x <= this.selection.maxMs) ? "#f6ae65" : "#71869c"}
-        opacity="0.7" tabindex="0" role="link"
-        aria-label=${`Inspect span: ${ms(x)}, ${signal.key} ${value(y, signal.unit)}`}
-        @click=${() => this.jump(row)}
-        @keydown=${(e: KeyboardEvent) => { if (e.key === "Enter") this.jump(row); }}>
-        <title>${ms(x)} elapsed · ${signal.key}: ${value(y, signal.unit)} · inspect trace</title>
-      </circle>`)}
-      <text x=${(left + right) / 2} y=${height - 3} text-anchor="middle">Span elapsed (ms) →</text>
-    </svg>`;
+    return renderNumericPlot(signal, {
+      signals: this.report?.signals ?? [],
+      boundaryMs: this.report!.boundaryMs,
+      percentile: this.selection.percentile,
+      minMs: this.selection.minMs,
+      maxMs: this.selection.maxMs,
+      large,
+      onJump: row => this.jump(row),
+    });
   }
 
   private signal(signal: TailSignal, i: number) {
     const band = this.selection.minMs != null || this.selection.maxMs != null;
     const limited = Math.min(signal.typicalCount, signal.slowCount) < 20 || Math.min(signal.typicalCoverage, signal.slowCoverage) < 0.5;
     return html`<article class="tail-field">
-      <div class="tail-field-heading"><h4><span class="tail-rank">${i + 1}</span>${signal.key}</h4>
+      <div class="tail-field-heading"><h4><span class="tail-rank" title="Ordered by the backend's comparison of group distributions; limited observations come last.">${i + 1}</span>${signal.key}</h4>
         <button class="tail-expand" aria-label="Enlarge ${signal.key} plot" title="Enlarge plot" @click=${() => this.expand(signal)}>⤢</button>
       </div>
       <div class="tail-field-means"><span><span class="tail-dot typical"></span>Typical <strong>${value(signal.typical, signal.unit)}</strong></span>
         <span><span class="tail-dot slow"></span>${band ? "Selected" : "Slow"} <strong>${value(signal.slow, signal.unit)}</strong></span></div>
       ${this.plot(signal)}
       <div class="tail-signal-stats">
-        <span title="Spearman rank correlation: larger values and longer spans rising together. +1 rises together; 0 has no consistent monotonic trend; −1 moves in opposite directions. Based on up to 2,048 sampled observations.">Spearman <strong>${number(signal.correlation, 2)}</strong></span>
+        <button class="tail-correlation" type="button" aria-label="${correlationLabel(signal.correlation)}: explain ${signal.key} correlation"
+          @click=${(event: Event) => this.explain(event, correlationLabel(signal.correlation), html`
+            <dl class="tail-info-values"><dt>Spearman rank correlation</dt><dd>${number(signal.correlation, 4)}</dd>
+              <dt>Recorded spans compared</dt><dd>${number(signal.correlationCount, 0)}</dd></dl>
+            <p>Spearman compares the order of field values with the order of elapsed times. +1 means both orders match perfectly; −1 means they are perfectly reversed. Near zero means no consistent increase or decrease; separate clusters can still exist.</p>
+            <p>The backend compares up to 2,048 recorded observations sampled across latency ranks. Labels use the magnitude: below 0.1 not correlated, 0.1–0.3 weak, 0.3–0.7 moderate, and 0.7–1 high. Only exactly +1 or −1 is called perfect. This is descriptive and does not prove a cause.</p>`)}>
+          ${correlationLabel(signal.correlation)} <span aria-hidden="true">ⓘ</span>
+        </button>
       </div>
       <div class="tail-signal-meta">
-        <span title="Source files with the same direction as the overall difference; each qualifying file has at least five values in both groups. This is repetition, not a significance test.">${signal.filesCompared ? `${signal.filesAgree}/${signal.filesCompared} files agree` : "File check unavailable"}</span>
+        <button class="tail-meta-button" type="button" @click=${(event: Event) => this.explain(event, "Repetition across source files", html`
+          <p>${signal.key}: ${signal.filesAgree} of ${signal.filesCompared} qualifying files reproduce the overall direction of the typical/slow value comparison: higher or lower values.</p>
+          <p>A file qualifies with at least five recorded values in both groups. ${signal.filesCompared ? "Agreement is repetition, not a significance test or a cause." : "No files met that threshold; repetition cannot be checked."}</p>`)}>
+          ${signal.filesCompared ? `${signal.filesAgree}/${signal.filesCompared} files agree` : "File check unavailable"} <span aria-hidden="true">ⓘ</span>
+        </button>
         ${signal.typicalCoverage < 1 || signal.slowCoverage < 1 ? html`<span title="Recorded-value coverage: typical / slow. Missing values are excluded, never treated as zero.">${percent(signal.typicalCoverage)} / ${percent(signal.slowCoverage)} coverage</span>` : nothing}
       </div>
-      ${signal.duplicatesLatency ? html`<span class="tail-badge">Repeats elapsed time</span>` : limited ? html`<span class="tail-badge">Limited observations</span>` : nothing}
+      ${limited ? html`<button class="tail-badge" type="button" aria-label="Explain limited observations for ${signal.key}"
+        @click=${(event: Event) => this.explain(event, "Limited observations", this.observationExplanation(signal))}>Limited observations <span aria-hidden="true">ⓘ</span></button>` : nothing}
     </article>`;
   }
 
   private compositionRow(label: string, composition: TailComposition | null | undefined, elapsed: number | null) {
     return html`<div class="tail-composition-row">
       <div class="tail-composition-label">${label}
-        ${composition && composition.detailedCoverage < 1 ? html`<span class="tail-composition-quality" title="${number(composition.detailedCount, 0)}/${number(composition.count, 0)} spans have complete detail">${composition.detailedCoverage > .9995 ? "<100%" : percent(composition.detailedCoverage)} detailed</span>` : nothing}
+        ${composition && composition.detailedCoverage < 1 ? html`<button class="tail-composition-quality" type="button"
+          @click=${(event: Event) => this.explain(event, `${label} time detail`, html`
+            <p>${number(composition.detailedCount, 0)} of ${number(composition.count, 0)} spans have complete time detail (${percent(composition.detailedCoverage)}).</p>
+            <p>Missing composition contributes Unknown. The bar shows the average share per span, while the category durations are means across the group. These are estimates of recorded time, not the cause of a wait.</p>`)}>
+          ${composition.detailedCoverage > .9995 ? "<100%" : percent(composition.detailedCoverage)} detailed <span aria-hidden="true">ⓘ</span>
+        </button>` : nothing}
       </div>
       ${composition ? html`<div class="tail-composition-bar" role="img" aria-label="${label} time breakdown: ${composition.categories.map(c => `${TIME_CATEGORIES.find(cat => cat.key === c.key)?.label ?? c.key} ${percent(c.share)}`).join(", ")}">
         ${composition.categories.filter(c => c.share > 0).map(c => {
@@ -268,9 +286,11 @@ export class SpanTailAnalysis {
     if (!this.container || !this.context) return;
     const r = this.report;
     const band = this.selection.minMs != null || this.selection.maxMs != null;
-    const changes = r?.mixChanges ?? [];
+    const info = this.info;
     const expanded = r?.signals.find(s => s.key === this.expandedKey);
     const histograms = r?.histograms ?? [];
+    const histogram = histograms.find(h => h.key === this.categoryKey) ?? histograms[0];
+    const group = r?.groups.find(g => g.key === histogram?.key);
     this.container.closest(".detail-panel")?.classList.toggle("tail-analysis-ready", r != null);
     render(html`<section class="span-tail-analysis" aria-busy=${this.busy}>
       <div class="tail-heading"><h3>How are slow spans different?</h3>
@@ -304,11 +324,19 @@ export class SpanTailAnalysis {
           <span title="All boundary ties are included."><span class="tail-dot typical"></span><strong>Typical</strong> ≤ median ${ms(r.medianMs)} · ${number(r.typicalCount, 0)}</span>
           <span><span class="tail-dot slow"></span><strong>${band ? "Selected" : `Slow p${this.selection.percentile}+`}</strong> ${band ? `${ms(r.boundaryMs)}–${this.selection.maxMs == null ? "∞" : ms(this.selection.maxMs)}` : `≥ ${ms(r.boundaryMs)}`} · ${number(r.slowCount, 0)}</span>
         </div>
-        ${this.sourceUsed < this.sourceCount || this.truncated || this.fieldsTruncated ? html`<p class="tail-warning">Partial sample · ${this.sourceUsed}/${this.sourceCount} files. ${this.truncated ? "One million span limit reached." : ""} ${this.fieldsTruncated ? "Field discovery limit reached." : ""}</p>` : nothing}
-        ${r.slowCount < 20 ? html`<p class="tail-warning">Only ${r.slowCount} ${band ? "selected" : "slow"} spans · widen the group or time window before relying on these differences.</p>` : nothing}
-        ${changes.length && !this.selection.groupKey ? html`<div class="tail-mix"><strong>Mix shift</strong>
-          ${changes.map(g => html`<span title=${g.key}>${g.value} ${percent(g.typical)} → ${percent(g.slow)}</span>`)}
-          <span class="tail-muted">Compare the same group above.</span></div>` : nothing}
+        ${this.sourceUsed < this.sourceCount || this.truncated || this.fieldsTruncated ? html`<button class="tail-warning tail-warning-button" type="button"
+          @click=${(event: Event) => this.explain(event, "Partial source coverage", html`
+            <dl class="tail-info-values"><dt>Source files read</dt><dd>${this.sourceUsed} of ${this.sourceCount}</dd>
+              <dt>Matching spans analysed</dt><dd>${number(r.count, 0)}</dd></dl>
+            <p>The backend reads at most 24 files and one million matching spans.${this.truncated ? " The one-million-span cap was reached." : ""}${this.fieldsTruncated ? " A numeric or categorical field limit was reached." : ""}</p>
+            <p>These graphs describe the loaded scope. Unread files or unrecorded fields may contain different patterns.</p>`)}>
+          Partial sample · ${this.sourceUsed}/${this.sourceCount} files <span aria-hidden="true">ⓘ</span>
+        </button>` : nothing}
+        ${r.slowCount < 20 ? html`<button class="tail-warning tail-warning-button" type="button" @click=${(event: Event) => this.explain(event, "Few comparison spans", html`
+          <p>${number(r.slowCount, 0)} ${band ? "selected" : "slow"} spans are compared with ${number(r.typicalCount, 0)} typical spans. At least 20 recorded values in each group are needed to avoid the limited-observation badge on a field.</p>
+          <p>Widen the group or time window before relying on this difference. A small observed tail can change substantially when more spans arrive.</p>`)}>
+          Only ${r.slowCount} ${band ? "selected" : "slow"} spans <span aria-hidden="true">ⓘ</span>
+        </button>` : nothing}
         ${renderPropertyHistograms(histograms, {
           selectedKey: this.categoryKey,
           mode: this.categoryMode,
@@ -317,14 +345,31 @@ export class SpanTailAnalysis {
           onModeChange: mode => { this.categoryMode = mode; this.draw(); },
           onSelectRange: (minMs, maxMs) => this.context?.onBand(minMs, maxMs),
         })}
+        ${r.propertyScreen?.examined ? html`<details class="tail-property-screen"><summary>
+          ${r.propertyScreen.shown}/${r.propertyScreen.examined} properties show differences
+        </summary><div>
+          <p>${r.propertyScreen.similarDistributions} show no clear difference in this sample; ${r.propertyScreen.limitedObservations} lack enough observations; ${r.propertyScreen.limitedCoverage} have limited recorded coverage.</p>
+          <p>The backend requires at least ${r.propertyScreen.minimumSamples} spans per compared value and ${percent(r.propertyScreen.minimumCoverage)} property coverage. It keeps distribution gaps above ${percent(r.propertyScreen.minimumCdfGap)} after a sampling margin, or p99 ratios above ${number(r.propertyScreen.minimumTailRatio)}× with at least ${r.propertyScreen.minimumTailSamples} spans per value.</p>
+          ${histogram?.relevance ? html`<p>${histogram.key}: ${histogram.relevance.reason === "tail"
+            ? `p99 difference; conservative ratio ${number(histogram.relevance.tailRatioLowerBound)}×`
+            : `distribution gap ${percent(histogram.relevance.cdfGap)} with ${percent(histogram.relevance.cdfMargin)} sampling margin`}.</p>` : nothing}
+          <p>${r.propertyScreen.interpretation}</p>
+        </div></details>` : nothing}
+        ${group ? renderPropertyCohorts(group, r, band, histogram?.values.map(value => value.value)) : nothing}
         <section class="tail-numeric" aria-label="Numeric fields"><div class="tail-chart-heading"><h4>Numeric fields against elapsed time</h4>
           <span class="tail-legend"><span class="tail-dot typical"></span>Other spans <span class="tail-dot slow"></span>${band ? "Selected" : "Slow"}</span>
           <details class="tail-chart-help"><summary>Reading these charts</summary><div id="tail-chart-guide">
-            <p>Each dot is one span; click it to inspect the trace. X is total elapsed time in milliseconds. Y is the field value in its recorded unit. Orange dashed lines mark the labelled percentile cutoff, or the start and end of a custom selection. Axes are linear; all panels share the X scale. Up to 330 sampled points are drawn per field.</p>
-            <p><strong>Spearman</strong> compares the ordering of field values and elapsed time: +1 rises together, 0 has no consistent monotonic trend, −1 moves in opposite directions. It uses up to 2,048 observations sampled across latency ranks. Near zero can still hide separate clusters.</p>
-            <p><strong>Files agree</strong> checks whether the direction repeats in files with at least five recorded values in both groups. None of these measures proves causation or supplies a significance test.</p>
+            <p>Colored cells count every loaded span with this field. Hover or focus the plot and use arrow keys for cell counts. Outlined dots are trace samples; hover or focus one before opening its trace.</p>
+            <p>X uses logarithmic elapsed time with a zero-inclusive first bin. Y is linear in the displayed unit. The backend shares limits across fields with the same unit and converts declared time units to milliseconds. Unknown units stay separate. Orange dashed lines mark the labelled slow cutoff or selection endpoints.</p>
+            <p>Fields are ordered by the backend's comparison of group distributions, with limited observations last. Correlation describes a separate pattern. These are associations, not causes; click a badge for its definition and recorded counts.</p>
           </div></details>
         </div>
+        ${r.signals.some(signal => !signal.density) ? html`<button class="tail-badge tail-cached-plots" type="button"
+          @click=${(event: Event) => this.explain(event, "Cached point samples", html`
+            <p>These fields have no full-observation density grid in this cached report: ${r.signals.filter(signal => !signal.density).map(signal => signal.key).join(", ")}.</p>
+            <p>The outlined dots are bounded trace samples and cannot show how dense the underlying data is. Reports from the current backend include exact cell counts and shared unit axes; no missing density or unit information is inferred here.</p>`)}>
+          Point samples · density unavailable in cached result <span aria-hidden="true">ⓘ</span>
+        </button>` : nothing}
         <div class="tail-grid">${r.signals.length ? r.signals.slice(0, this.more ? undefined : 3).map((s, i) => this.signal(s, i)) : html`<p>No varying numeric fields recorded.</p>`}</div>
         ${r.signals.length > 3 ? html`<button class="secondary tail-more" @click=${() => { this.more = !this.more; this.draw(); }}>${this.more ? "Show fewer fields" : `Show all ${r.signals.length} fields`}</button>` : nothing}
         </section>
@@ -341,14 +386,24 @@ export class SpanTailAnalysis {
         <details class="tail-method"><summary>Limits and interpretation</summary>
           <p>These are leads, not proven causes. Request type, payload size, time, or load can change together. Compare similar spans, inspect the shapes, and open traces to test a hypothesis. Producer timers may overlap and are not added as contributions.</p>
           <p>Percentiles are recalculated within the chosen group and include threshold ties. A band overlapping the faster half creates overlapping cohorts. Missing values are excluded from means and comparisons. Catalog percentiles may use a different coverage or approximation.</p>
-          <p>The backend analyses at most 24 files and one million matching spans, discovering up to 32 numeric fields or categorical keys. Missing or conflicting units are never guessed.</p>
+          <p>The backend analyses at most 24 files and one million matching spans, discovering up to 128 numeric candidates, reporting up to 32 numeric fields, and retaining up to 32 categorical keys. Missing or conflicting units are never guessed.</p>
         </details>
         </div>
       ` : nothing}
       ${expanded ? html`<dialog class="tail-plot-dialog" @close=${() => { this.expandedKey = null; }}>
         <div class="tail-dialog-heading"><h3>${expanded.key}</h3><button @click=${(e: Event) => (e.target as HTMLElement).closest("dialog")?.close()}>Close</button></div>
         <div class="tail-field-means"><span>Typical <strong>${value(expanded.typical, expanded.unit)}</strong></span><span>${band ? "Selected" : "Slow"} <strong>${value(expanded.slow, expanded.unit)}</strong></span></div>
-        ${this.plot(expanded, true)}<p class="tail-note">Click a dot to inspect its trace · orange = ${band ? "selected" : "slow"} · linear axes</p>
+        ${this.plot(expanded, true)}<p class="tail-note">Click a dot to inspect its trace · orange = ${band ? "selected" : "slow"} · logarithmic elapsed axis</p>
+      </dialog>` : nothing}
+      ${info ? html`<dialog class="tail-info-dialog" aria-labelledby="tail-info-title" @close=${() => {
+        if (this.info !== info) return;
+        this.info = null;
+        this.draw();
+        info.trigger.focus();
+      }}>
+        <div class="tail-dialog-heading"><h3 id="tail-info-title">${info.title}</h3>
+          <button type="button" @click=${(event: Event) => (event.currentTarget as HTMLElement).closest("dialog")?.close()}>Close</button></div>
+        ${info.body}
       </dialog>` : nothing}
     </section>`, this.container);
     const examplesMount = this.container.closest(".detail-panel")?.querySelector<HTMLElement>(".span-tail-examples-mount");

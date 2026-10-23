@@ -1,0 +1,83 @@
+import { describe, expect, it } from "vitest";
+import { densityColor, numericAxisTick, numericValueAxis, renderNumericPlot, traceSampleIndex } from "./numeric-plot.js";
+import type { TailSignal } from "../../lib/trace/span-tail-analysis.js";
+
+const signal = (overrides: Partial<TailSignal> = {}): TailSignal => ({
+  key: "work_time", unit: "ns", typical: 1e6, slow: 8e6, typicalCount: 50, slowCount: 20,
+  typicalCoverage: 1, slowCoverage: 1, separation: .8, correlation: .8, correlationCount: 100,
+  duplicatesLatency: false, filesCompared: 1, filesAgree: 1, points: [],
+  ...overrides,
+});
+
+function text(value: unknown): string {
+  if (Array.isArray(value)) return value.map(text).join("");
+  if (value != null && typeof value === "object" && "strings" in value && "values" in value) {
+    const template = value as { strings: string[]; values: unknown[] };
+    return template.strings.map((part, i) => part + text(template.values[i])).join("");
+  }
+  return typeof value === "number" || typeof value === "string" ? String(value) : "";
+}
+
+describe("backend numeric plot data", () => {
+  it("uses backend shared display axes without recalculating them from plotted points", () => {
+    const axis = { unit: "ms", multiplier: 1e-6, minimum: 0, maximum: 12 };
+    expect(numericValueAxis(signal({ valueAxis: axis }))).toBe(axis);
+    expect(numericValueAxis(signal({ unit: null, valueAxis: { ...axis, unit: null, multiplier: 1 } })).unit).toBeNull();
+  });
+
+  it("renders full-observation counts even without a navigation sample", () => {
+    const field = signal({
+      valueAxis: { unit: "ms", multiplier: 1e-6, minimum: 0, maximum: 12 },
+      density: { elapsedEdgesMs: [0, 1, 100], valueEdges: [0, 6, 12], counts: [9000, 500, 0, 500], count: 10000, maxCount: 9000 },
+    });
+    const markup = text(renderNumericPlot(field, { signals: [field], boundaryMs: 10, percentile: 99, minMs: null, maxMs: null, large: false, onJump: () => {} }));
+    expect(markup).toContain('data-count=9000');
+    expect(markup).toContain("10,000 recorded spans");
+    expect(markup).toContain("1–9,000 / cell");
+    expect(markup).toContain("log scale");
+    expect(markup).not.toContain("No recorded values");
+  });
+
+  it("gives zero count no fill and separates sparse/dense counts using the returned maximum", () => {
+    expect(densityColor(0, 9000)).toBe("transparent");
+    expect(densityColor(1, 9000)).not.toBe(densityColor(9000, 9000));
+    expect(densityColor(9000, 9000)).toBe("hsl(194 80% 60%)");
+  });
+
+  it("keeps large declared-byte and unknown-unit labels inside the axis gutter", () => {
+    expect(numericAxisTick(12e6, "bytes")).toBe("12 MB");
+    expect(numericAxisTick(12e3, "bytes")).toBe("12 kB");
+    expect(numericAxisTick(12e6, null)).toBe("1.2e7");
+    expect(numericAxisTick(-12e6, "count")).toBe("-1.2e7");
+  });
+
+  it("moves through trace samples without turning them into hundreds of Tab stops", () => {
+    expect(traceSampleIndex(0, "ArrowLeft", 330)).toBe(0);
+    expect(traceSampleIndex(0, "ArrowRight", 330)).toBe(1);
+    expect(traceSampleIndex(1, "End", 330)).toBe(329);
+    expect(traceSampleIndex(329, "ArrowRight", 330)).toBe(329);
+    expect(traceSampleIndex(329, "Home", 330)).toBe(0);
+    expect(traceSampleIndex(0, "Tab", 330)).toBeNull();
+    expect(traceSampleIndex(0, "ArrowRight", 0)).toBeNull();
+  });
+
+  it("describes older reports as samples rather than inferring density", () => {
+    const field = signal({
+      unit: null,
+      points: [[1, 10, { elapsedMs: 1, insideMs: null, startNs: "1", endNs: "1000001", sourceUrl: "demo.bin", requestId: null }]],
+    });
+    const markup = text(renderNumericPlot(field, { signals: [field], boundaryMs: 10, percentile: 99, minMs: null, maxMs: null, large: false, onJump: () => {} }));
+    expect(markup).toContain("unit not recorded");
+    expect(markup).toContain("density unavailable in this cached report");
+    expect(markup).not.toContain("tail-density-cell");
+  });
+
+  it("labels a custom endpoint beyond loaded elapsed values as off scale", () => {
+    const field = signal({
+      valueAxis: { unit: "ms", multiplier: 1e-6, minimum: 0, maximum: 12 },
+      density: { elapsedEdgesMs: [0, 1, 100], valueEdges: [0, 6, 12], counts: [9000, 500, 0, 500], count: 10000, maxCount: 9000 },
+    });
+    const markup = text(renderNumericPlot(field, { signals: [field], boundaryMs: 10, percentile: 99, minMs: 10, maxMs: 5000, large: false, onJump: () => {} }));
+    expect(markup).toContain("off scale");
+  });
+});

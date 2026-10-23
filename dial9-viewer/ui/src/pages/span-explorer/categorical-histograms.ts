@@ -28,6 +28,8 @@ const colors = [
   "#64c9f3", "#d6a0ff", "#f5bc64", "#79d6af", "#f78da7", "#96a8ff",
   "#d1db73", "#efad86", "#82dbd9", "#e691df", "#b0c1d2", "#e1cdad",
 ];
+/** Keep a property's values consistent across distributions and cohort bars. */
+export const propertyValueColor = (index: number) => index < 0 ? "#8393a5" : colors[index % colors.length]!;
 const number = (n: number, digits = 0) => n.toLocaleString(undefined, { maximumFractionDigits: digits });
 const duration = (ms: number) => formatHumanDuration(ms * 1e6);
 const percent = (n: number) => `${number(n * 100, 1)}%`;
@@ -245,7 +247,7 @@ export function renderCategoricalHistogram(
   histogram: CategoricalHistogram,
   options: CategoricalHistogramOptions = {},
 ) {
-  const series = histogram.values.map((value, i) => ({ value, color: colors[i % colors.length]! }));
+  const series = histogram.values.map((value, i) => ({ value, color: propertyValueColor(i) }));
   const overlay = (options.mode ?? "overlay") === "overlay";
   return html`<section class="tail-category-chart ${overlay ? "overlay" : "stacked"}">
     <div class="tail-category-caption"><span>% of spans within each value</span>

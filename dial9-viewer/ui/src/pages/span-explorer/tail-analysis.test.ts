@@ -32,7 +32,9 @@ function click(value: unknown, label: string): () => void {
     }
   } else if (isTemplate(value)) {
     for (let i = 0; i < value.values.length; i++) {
-      if (value.strings[i]?.endsWith("@click=") && value.strings[i + 1]?.includes(`>${label}</button>`)) {
+      const hasLabel = value.strings[i + 1]?.includes(`>${label}</button>`)
+        || (value.strings[i + 1] === ">" && value.values[i + 1] === label && value.strings[i + 2]?.includes("</button>"));
+      if (value.strings[i]?.endsWith("@click=") && hasLabel) {
         return value.values[i] as () => void;
       }
       try { return click(value.values[i], label); } catch { /* Keep looking in sibling templates. */ }
@@ -87,7 +89,8 @@ function setup() {
   const classToggle = vi.fn();
   const examples = {} as HTMLElement;
   const panel = { classList: { toggle: classToggle }, querySelector: () => examples };
-  const container = { closest: () => panel, scrollIntoView: vi.fn() } as unknown as HTMLElement;
+  const showModal = vi.fn();
+  const container = { closest: () => panel, scrollIntoView: vi.fn(), querySelector: () => ({ showModal }) } as unknown as HTMLElement;
   const context = {
     spanType: { span_type_uid: "request-uid", name: "request" } as SpanTypeStats,
     scope: readScope(new URLSearchParams("api=1&data_dir=demo")),
@@ -97,7 +100,7 @@ function setup() {
   const analysis = new SpanTailAnalysis();
   const latest = () => vi.mocked(render).mock.calls.filter(c => c[1] === container).at(-1)?.[0];
   analysis.mount(container, context);
-  return { analysis, context, container, classToggle, latest };
+  return { analysis, context, container, classToggle, latest, showModal };
 }
 
 beforeEach(() => {
@@ -129,6 +132,48 @@ describe("Span Explorer investigation", () => {
     await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
     expect(text(latest())).toContain('aria-label="Numeric fields"');
     expect(text(latest())).not.toContain('tail-property-heading');
+  });
+
+  it("keeps elapsed aliases hidden after expanding an older report", async () => {
+    const field = report().signals[0]!;
+    const signals = [1, 2, 3, 4].map(n => ({ ...field, key: `field_${n}` }));
+    signals.splice(1, 0, { ...field, key: "ElapsedAliasOnly", duplicatesLatency: true });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(report({ signals }))));
+    const { latest } = setup();
+    click(latest(), "Analyse source traces")();
+    await vi.waitFor(() => expect(text(latest())).toContain("field_1"));
+    expect(text(latest())).not.toContain("ElapsedAliasOnly");
+    expect(text(latest())).toContain("Show all 4 fields");
+    click(latest(), "Show all 4 fields")();
+    expect(text(latest())).toContain("field_4");
+    expect(text(latest())).not.toContain("ElapsedAliasOnly");
+  });
+
+  it("shows qualitative correlation and explains observation limits on click", async () => {
+    const field = { ...report().signals[0]!, correlation: 1, typicalCount: 5, typicalCoverage: .1 };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(report({ signals: [field] }))));
+    const { latest, showModal } = setup();
+    click(latest(), "Analyse source traces")();
+    await vi.waitFor(() => expect(text(latest())).toContain("Perfectly correlated"));
+    expect(text(latest())).not.toContain("Spearman");
+    const handler = bindings(latest(), "@click=").find(value => typeof value === "function" && String(value).includes("Limited observations")) as (event: unknown) => void;
+    const trigger = { focus: vi.fn() };
+    handler({ currentTarget: trigger });
+    expect(showModal).toHaveBeenCalledOnce();
+    expect(text(latest())).toContain("Typical has 5 recorded values; at least 20 are required.");
+    expect(text(latest())).toContain("at least 50% coverage is required.");
+    expect(trigger.focus).toHaveBeenCalled();
+  });
+
+  it("normalizes Greek-mu microseconds in displayed means", async () => {
+    const field = { ...report().signals[0]!, unit: "μs", typical: 2000, slow: 8000 };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(report({ signals: [field] }))));
+    const { latest } = setup();
+    click(latest(), "Analyse source traces")();
+    await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
+    expect(text(latest())).toContain("2ms");
+    expect(text(latest())).toContain("8ms");
+    expect(text(latest())).not.toContain("2,000 μs");
   });
 
   it("makes previous graphs inert while recomputing and clears them on failure", async () => {
@@ -165,5 +210,29 @@ describe("Span Explorer investigation", () => {
     await Promise.resolve();
     expect(text(latest())).toContain("Analysis cancelled.");
     expect(classToggle).toHaveBeenLastCalledWith("tail-analysis-ready", false);
+  });
+
+  it("does not cache bytes from a superseded raw-trace request", async () => {
+    const pending = deferred<Response>();
+    const oldBytes = new Uint8Array([1, 1]).buffer;
+    const currentBytes = new Uint8Array([2, 2]).buffer;
+    const readOldBytes = vi.fn().mockResolvedValue(oldBytes);
+    const fetch = vi.fn().mockImplementation((url: URL, options: RequestInit) => {
+      if (url.pathname === "/old.bin") return pending.promise;
+      if (url.pathname === "/current.bin") return Promise.resolve(new Response(currentBytes));
+      expect(options.body).toEqual(currentBytes);
+      return Promise.resolve(response(report()));
+    });
+    vi.stubGlobal("fetch", fetch);
+    const { analysis, context, container, latest } = setup();
+    analysis.mount(container, { ...context, scope: { ...context.scope, trace: "/old.bin" } });
+    click(latest(), "Analyse source traces")();
+    analysis.mount(container, { ...context, scope: { ...context.scope, trace: "/current.bin" } });
+    expect(fetch.mock.calls[0]?.[1]?.signal.aborted).toBe(true);
+    pending.resolve({ ok: true, arrayBuffer: readOldBytes } as unknown as Response);
+    await vi.waitFor(() => expect(readOldBytes).toHaveBeenCalledOnce());
+    click(latest(), "Analyse source traces")();
+    await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
+    expect(fetch.mock.calls.map(call => call[0].pathname)).toEqual(["/old.bin", "/current.bin", "/api/span-tail"]);
   });
 });

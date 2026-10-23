@@ -6,7 +6,7 @@ the current source, exact span-type ID, time window, and attribute filters.
 There are no service-specific fields, operation names, or datasets in the
 native feature.
 
-See [TASKS.md](TASKS.md) for the paused improvement backlog and
+See [TASKS.md](TASKS.md) for the improvement backlog and
 [WORKFLOW.md](WORKFLOW.md) for task assignment, branches, and integration.
 
 Selecting a span type collapses the catalog to a compact selected-span bar.
@@ -17,7 +17,7 @@ computes the entire analysis through `GET /api/span-tail` (aggregate scope)
 or `POST /api/span-tail` (raw bytes). It reuses credential-scoped resolve,
 fold, and Parquet reads, discovers numeric attributes and producer units,
 and identifies categorical attributes with up to twelve values. The browser
-only requests reports and renders summaries and bounded plot points. It compares
+only requests reports and renders summaries, density cells, and trace links. It compares
 the faster half with the selected slow percentile or histogram band. Choosing a
 categorical group recalculates the percentiles inside that group.
 Orange dashed plot lines label the percentile cutoff, or both endpoints of a
@@ -28,13 +28,19 @@ The view starts with:
 
 - Explicit comparison-group definitions, counts, and source-file coverage.
 - Categorical latency distributions when a varying categorical field is present.
-  Two values overlay in distinct colors; larger categories stack vertically.
+  Values overlay in distinct colors by default; **Stacked** shows comparable rows.
   Each value shows its count and p99. Shared logarithmic bins and Y scales make
   the shapes comparable; bin heights are percentages within each value.
-  Missing values are counted separately. The category selector changes fields.
-- A **Numeric fields** view with three compact scatterplots, ordered by distribution
-  differences. All panels share their elapsed-time axis; each field has its
-  own value axis. Additional fields and enlarged plots are available on demand.
+  Missing values are counted separately. Property buttons change fields.
+  Paired bars below the distributions show typical and slow value proportions,
+  with the same colors, actual cohort counts, and explicit missing values.
+- A **Numeric fields** section directly below the property graphs, with three
+  compact plots ordered by group-distribution differences. Density cells count
+  every loaded recorded value; outlined dots are trace-linked samples.
+  Elapsed time uses a shared logarithmic axis with a zero-inclusive first bin.
+  The backend shares value limits across identical units and normalizes declared
+  time units to milliseconds. Unknown units remain separate. Additional fields
+  and enlarged plots are available on demand.
 - Two stacked time-composition bars for typical and selected spans, using the
   existing On CPU, Blocked, Async wait, Scheduling delay, and Unknown categories.
   Rust computes the mean per-instance shares and category durations. Mean elapsed
@@ -44,23 +50,34 @@ Categorical bin counts, normalization, and exact per-value percentiles are
 computed in Rust across the selected source scope, including any attribute or
 group filter. A slow-percentile or histogram-band comparison does not discard
 the rest of the distribution. Fields constant within that scope or exceeding
-twelve values are omitted. Group counts remain visible because a small sample's
-observed p99 is a weak basis for a conclusion.
+twelve values are omitted. The backend screens for distribution or p99
+differences with sample-size and coverage thresholds. Screening counts and
+definitions are available on demand; an excluded field can have no clear
+difference in this sample or insufficient observations. Group counts remain
+visible because a small sample's observed p99 is a weak basis for a conclusion.
 
-The field score is rank-biserial separation: `2 × P(slow > typical) − 1`,
-with ties split equally. Fields with fewer than twenty values in either
-group or under 50% coverage come after better-observed fields. Duration
-attributes that merely repeat total elapsed time come last; constant
-fields are omitted. This is a descriptive ranking, not a significance test.
+Numeric fields with fewer than twenty values in either group or under 50%
+coverage come after better-observed fields. Duration attributes that repeat
+total elapsed time and constant fields are omitted. The backend's ordering is
+descriptive, not a significance test.
 
-Each card shows group means, the comparison score, Spearman, and repetition
-across qualifying source files. Definitions appear once in a shared guide;
-missing coverage and repeated latency are shown as exceptions. The guide
-explains that file repetition needs five observations in each cohort. Spearman
-uses up to 2,048 evenly spaced observations across latency ranks; comparison
-means and separation use every loaded recorded value. Drawing uses up to
-330 points. A dot or slow-example button opens its original trace focused
-on the selected span, preserving the viewer's credential contract.
+Each card shows group means, qualitative correlation, and repetition across
+qualifying source files. Click a correlation or observation badge for its
+definition and recorded counts; Escape closes the explanation and returns focus.
+File repetition needs five observations in each cohort. Spearman compares up to
+2,048 evenly spaced observations across latency ranks; comparison means use
+every loaded recorded value. Drawing uses up to 330 trace-link dots in addition
+to the full-observation density grid. Hover or focus a dot to see its values and
+the trace action before opening it. A dot or slow-example button opens its
+original trace focused on the selected span, preserving the credential contract.
+Older cached reports show an explicit sample-only warning and do not invent
+missing density or shared-unit metadata.
+
+Recomputation blurs and disables previous results. Failure and cancellation
+clear stale comparisons; replacing the source retires its previous detail.
+The paired comparison replaces the catalog's single time bar once analysis is
+available. Flamegraph links and recorded-instance browsing share one trace
+inspection section beneath the charts.
 
 ## Run locally
 
