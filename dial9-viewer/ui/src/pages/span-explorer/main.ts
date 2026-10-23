@@ -209,9 +209,13 @@ function statsBadge(): string {
   return badge;
 }
 
-function renderDetailNow(): void {
+function renderDetailNow(loading = false): void {
+  const selected = loading
+    ? undefined
+    : spanTypes.find(s => s.span_type_uid === selectedUid);
   renderDetail(els.detailPanel, {
-    spanType: spanTypes.find((s) => s.span_type_uid === selectedUid),
+    spanType: selected,
+    loading,
     band,
     coverage: lastCoverage,
     attrFilters,
@@ -242,11 +246,14 @@ function renderDetailNow(): void {
       renderDetailNow();
     },
   });
-  const selected = spanTypes.find(s => s.span_type_uid === selectedUid);
   tailAnalysis.mount(els.detailPanel.querySelector(".span-tail-mount"), selected ? {
     spanType: selected, scope, view: view(),
     headers: Dial9Session.headers(Dial9Creds.headers()),
     onClearBand: () => applyBand({ min_ns: null, max_ns: null }),
+    onBand: (minMs, maxMs) => applyBand({
+      min_ns: minMs == null ? null : Math.round(minMs * 1e6),
+      max_ns: maxMs == null ? null : Math.round(maxMs * 1e6),
+    }),
   } : null);
 }
 
@@ -255,7 +262,10 @@ function renderCatalogNow(): void {
   const selected = spanTypes.find(s => s.span_type_uid === selectedUid);
   const expanded = !selected || catalogExpanded;
   els.catalogSelection.style.display = selected ? "flex" : "none";
-  els.catalogSelectedName.textContent = selected ? spanTypeLabel(selected) : "";
+  // The expanded catalog already contains the selected name in its row.
+  els.catalogSelectedName.textContent = selected
+    ? expanded ? "Choose a span type" : spanTypeLabel(selected)
+    : "";
   els.catalogSelectedName.title = els.catalogSelectedName.textContent;
   els.btnToggleCatalog.textContent = expanded ? "Hide span list" : `Change span · ${spanTypes.length}`;
   els.btnToggleCatalog.setAttribute("aria-expanded", String(expanded));
@@ -391,10 +401,16 @@ function startStreaming(mode: StreamMode): void {
   updateStreamingUi();
   els.error.style.display = "none";
   if (mode === "replace") {
+    spanTypes = [];
+    lastCoverage = null;
+    exemplarScopeByUid.clear();
     els.loading.classList.remove("hidden");
+    els.stats.textContent = "Loading span statistics…";
     els.catalogSelection.style.display = "none";
     els.catalogWrap.style.display = "none";
-    els.detailPanel.className = "detail-panel empty";
+    // The new time scope has no authoritative detail yet. Retire its old
+    // analysis request and remove stale graph actions until a snapshot arrives.
+    renderDetailNow(true);
   }
 
   const token = ++streamToken;
@@ -510,6 +526,8 @@ function startStreaming(mode: StreamMode): void {
           (mode === "exemplars" && !exemplarSnapshotAdopted
             ? " · exemplar refresh incomplete"
             : " · refined");
+      } else if (mode === "replace") {
+        showError("No span statistics returned for this source.");
       }
       if (mode === "replace" || mode === "refine") {
         refreshComparisonAfterBaseline();
@@ -698,6 +716,9 @@ els.btnStop.addEventListener("click", () => {
   stopComparisonStreaming(false);
   if (stoppedComparison) comparisonError = "Comparison stopped.";
   if (stoppedMode !== "exemplars") exemplarRefreshPending = false;
+  if (stoppedMode === "replace" && spanTypes.length === 0) {
+    showError("Span statistics loading cancelled.");
+  }
   renderFilterBarNow();
   renderDetailNow();
   if (stoppedMode != null) els.stats.textContent = `${statsBadge()} · stopped`;
