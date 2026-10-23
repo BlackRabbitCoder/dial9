@@ -484,7 +484,9 @@ impl Collector {
             }
             if count == 0
                 || minimum == maximum
-                || (time_multiplier(unit.as_deref()).is_some() && fraction(matches, count) > 0.98)
+                // A rare divergence can explain the slow tail. Only hide
+                // declared timers that repeat elapsed in every recorded value.
+                || (time_multiplier(unit.as_deref()).is_some() && matches == count)
             {
                 continue;
             }
@@ -1817,6 +1819,45 @@ mod tests {
         assert!(report.signals.iter().all(|s| s.key.starts_with("Work")));
         assert_eq!(report.numeric_fields_omitted, 0);
         assert!(!collector.fields_truncated);
+    }
+
+    #[test]
+    fn rare_tail_divergence_is_not_mistaken_for_an_elapsed_alias() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 1..=1_000 {
+            let mut row = row(n);
+            // This timer repeats elapsed time in the ordinary 99% but exposes
+            // different work in the slowest 1%. Overall agreement hides it.
+            row.attributes.push((
+                "TailTimer".into(),
+                if n <= 990 { n } else { n * 4 }.to_string(),
+            ));
+            row.attribute_units.push(("TailTimer".into(), "ms".into()));
+            row.attributes
+                .push(("UnknownElapsed".into(), n.to_string()));
+            if n % 37 == 0 {
+                row.attributes.retain(|(key, _)| key != "ElapsedAlias");
+            }
+            collector.push(row, &selection, 0, "");
+        }
+        let report = collector.report(&selection).unwrap();
+        let timer = report
+            .signals
+            .iter()
+            .find(|s| s.key == "TailTimer")
+            .expect("a meaningful rare-tail divergence must remain visible");
+        assert_eq!(timer.slow_count, 11);
+        assert_eq!(timer.density.as_ref().unwrap().count, 1_000);
+        assert!(report.signals.iter().all(|s| s.key != "ElapsedAlias"));
+        let unknown = report
+            .signals
+            .iter()
+            .find(|s| s.key == "UnknownElapsed")
+            .unwrap();
+        assert_eq!(unknown.unit, None);
+        assert_eq!(unknown.value_axis.unit, None);
+        assert_eq!(unknown.value_axis.maximum, 1_000.0);
     }
 
     #[test]
