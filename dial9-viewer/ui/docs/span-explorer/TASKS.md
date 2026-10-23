@@ -10,10 +10,10 @@ The coordinator assigns batches that minimize conflicting edits.
 
 | Batch | Tasks | Owner | Branch | Status |
 | --- | --- | --- | --- | --- |
-| Page | 4, 5, 8, 9, 15 | page-layout | `codex/span-ui-page` | PR #1068; CI running |
-| Backend | 3, 11 (aggregation), 12 | backend-analysis | `codex/span-ui-backend` | Assigned |
-| Histograms | 13, 14, 17, 18 | property-histograms | `codex/span-ui-histograms` | PR #1069; CI running |
-| Numeric | 1, 2, 6, 7, 10, 11 (rendering), 16; property controls integration | page-layout | `codex/span-ui-numeric` | Assigned; feedback received |
+| Page | 4, 5, 8, 9, 15 | page-layout | `codex/span-ui-page` | PR #1068 merged; native-page QA passed |
+| Backend | 3, 11 (aggregation), 12 | backend-analysis | `codex/span-ui-backend` | PR #1070; correcting rare-tail alias suppression |
+| Histograms | 13, 14, 17, 18 | property-histograms | `codex/span-ui-histograms` | PR #1069 merged; component QA passed |
+| Numeric | 1, 2, 6, 7, 10, 11 (rendering), 16; property controls integration | page-layout | `codex/span-ui-numeric` | Implemented; combined QA and dependency integration |
 
 Design guidance: start with why the user is here, minimize the explanation a
 visual needs, and make the initial view useful for deciding where to go deeper.
@@ -33,7 +33,9 @@ Keep analysis in the backend and render its results in the frontend.
 - [ ] **3. Automatically hide fields that repeat elapsed time.**
   Elapsed-time aliases should never appear among the numeric field graphs,
   including after expanding the full field list. Exclude them from visible
-  counts, ranking, and shared field-axis calculations.
+  counts, ranking, and shared field-axis calculations. Preserve a timer that
+  matches elapsed time for ordinary requests but differs meaningfully in the
+  tail; a majority-match rule must not hide that signal.
 
 - [ ] **4. Make recomputation visually obvious.**
   Clearly mark graphs as being recomputed, for example with a simple blur or

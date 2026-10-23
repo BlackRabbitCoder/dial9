@@ -26,7 +26,9 @@ a main-branch PR or deployment remains a separate step.
 5. Review contributions and their latest validation. Merge passing, reviewed
    PRs into the integration branch in dependency order, then mark tasks done.
 6. Keep integration commits intact so other agents can update their branches.
-   A main-branch PR or deployment is a separate user-authorized step.
+   Use the repository's supported squash merges. Dependent workers reconcile
+   their branches onto the resulting integration commits. A main-branch PR or
+   deployment is a separate user-authorized step.
 
 ## Worker branches
 
@@ -67,6 +69,11 @@ before work starts. Analysis remains in Rust.
 - Commit the contribution, push its task branch, and open a PR with
   **`codex/span-tail-lab` as the base**. Include the task number, resulting
   behavior, validation, and any remaining questions.
+- The coordinator may arrange a stacked contribution PR against an unfinished
+  dependency branch to overlap CI. Keep each layer independently buildable,
+  merge the dependency first, and reconcile or retarget the remaining layer
+  onto the integration branch. Verify CI on the final head and review the
+  final diff before merging.
 - Wait for CI on the latest contribution commit, resolve blocking failures
   within the assigned scope, and notify the coordinator when ready.
 - After an integration merge, update dependent work from the integration
