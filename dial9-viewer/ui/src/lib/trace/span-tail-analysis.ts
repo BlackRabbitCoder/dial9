@@ -7,7 +7,8 @@ export interface TailRecord {
   sourceUrl: string;
   requestId: string | null;
   /** Original recorded string pairs, preserving duplicate keys and their order.
-   * null/absent means unavailable; [] means this span recorded no fields. */
+   * null/absent means unavailable; [] means no pairs are included.
+   * [] with attributesOmitted=0 means this span recorded no fields. */
   attributes?: [string, string][] | null;
   /** Whole pairs omitted by response limits; null/absent means unavailable. */
   attributesOmitted?: number | null;

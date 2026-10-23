@@ -31,9 +31,12 @@ The view starts with:
 
 - Explicit comparison-group definitions, counts, and source-file coverage.
 - Categorical latency distributions when a varying categorical field is present.
-  Values overlay in distinct colors by default; **Stacked** shows comparable rows.
+  Values overlay in distinct colors by default; **Stacked** shows cumulative
+  layers on one graph with a white total curve.
   Each value shows its count and p99. Shared logarithmic bins and Y scales make
-  the shapes comparable; bin heights are percentages within each value.
+  the shapes comparable. Overlay heights are percentages within each value;
+  stacked layers use exact bin counts divided by the full recorded population,
+  so their heights add up to the pooled total distribution.
   Missing values are counted separately. Property buttons change fields.
   Paired bars below the distributions show typical and slow value proportions,
   with the same colors, actual cohort counts, and explicit missing values.

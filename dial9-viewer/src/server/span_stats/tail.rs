@@ -31,6 +31,9 @@ const PROPERTY_MIN_COVERAGE: f64 = 0.5;
 const PROPERTY_MIN_CDF_GAP: f64 = 0.2;
 const PROPERTY_MIN_TAIL_RATIO: f64 = 1.5;
 const PROPERTY_SAMPLING_BUDGET: f64 = 0.01;
+const MAX_EXAMPLE_ATTRIBUTES: usize = 64;
+const MAX_EXAMPLE_ATTRIBUTE_BYTES: usize = 8 * 1024;
+const MAX_REPORT_ATTRIBUTE_BYTES: usize = 16 * 1024 * 1024;
 // Keep permits in blocking workers as well: dropping a timed-out HTTP future
 // must not release capacity while its CPU work is still running.
 static ANALYSIS_LIMIT: Semaphore = Semaphore::const_new(2);
@@ -107,6 +110,12 @@ struct Example {
     end_ns: String,
     source_url: String,
     request_id: Option<String>,
+    attributes: Option<Vec<(String, String)>>,
+    attributes_omitted: Option<usize>,
+    #[serde(skip)]
+    source: usize,
+    #[serde(skip)]
+    span_uid: String,
 }
 
 struct Observation {
@@ -139,6 +148,21 @@ struct Signal {
     value_axis: ValueAxis,
     // Populated after the final visible field set establishes shared axes.
     density: Option<Density>,
+    tail_difference: Option<NumericTailDifference>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NumericTailDifference {
+    cdf_gap: f64,
+    sampling_margin: f64,
+    lower_bound: f64,
+    comparisons: usize,
+    sampling_budget: f64,
+    typical_median: f64,
+    slow_median: f64,
+    typical_p99: f64,
+    slow_p99: f64,
 }
 
 #[derive(Clone, Serialize)]
@@ -318,6 +342,166 @@ fn numeric(value: &str) -> Option<f64> {
     (n.is_finite() && (n.fract() != 0.0 || n.abs() <= 9_007_199_254_740_991.0)).then_some(n)
 }
 
+/// Exact cohort CDF difference with the same descriptive sampling margin as
+/// property screening. Independence is assumed; this is not a p-value or cause.
+/// Both cohorts must be sorted in ascending value order.
+fn numeric_tail_difference(
+    typical: &[f64],
+    slow: &[f64],
+    comparisons: usize,
+) -> Option<NumericTailDifference> {
+    if typical.is_empty() || slow.is_empty() {
+        return None;
+    }
+    let log_budget = (2.0 * comparisons.max(1) as f64 / PROPERTY_SAMPLING_BUDGET).ln();
+    let sampling_margin = (log_budget / (2.0 * typical.len() as f64)).sqrt()
+        + (log_budget / (2.0 * slow.len() as f64)).sqrt();
+    let cdf_gap = cdf_distance(typical, slow);
+    let quantile = |values: &[f64], p: f64| {
+        values[((values.len() as f64 * p).ceil() as usize).saturating_sub(1)]
+    };
+    Some(NumericTailDifference {
+        cdf_gap,
+        sampling_margin,
+        lower_bound: (cdf_gap - sampling_margin).max(0.0),
+        comparisons,
+        sampling_budget: PROPERTY_SAMPLING_BUDGET,
+        typical_median: quantile(typical, 0.5),
+        slow_median: quantile(slow, 0.5),
+        typical_p99: quantile(typical, 0.99),
+        slow_p99: quantile(slow, 0.99),
+    })
+}
+
+struct ExampleMetadata {
+    references: usize,
+    seen: bool,
+    attributes: Option<Vec<(String, String)>>,
+    omitted: Option<usize>,
+    extra_bytes: usize,
+}
+
+type MetadataIdentities = BTreeMap<(i64, i64), BTreeMap<String, ExampleMetadata>>;
+
+/// Stores metadata only for bounded trace examples. Original strings are
+/// hydrated from source rows after analysis, never retained on every observation.
+struct MetadataHydrator {
+    sources: BTreeMap<usize, MetadataIdentities>,
+    bytes_used: usize,
+}
+
+impl MetadataHydrator {
+    fn new(report: &Report) -> Self {
+        let mut sources: BTreeMap<usize, MetadataIdentities> = BTreeMap::new();
+        let mut references = 0;
+        for example in report.examples.iter().chain(
+            report
+                .signals
+                .iter()
+                .flat_map(|s| s.points.iter().map(|p| &p.2)),
+        ) {
+            let coordinates = example
+                .start_ns
+                .parse::<i64>()
+                .ok()
+                .zip(example.end_ns.parse::<i64>().ok());
+            let Some(coordinates) = coordinates else {
+                continue;
+            };
+            let entry = sources
+                .entry(example.source)
+                .or_default()
+                .entry(coordinates)
+                .or_default()
+                .entry(example.span_uid.clone())
+                .or_insert_with(|| ExampleMetadata {
+                    references: 0,
+                    seen: false,
+                    attributes: None,
+                    omitted: None,
+                    extra_bytes: 0,
+                });
+            entry.references += 1;
+            references += 1;
+        }
+        Self {
+            sources,
+            // Reserve the [] overhead for every emitted copy before filling.
+            bytes_used: references * 2,
+        }
+    }
+
+    fn record(
+        &mut self,
+        source: usize,
+        span_uid: &str,
+        start_ns: i64,
+        end_ns: i64,
+        attributes: &[(String, String)],
+    ) -> Result<(), serde_json::Error> {
+        let entry = self
+            .sources
+            .get_mut(&source)
+            .and_then(|rows| rows.get_mut(&(start_ns, end_ns)))
+            .and_then(|rows| rows.get_mut(span_uid));
+        let Some(entry) = entry else { return Ok(()) };
+        if entry.seen {
+            // Identical coordinates are not sufficient to choose between
+            // duplicate source identities, even if one was read first.
+            self.bytes_used -= entry.extra_bytes * entry.references;
+            entry.extra_bytes = 0;
+            entry.attributes = None;
+            entry.omitted = None;
+            return Ok(());
+        }
+        entry.seen = true;
+        let extra_budget = (MAX_REPORT_ATTRIBUTE_BYTES - self.bytes_used) / entry.references;
+        let budget = MAX_EXAMPLE_ATTRIBUTE_BYTES.min(extra_budget + 2);
+        let mut captured = Vec::new();
+        let mut bytes = 2;
+        for (key, value) in attributes {
+            if captured.len() == MAX_EXAMPLE_ATTRIBUTES
+                || key.len().saturating_add(value.len()) > budget
+            {
+                continue;
+            }
+            let pair_bytes = serde_json::to_vec(&(key, value))?.len();
+            let additional = pair_bytes + usize::from(!captured.is_empty());
+            if bytes + additional <= budget {
+                captured.push((key.clone(), value.clone()));
+                bytes += additional;
+            }
+        }
+        entry.omitted = Some(attributes.len() - captured.len());
+        entry.attributes = Some(captured);
+        entry.extra_bytes = bytes - 2;
+        self.bytes_used += entry.extra_bytes * entry.references;
+        Ok(())
+    }
+
+    fn finish(self, report: &mut Report) {
+        for example in report.examples.iter_mut().chain(
+            report
+                .signals
+                .iter_mut()
+                .flat_map(|s| s.points.iter_mut().map(|p| &mut p.2)),
+        ) {
+            let coordinates = example
+                .start_ns
+                .parse::<i64>()
+                .ok()
+                .zip(example.end_ns.parse::<i64>().ok());
+            let entry = coordinates
+                .and_then(|key| self.sources.get(&example.source)?.get(&key))
+                .and_then(|rows| rows.get(&example.span_uid));
+            if let Some(entry) = entry {
+                example.attributes.clone_from(&entry.attributes);
+                example.attributes_omitted = entry.omitted;
+            }
+        }
+    }
+}
+
 impl Collector {
     fn push(&mut self, row: SpanStatsRow, selection: &Selection, source: usize, url: &str) {
         if row.span_type_uid != selection.uid
@@ -397,13 +581,14 @@ impl Collector {
         let exemplar = row
             .exemplar
             .filter(|e| !e.source_key.is_empty() && e.end_ns >= e.start_ns);
-        let (start_ns, end_ns, source_url) = match exemplar {
+        let (start_ns, end_ns, source_url, span_uid) = match exemplar {
             Some(e) => (
                 e.start_ns.to_string(),
                 e.end_ns.to_string(),
                 url.to_string(),
+                e.span_uid,
             ),
-            None => (String::new(), String::new(), String::new()),
+            None => (String::new(), String::new(), String::new(), String::new()),
         };
         self.rows.push(Observation {
             example: Example {
@@ -413,6 +598,10 @@ impl Collector {
                 end_ns,
                 source_url,
                 request_id,
+                attributes: None,
+                attributes_omitted: None,
+                source,
+                span_uid,
             },
             source,
             composition: row.composition,
@@ -530,21 +719,25 @@ impl Collector {
             fields.push((key, unit, multiplier, displayed_unit, minimum, maximum));
         }
         let elapsed_edges_ms = elapsed_bin_edges(&rows);
+        let comparisons = fields.len();
         let mut signals = Vec::new();
         for (key, unit, multiplier, displayed_unit, minimum, maximum) in fields {
             let all: Vec<_> = rows
                 .iter()
                 .filter_map(|r| r.numeric.get(key).map(|n| (*r, *n)))
                 .collect();
-            let a: Vec<_> = typical
+            let mut a: Vec<_> = typical
                 .iter()
                 .filter_map(|r| r.numeric.get(key).copied())
                 .collect();
-            let b: Vec<_> = slow
+            let mut b: Vec<_> = slow
                 .iter()
                 .filter_map(|r| r.numeric.get(key).copied())
                 .collect();
             let difference = separation(&a, &b);
+            a.sort_by(f64::total_cmp);
+            b.sort_by(f64::total_cmp);
+            let tail_difference = numeric_tail_difference(&a, &b, comparisons);
             let mut files: BTreeMap<usize, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
             for row in &typical {
                 if let Some(n) = row.numeric.get(key) {
@@ -622,12 +815,11 @@ impl Collector {
                 points,
                 value_axis,
                 density: None,
+                tail_difference,
             });
         }
         let quality = |s: &Signal| {
-            if s.typical_count.min(s.slow_count) < 20
-                || s.typical_coverage.min(s.slow_coverage) < 0.5
-            {
+            if s.typical_count.min(s.slow_count) < 20 {
                 0
             } else {
                 1
@@ -636,11 +828,11 @@ impl Collector {
         signals.sort_by(|a, b| {
             quality(b)
                 .cmp(&quality(a))
-                .then_with(|| {
-                    b.separation
-                        .unwrap_or(0.0)
-                        .abs()
-                        .total_cmp(&a.separation.unwrap_or(0.0).abs())
+                .then_with(|| match (&a.tail_difference, &b.tail_difference) {
+                    (Some(a), Some(b)) => b.lower_bound.total_cmp(&a.lower_bound),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
                 })
                 .then_with(|| a.key.cmp(&b.key))
         });
@@ -1311,22 +1503,68 @@ pub(crate) async fn get_tail(
         .map_err(internal)?
         .map_err(internal)?;
     }
-    let response = tokio::task::spawn_blocking(move || {
-        let (collector, selection, _permit) = work;
+    let uid = work.1.uid;
+    let mut work = tokio::task::spawn_blocking(move || {
+        let (collector, selection, permit) = work;
         collector.report(&selection).map(|report| {
             let fields_truncated = collector.fields_truncated || report.numeric_fields_omitted > 0;
-            TailResponse {
+            let metadata = MetadataHydrator::new(&report);
+            let response = TailResponse {
                 report,
                 files_used,
                 files_matched,
                 truncated: collector.truncated,
                 fields_truncated,
-            }
+            };
+            (response, metadata, permit)
         })
     })
     .await
     .map_err(internal)?
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // Revisit cached rows only for sources containing selected examples. The
+    // collector has been dropped, and full attributes never lived on its rows.
+    for (source, (_, full_key)) in resolved.capped.iter().enumerate() {
+        if !work.1.sources.contains_key(&source) {
+            continue;
+        }
+        let key = aggregate::spans_part_key_pub(&agg.output_prefix, full_key);
+        let data = agg
+            .output
+            .get_object(&agg.output_bucket, &key)
+            .await
+            .map_err(internal)?;
+        let (start, end) = (scope.start_ns, scope.end_ns);
+        work = tokio::task::spawn_blocking(move || {
+            let (response, mut metadata, permit) = work;
+            let reader = SpansBatchReader::new(start, end, Some(uid), None);
+            let (_, result) = reader.read(data, |input| {
+                if let SpanStatsInput::Row(row) = input
+                    && let Some(example) = row.exemplar
+                {
+                    metadata.record(
+                        source,
+                        &example.span_uid,
+                        example.start_ns,
+                        example.end_ns,
+                        &row.attributes,
+                    )?;
+                }
+                Ok(())
+            });
+            result.map(|()| (response, metadata, permit))
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+    }
+    let response = tokio::task::spawn_blocking(move || {
+        let (mut response, metadata, _permit) = work;
+        metadata.finish(&mut response.report);
+        response
+    })
+    .await
+    .map_err(internal)?;
     Ok(Json(response))
 }
 
@@ -1401,13 +1639,29 @@ pub(crate) async fn post_tail(
             };
             collector.push(row, &selection, 0, "");
         }
-        let report = collector.report(&selection).map_err(anyhow::Error::msg)?;
+        let mut report = collector.report(&selection).map_err(anyhow::Error::msg)?;
         let fields_truncated = collector.fields_truncated || report.numeric_fields_omitted > 0;
+        let truncated = collector.truncated;
+        drop(collector);
+        let mut metadata = MetadataHydrator::new(&report);
+        let (_, _, _, spans) = decode::decode_samples(&trace, "raw-trace")?;
+        for span in spans {
+            if span.span_type_uid == selection.uid {
+                metadata.record(
+                    0,
+                    &hex::encode(span.span_uid),
+                    i64::try_from(span.start_ns)?,
+                    i64::try_from(span.end_ns)?,
+                    &span.attributes,
+                )?;
+            }
+        }
+        metadata.finish(&mut report);
         Ok::<_, anyhow::Error>(TailResponse {
             report,
             files_used: 1,
             files_matched: 1,
-            truncated: collector.truncated,
+            truncated,
             fields_truncated,
         })
     })
@@ -1495,6 +1749,266 @@ mod tests {
         #[case] expected: Option<f64>,
     ) {
         assert_eq!(separation(&typical, &slow), expected);
+    }
+
+    #[rstest]
+    #[case(vec![], vec![1.0])]
+    #[case(vec![1.0], vec![])]
+    fn numeric_distribution_difference_requires_both_recorded_cohorts(
+        #[case] typical: Vec<f64>,
+        #[case] slow: Vec<f64>,
+    ) {
+        assert!(numeric_tail_difference(&typical, &slow, 1).is_none());
+    }
+
+    #[test]
+    fn numeric_distribution_difference_detects_shape_without_monotonic_direction() {
+        let typical = vec![0.0; 4_000];
+        let mut slow = vec![-10.0; 2_000];
+        slow.extend(vec![10.0; 2_000]);
+        assert_eq!(separation(&typical, &slow), Some(0.0));
+        let difference = numeric_tail_difference(&typical, &slow, 3).unwrap();
+        assert_eq!(difference.cdf_gap, 0.5);
+        assert!(difference.lower_bound > 0.4);
+        assert_eq!(difference.typical_median, 0.0);
+        assert_eq!(difference.slow_median, -10.0);
+        assert_eq!(difference.typical_p99, 0.0);
+        assert_eq!(difference.slow_p99, 10.0);
+        assert_eq!(difference.comparisons, 3);
+        assert_eq!(difference.sampling_budget, PROPERTY_SAMPLING_BUDGET);
+    }
+
+    #[test]
+    fn numeric_sampling_allowance_accounts_for_counts_and_comparison_budget() {
+        let equal = numeric_tail_difference(&[1.0, 2.0], &[1.0, 2.0], 1).unwrap();
+        assert_eq!(equal.cdf_gap, 0.0);
+        assert_eq!(equal.lower_bound, 0.0);
+        let rare = numeric_tail_difference(&[1.0], &[2.0], 1).unwrap();
+        assert_eq!(rare.cdf_gap, 1.0);
+        assert_eq!(rare.lower_bound, 0.0);
+        let typical = vec![1.0; 1_000];
+        let slow = vec![2.0; 1_000];
+        let one = numeric_tail_difference(&typical, &slow, 1).unwrap();
+        let many = numeric_tail_difference(&typical, &slow, 128).unwrap();
+        assert_eq!(one.cdf_gap, 1.0);
+        assert!(many.sampling_margin > one.sampling_margin);
+        assert!(many.lower_bound < one.lower_bound);
+    }
+
+    #[test]
+    fn strong_recorded_tail_difference_ranks_ahead_of_weak_dense_field() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 1..=10_000 {
+            let mut row = row(n);
+            row.attributes = vec![("Weak".into(), (n % 2).to_string())];
+            row.attribute_units.clear();
+            if n % 5 == 0 {
+                row.attributes
+                    .push(("Sparse".into(), if n >= 9_900 { "100" } else { "0" }.into()));
+            }
+            collector.push(row, &selection, 0, "/source");
+        }
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(report.signals[0].key, "Sparse");
+        let sparse = &report.signals[0];
+        assert_eq!((sparse.typical_count, sparse.slow_count), (1_000, 21));
+        assert_eq!(sparse.typical_coverage, 0.2);
+        assert!(sparse.slow_coverage < 0.21);
+        let difference = sparse.tail_difference.as_ref().unwrap();
+        assert_eq!(difference.cdf_gap, 1.0);
+        assert_eq!(difference.comparisons, 2);
+        assert_eq!(
+            (difference.typical_median, difference.slow_median),
+            (0.0, 100.0)
+        );
+        assert_eq!((difference.typical_p99, difference.slow_p99), (0.0, 100.0));
+        assert!(difference.lower_bound > 0.5);
+    }
+
+    #[test]
+    fn an_unavailable_comparison_is_not_ranked_as_an_observed_zero_difference() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 1..=100 {
+            let mut row = row(n);
+            row.attributes = vec![("ZAvailable".into(), (n % 2).to_string())];
+            row.attribute_units.clear();
+            if n <= 50 {
+                row.attributes
+                    .push(("AUnavailable".into(), (n % 2).to_string()));
+            }
+            collector.push(row, &selection, 0, "/source");
+        }
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(report.signals[0].key, "ZAvailable");
+        let available = report.signals[0].tail_difference.as_ref().unwrap();
+        assert_eq!(available.cdf_gap, 0.0);
+        assert_eq!(available.lower_bound, 0.0);
+        assert_eq!(report.signals[1].key, "AUnavailable");
+        assert!(report.signals[1].tail_difference.is_none());
+        assert_eq!(report.signals[1].slow_count, 0);
+    }
+
+    #[test]
+    fn numeric_cohort_summaries_use_every_recorded_value_in_original_units() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 1..=10_000 {
+            let mut row = row(n);
+            row.attributes = vec![("Work".into(), (n * 500).to_string())];
+            row.attribute_units = vec![("Work".into(), "us".into())];
+            collector.push(row, &selection, 0, "/source");
+        }
+        let report = collector.report(&selection).unwrap();
+        let signal = &report.signals[0];
+        assert_eq!((signal.typical_count, signal.slow_count), (5_000, 101));
+        assert!(signal.points.len() <= 330);
+        assert_eq!(signal.correlation_count, 2_048);
+        let difference = signal.tail_difference.as_ref().unwrap();
+        assert_eq!(difference.typical_median, 2_500.0 * 500.0);
+        assert_eq!(difference.typical_p99, 4_950.0 * 500.0);
+        assert_eq!(difference.slow_median, 9_950.0 * 500.0);
+        assert_eq!(difference.slow_p99, 9_999.0 * 500.0);
+        assert_eq!(signal.value_axis.multiplier, 0.001);
+    }
+
+    fn metadata_report() -> Report {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        collector.push(row(1), &selection, 0, "/source");
+        collector.report(&selection).unwrap()
+    }
+
+    #[test]
+    fn example_metadata_preserves_raw_pairs_and_reports_empty_missing_and_ambiguous_rows() {
+        let mut report = metadata_report();
+        let mut metadata = MetadataHydrator::new(&report);
+        let pairs = vec![
+            ("Repeated".into(), "001".into()),
+            ("Repeated".into(), "true".into()),
+            ("Text".into(), "<tag>\n\"☃\"".into()),
+        ];
+        metadata.record(0, "1", 1, 1_000_001, &pairs).unwrap();
+        metadata.finish(&mut report);
+        assert_eq!(report.examples[0].attributes.as_ref(), Some(&pairs));
+        assert_eq!(report.examples[0].attributes_omitted, Some(0));
+        assert_eq!(report.examples[0].start_ns, "1");
+
+        let mut empty = metadata_report();
+        let mut metadata = MetadataHydrator::new(&empty);
+        metadata.record(0, "1", 1, 1_000_001, &[]).unwrap();
+        metadata.finish(&mut empty);
+        assert_eq!(empty.examples[0].attributes, Some(Vec::new()));
+        assert_eq!(empty.examples[0].attributes_omitted, Some(0));
+
+        let mut missing = metadata_report();
+        let mut metadata = MetadataHydrator::new(&missing);
+        metadata.record(1, "1", 1, 1_000_001, &pairs).unwrap();
+        metadata.record(0, "other", 1, 1_000_001, &pairs).unwrap();
+        metadata.record(0, "1", 2, 1_000_001, &pairs).unwrap();
+        metadata.finish(&mut missing);
+        assert!(missing.examples[0].attributes.is_none());
+        assert!(missing.examples[0].attributes_omitted.is_none());
+
+        let mut ambiguous = metadata_report();
+        let mut metadata = MetadataHydrator::new(&ambiguous);
+        for _ in 0..3 {
+            metadata.record(0, "1", 1, 1_000_001, &pairs).unwrap();
+        }
+        metadata.finish(&mut ambiguous);
+        assert!(ambiguous.examples[0].attributes.is_none());
+        assert!(ambiguous.examples[0].attributes_omitted.is_none());
+    }
+
+    #[test]
+    fn example_metadata_resolves_source_identity_and_repeated_report_references() {
+        let mut report = metadata_report();
+        let mut second_source = report.examples[0].clone();
+        second_source.source = 1;
+        second_source.source_url = "/other-source".into();
+        report.examples.push(second_source);
+        report.examples.push(report.examples[0].clone());
+        let mut metadata = MetadataHydrator::new(&report);
+        let first = vec![("Source".into(), "first".into())];
+        let second = vec![("Source".into(), "second".into())];
+        metadata.record(1, "1", 1, 1_000_001, &second).unwrap();
+        metadata.record(0, "1", 1, 1_000_001, &first).unwrap();
+        metadata.finish(&mut report);
+        assert_eq!(report.examples[0].attributes.as_ref(), Some(&first));
+        assert_eq!(report.examples[1].attributes.as_ref(), Some(&second));
+        assert_eq!(report.examples[2].attributes.as_ref(), Some(&first));
+    }
+
+    #[test]
+    fn example_metadata_caps_whole_pairs_by_count_and_exact_escaped_json_bytes() {
+        let mut report = metadata_report();
+        let mut metadata = MetadataHydrator::new(&report);
+        let pairs: Vec<_> = (0..100).map(|n| ("Key".into(), n.to_string())).collect();
+        metadata.record(0, "1", 1, 1_000_001, &pairs).unwrap();
+        metadata.finish(&mut report);
+        assert_eq!(
+            report.examples[0].attributes.as_ref().unwrap(),
+            &pairs[..64]
+        );
+        assert_eq!(report.examples[0].attributes_omitted, Some(36));
+
+        let mut report = metadata_report();
+        let mut metadata = MetadataHydrator::new(&report);
+        let pairs = vec![
+            ("TooBig".into(), "x".repeat(MAX_EXAMPLE_ATTRIBUTE_BYTES)),
+            ("Escaped".into(), "\n".repeat(4_070)),
+            ("Later".into(), "kept".into()),
+            ("More".into(), "\n".repeat(100)),
+        ];
+        metadata.record(0, "1", 1, 1_000_001, &pairs).unwrap();
+        metadata.finish(&mut report);
+        let captured = report.examples[0].attributes.as_ref().unwrap();
+        assert_eq!(captured, &pairs[1..3]);
+        assert_eq!(report.examples[0].attributes_omitted, Some(2));
+        assert!(serde_json::to_vec(captured).unwrap().len() <= MAX_EXAMPLE_ATTRIBUTE_BYTES);
+    }
+
+    #[test]
+    fn example_metadata_total_budget_counts_every_emitted_reference() {
+        let mut report = metadata_report();
+        let template = report.examples[0].clone();
+        report.examples = vec![template.clone(); 10_000];
+        let mut metadata = MetadataHydrator::new(&report);
+        let pairs = vec![
+            ("First".into(), "a".repeat(1_000)),
+            ("Second".into(), "b".repeat(1_000)),
+        ];
+        metadata.record(0, "1", 1, 1_000_001, &pairs).unwrap();
+        assert!(metadata.bytes_used <= MAX_REPORT_ATTRIBUTE_BYTES);
+        metadata.finish(&mut report);
+        assert!(
+            report
+                .examples
+                .iter()
+                .all(|e| e.attributes_omitted == Some(1))
+        );
+        let emitted_bytes: usize = report
+            .examples
+            .iter()
+            .map(|e| {
+                serde_json::to_vec(e.attributes.as_ref().unwrap())
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert!(emitted_bytes <= MAX_REPORT_ATTRIBUTE_BYTES);
+    }
+
+    #[test]
+    fn no_included_pairs_can_still_have_recorded_fields_omitted_by_limits() {
+        let mut report = metadata_report();
+        let mut metadata = MetadataHydrator::new(&report);
+        let pairs = vec![("TooBig".into(), "x".repeat(MAX_EXAMPLE_ATTRIBUTE_BYTES))];
+        metadata.record(0, "1", 1, 1_000_001, &pairs).unwrap();
+        metadata.finish(&mut report);
+        assert_eq!(report.examples[0].attributes, Some(Vec::new()));
+        assert_eq!(report.examples[0].attributes_omitted, Some(1));
     }
 
     #[rstest]
@@ -2504,16 +3018,46 @@ mod tests {
         crate::ingest::parquet_writer::write_spans(&mut parquet, &spans).unwrap();
         let mut collector = Collector::default();
         let (_, result) =
-            SpansBatchReader::new(None, None, Some(uid), None).read(parquet, |input| {
+            SpansBatchReader::new(None, None, Some(uid), None).read(parquet.clone(), |input| {
                 if let SpanStatsInput::Row(row) = input {
                     collector.push(*row, &selection, 0, "");
                 }
                 Ok(())
             });
         result.unwrap();
-        let folded = collector.report(&selection).unwrap();
+        let mut folded = collector.report(&selection).unwrap();
+        let mut metadata = MetadataHydrator::new(&folded);
+        let (_, result) =
+            SpansBatchReader::new(None, None, Some(uid), None).read(parquet, |input| {
+                if let SpanStatsInput::Row(row) = input
+                    && let Some(example) = row.exemplar
+                {
+                    metadata.record(
+                        0,
+                        &example.span_uid,
+                        example.start_ns,
+                        example.end_ns,
+                        &row.attributes,
+                    )?;
+                }
+                Ok(())
+            });
+        result.unwrap();
+        metadata.finish(&mut folded);
         assert_eq!(response.report.signals.len(), 1);
         assert_eq!(response.report.signals[0].key, "Work");
+        assert!(
+            response.report.signals[0]
+                .points
+                .iter()
+                .all(|(_, _, example)| {
+                    example.attributes_omitted == Some(0)
+                        && example.attributes.as_ref().is_some_and(|pairs| {
+                            pairs.contains(&("operation".into(), "fixture-operation".into()))
+                                && pairs.iter().any(|(key, _)| key == "ElapsedAlias")
+                        })
+                })
+        );
         assert_eq!(
             response.report.signals[0].density.as_ref().unwrap().count,
             2_000
