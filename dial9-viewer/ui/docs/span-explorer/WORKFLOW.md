@@ -6,9 +6,10 @@ The shared integration branch is `codex/span-tail-lab` in `dial9-rs/dial9`.
 The checkpoint contains the Span Explorer implementation, its Rust analysis
 backend, and categorical latency histograms.
 
-The tasks in [TASKS.md](TASKS.md) are paused and unassigned. Do not start
-an agent, claim a task, or implement an improvement until the user authorizes
-an assignment. Preparing this branch and workflow does not start task work.
+The user authorized the coordinator to drive all tasks through subagents,
+integration, QA, and periodic demos. Assignments and feedback checkpoints are
+recorded in [TASKS.md](TASKS.md). Contribution PRs target the integration branch;
+a main-branch PR or deployment remains a separate step.
 
 ## Coordinator
 
@@ -30,7 +31,8 @@ an assignment. Preparing this branch and workflow does not start task work.
 ## Worker branches
 
 Work in the upstream `dial9` repository. Use an isolated worktree and one
-branch per assigned task; do not share a dirty checkout or push directly to
+branch per assigned batch; group tasks that affect the same component. Do not
+share a dirty checkout or push directly to
 the integration branch.
 
 From the upstream checkout, after assignment:

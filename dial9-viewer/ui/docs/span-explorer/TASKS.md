@@ -1,10 +1,20 @@
 # Span Explorer UI task list
 
-Status: planning only. These tasks are recorded for future assignment; do not
-execute them yet. Keep the task numbers stable when assigning work.
+Status: active. The user authorized the coordinator to drive all tasks through
+subagents, integration, QA, and periodic demos. Keep the task numbers stable.
 
 Follow [WORKFLOW.md](WORKFLOW.md) when the user authorizes an assignment.
-Unassigned tasks remain paused.
+The coordinator assigns batches that minimize conflicting edits.
+
+## Assignment ledger
+
+| Batch | Tasks | Owner | Branch | Status |
+| --- | --- | --- | --- | --- |
+| Page | 4, 5, 8, 9, 15 | page-layout | `codex/span-ui-page` | Assigned |
+| Backend | 3, 11 (aggregation), 12 | backend-analysis | `codex/span-ui-backend` | Assigned |
+| Histograms | 13, 14, 17, 18 | property-histograms | `codex/span-ui-histograms` | Assigned |
+| Numeric | 1, 2, 6, 7, 11 (rendering) | To assign after page/backend integration | To assign | Queued |
+| Feedback | 10, 16 | Coordinator | To assign | Awaiting requested user input |
 
 Design guidance: start with why the user is here, minimize the explanation a
 visual needs, and make the initial view useful for deciding where to go deeper.
@@ -117,6 +127,6 @@ Keep analysis in the backend and render its results in the frontend.
   conventions, readouts, and selection behavior for the multi-series view.
   Preserve the line rendering of distributions that works well for overlays.
 
-Tasks 12–18 remain paused and unassigned. Coordinate tasks 13, 17, and 18
+Coordinate tasks 13, 17, and 18
 because they affect the same histogram component. Task 16 requires user
 feedback when work starts.
