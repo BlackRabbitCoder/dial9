@@ -259,7 +259,7 @@ export class SpanTailAnalysis {
         group.count < 20 ? html`<li>${group.name} has ${group.count} recorded values; at least 20 are required.</li>` : nothing,
         group.coverage < .5 ? html`<li>${group.name} records this field for ${percent(group.coverage)} of spans; the coverage warning threshold is 50%.</li>` : nothing,
       ])}</ul>
-      <p>The badge appears below either threshold in either group. Coverage warnings are separate from the backend's tail-difference ranking. Missing values are excluded; they are never treated as zero. Few observations or selective recording can make a difference unstable.</p>`;
+      <p>Limited coverage appears below 50% coverage in either group; fewer than 20 recorded values produces a Too few values label. Coverage warnings are separate from the backend's tail-difference ranking. Missing values are excluded; they are never treated as zero. Few observations or selective recording can make a difference unstable.</p>`;
   }
 
   private signalDetails(signal: TailSignal): TemplateResult {
@@ -274,7 +274,7 @@ export class SpanTailAnalysis {
     ];
     return html`<div class="tail-signal-table-wrap" role="region" tabindex="0" aria-label="Typical and ${label.toLowerCase()} field values">
       <table class="tail-signal-table"><caption>${signal.key}${signal.unit ? ` · recorded unit ${signal.unit}` : " · unit not recorded"}</caption>
-        <thead><tr><th scope="col">Spans</th><th scope="col">Recorded</th><th scope="col">Coverage</th><th scope="col">Mean</th><th scope="col">Median</th><th scope="col">p99</th></tr></thead>
+        <thead><tr><th scope="col">Group</th><th scope="col">Recorded</th><th scope="col">Coverage</th><th scope="col">Mean</th><th scope="col">Median</th><th scope="col">p99</th></tr></thead>
         <tbody>${rows.map(row => html`<tr><th scope="row">${row.label}</th>
           <td>${number(row.count, 0)}</td><td>${percent(row.coverage)}</td><td>${value(row.mean, signal.unit)}</td>
           <td>${value(row.median, signal.unit)}</td><td>${value(row.p99, signal.unit)}</td></tr>`)}</tbody>
