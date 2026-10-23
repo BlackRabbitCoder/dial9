@@ -80,3 +80,43 @@ Keep analysis in the backend and render its results in the frontend.
 - For implemented tasks, verify the visual result on actual data and check
   loading, custom selections, desktop/mobile layouts, and keyboard interaction
   where relevant.
+
+## Additional UI feedback
+
+- [ ] **12. Show only properties with meaningfully different latency distributions.**
+  Filter categorical properties to those whose values have meaningful latency
+  differences. Define the criterion before implementation, account for sample
+  size, and compute the comparison in the backend.
+
+- [ ] **13. Make overlay the default, with an optional stacked histogram view.**
+  Default to overlaid distributions. Provide a control to switch to stacked
+  histograms using the same rendering style, colors, bins, and comparable axes.
+
+- [ ] **14. Rename "Categories" to "Properties" and add property filter buttons.**
+  Use "Properties" in the visible UI. Provide buttons to filter/select the
+  displayed properties, with clear active states.
+
+- [ ] **15. Show numeric results directly below the property graphs.**
+  Present numeric results below the categorical property results rather than
+  hiding them behind a separate view. When there are no meaningful categorical
+  properties, give the numeric results a clearly separated section.
+
+- [ ] **16. Clarify "Mix shift" with human input.**
+  **Required feedback checkpoint:** when this task is picked up, ask the user
+  for input before implementing a replacement. Establish what the user needs
+  to understand and whether the concept should remain, be renamed, or be
+  presented differently.
+
+- [ ] **17. Include raw counts in overlaid histogram readouts.**
+  The overlay should display raw span counts for each series and latency bin,
+  alongside any percentages. Clearly identify the corresponding value and bin.
+
+- [ ] **18. Adapt the top histogram's behavior for multiple series.**
+  Show a labeled, dashed p99 line for every series, including both series in a
+  two-value overlay. Reuse the top histogram's axes, units, percentile marker
+  conventions, readouts, and selection behavior for the multi-series view.
+  Preserve the line rendering of distributions that works well for overlays.
+
+Tasks 12–18 remain paused and unassigned. Coordinate tasks 13, 17, and 18
+because they affect the same histogram component. Task 16 requires user
+feedback when work starts.

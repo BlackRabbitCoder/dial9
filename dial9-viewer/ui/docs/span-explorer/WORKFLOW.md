@@ -6,7 +6,7 @@ The shared integration branch is `codex/span-tail-lab` in `dial9-rs/dial9`.
 The checkpoint contains the Span Explorer implementation, its Rust analysis
 backend, and categorical latency histograms.
 
-All eleven tasks in [TASKS.md](TASKS.md) are paused and unassigned. Do not start
+The tasks in [TASKS.md](TASKS.md) are paused and unassigned. Do not start
 an agent, claim a task, or implement an improvement until the user authorizes
 an assignment. Preparing this branch and workflow does not start task work.
 
@@ -19,7 +19,9 @@ an assignment. Preparing this branch and workflow does not start task work.
    their status in their PRs.
 3. Assign tasks 5, 8, and 9 to one owner or establish their shared layout first.
    Complete task 3 before assigning the final shared-scale work in task 7.
-4. Task 10 starts with a user feedback conversation before implementation.
+   Coordinate tasks 13, 17, and 18 because they share the histogram component.
+4. Tasks marked with a required feedback checkpoint start with a user feedback
+   conversation before implementation.
 5. Review contributions and their latest validation. Merge passing, reviewed
    PRs into the integration branch in dependency order, then mark tasks done.
 6. Keep integration commits intact so other agents can update their branches.
@@ -86,5 +88,5 @@ Use only when the user is ready to start a task:
 > worktree branched from `origin/codex/span-tail-lab` and limit changes to
 > the assigned task. Push your branch and open a PR targeting
 > `codex/span-tail-lab`; wait for its latest CI and report validation to
-> the coordinator. Do not merge or start another task. For task 10, ask
-> the user for feedback before implementing a replacement.
+> the coordinator. Do not merge or start another task. If the assigned task
+> has a required feedback checkpoint, ask the user before implementation.
