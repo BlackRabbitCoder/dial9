@@ -10,11 +10,10 @@ The coordinator assigns batches that minimize conflicting edits.
 
 | Batch | Tasks | Owner | Branch | Status |
 | --- | --- | --- | --- | --- |
-| Page | 4, 5, 8, 9, 15 | page-layout | `codex/span-ui-page` | Assigned |
+| Page | 4, 5, 8, 9, 15 | page-layout | `codex/span-ui-page` | PR #1068; CI running |
 | Backend | 3, 11 (aggregation), 12 | backend-analysis | `codex/span-ui-backend` | Assigned |
-| Histograms | 13, 14, 17, 18 | property-histograms | `codex/span-ui-histograms` | Assigned |
-| Numeric | 1, 2, 6, 7, 11 (rendering) | To assign after page/backend integration | To assign | Queued |
-| Feedback | 10, 16 | Coordinator | To assign | Awaiting requested user input |
+| Histograms | 13, 14, 17, 18 | property-histograms | `codex/span-ui-histograms` | PR #1069; CI running |
+| Numeric | 1, 2, 6, 7, 10, 11 (rendering), 16; property controls integration | page-layout | `codex/span-ui-numeric` | Assigned; feedback received |
 
 Design guidance: start with why the user is here, minimize the explanation a
 visual needs, and make the initial view useful for deciding where to go deeper.
@@ -69,11 +68,10 @@ Keep analysis in the backend and render its results in the frontend.
   available width and height for graphs, with consistent page-level alignment
   and a usable mobile layout.
 
-- [ ] **10. Rework "Higher in slow XX% of pairs".**
-  **Required feedback checkpoint:** when this task is picked up, ask the user
-  for feedback before implementing a replacement. Establish what comparison
-  the user wants to understand, then choose wording or a visual they can
-  interpret without a statistical explanation. Do not preselect a solution.
+- [ ] **10. Remove "Higher in slow XX% of pairs".**
+  **Feedback received:** after discussing the pair comparison, the user asked
+  to drop the statistic. Keep the numeric graphs and actual typical/slow
+  values. Do not replace the removed statistic with another pair-score label.
 
 - [ ] **11. Make scatterplot density visible.**
   Distinguish dense regions from sparse ones, especially to the left of the
@@ -112,10 +110,9 @@ Keep analysis in the backend and render its results in the frontend.
   properties, give the numeric results a clearly separated section.
 
 - [ ] **16. Clarify "Mix shift" with human input.**
-  **Required feedback checkpoint:** when this task is picked up, ask the user
-  for input before implementing a replacement. Establish what the user needs
-  to understand and whether the concept should remain, be renamed, or be
-  presented differently.
+  **Feedback received:** show typical and slow property-value proportions
+  visually. Use aligned bars with consistent value colors and actual counts,
+  rather than the "Mix shift" text.
 
 - [ ] **17. Include raw counts in overlaid histogram readouts.**
   The overlay should display raw span counts for each series and latency bin,
