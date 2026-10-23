@@ -6,6 +6,11 @@ export interface TailRecord {
   endNs: string;
   sourceUrl: string;
   requestId: string | null;
+  /** Original recorded string pairs, preserving duplicate keys and their order.
+   * null/absent means unavailable; [] means this span recorded no fields. */
+  attributes?: [string, string][] | null;
+  /** Whole pairs omitted by response limits; null/absent means unavailable. */
+  attributesOmitted?: number | null;
 }
 export interface NumericField {
   key: string;
@@ -36,6 +41,22 @@ export interface TailDensity {
   count: number;
   maxCount: number;
 }
+export interface TailDifference {
+  /** Exact maximum CDF separation between all recorded cohort values. */
+  cdfGap: number;
+  /** Descriptive sampling allowance, assuming independent observations. */
+  samplingMargin: number;
+  /** max(0, cdfGap - samplingMargin); this is not a causal or p-value claim. */
+  lowerBound: number;
+  /** Number of eligible numeric fields covered by the sampling budget. */
+  comparisons: number;
+  samplingBudget: number;
+  /** All four summaries use original producer units and all recorded values. */
+  typicalMedian: number;
+  slowMedian: number;
+  typicalP99: number;
+  slowP99: number;
+}
 export interface TailSignal {
   key: string;
   unit: string | null;
@@ -55,6 +76,8 @@ export interface TailSignal {
   /** Optional only for compatibility with previously cached reports. */
   valueAxis?: TailValueAxis;
   density?: TailDensity;
+  /** null means one of the cohorts has no recorded values; absent is an old report. */
+  tailDifference?: TailDifference | null;
 }
 export interface TailComposition {
   count: number;
