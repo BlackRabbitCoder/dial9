@@ -85,13 +85,13 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function setup() {
+function setup({ mount = true } = {}) {
   const classToggle = vi.fn();
   const examples = {} as HTMLElement;
-  const panel = { classList: { toggle: classToggle }, querySelector: () => examples };
+  const panel = { classList: { toggle: classToggle }, querySelector: () => examples, scrollTop: 456 };
   const showModal = vi.fn();
   const container = { closest: () => panel, scrollIntoView: vi.fn(), querySelector: () => ({ showModal }) } as unknown as HTMLElement;
-  const context = {
+  const context: NonNullable<Parameters<SpanTailAnalysis["mount"]>[1]> = {
     spanType: { span_type_uid: "request-uid", name: "request" } as SpanTypeStats,
     scope: readScope(new URLSearchParams("api=1&data_dir=demo")),
     view: { startNs: null, endNs: null, selectedUid: "request-uid", bandMinNs: null, bandMaxNs: null, attrFilters: [], maxFiles: null },
@@ -99,8 +99,8 @@ function setup() {
   };
   const analysis = new SpanTailAnalysis();
   const latest = () => vi.mocked(render).mock.calls.filter(c => c[1] === container).at(-1)?.[0];
-  analysis.mount(container, context);
-  return { analysis, context, container, classToggle, latest, showModal };
+  if (mount) analysis.mount(container, context);
+  return { analysis, context, container, panel, classToggle, latest, showModal };
 }
 
 beforeEach(() => {
@@ -110,11 +110,155 @@ beforeEach(() => {
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe("automatic selected-span analysis", () => {
+  it("starts once with deep-linked bounds and preserves scroll when the report arrives", async () => {
+    const pending = deferred<Response>();
+    const fetch = vi.fn().mockReturnValue(pending.promise);
+    vi.stubGlobal("fetch", fetch);
+    const { analysis, context, container, panel, latest, classToggle } = setup({ mount: false });
+    analysis.mount(container, {
+      ...context,
+      view: { ...context.view, bandMinNs: 5e6, bandMaxNs: 20e6, maxFiles: 7 },
+    });
+    expect(fetch).toHaveBeenCalledOnce();
+    const url = fetch.mock.calls[0]![0] as URL;
+    expect(url.pathname).toBe("/api/span-tail");
+    expect(url.searchParams.get("span_type_uid")).toBe("request-uid");
+    expect(url.searchParams.get("min_span_ns")).toBe("5000000");
+    expect(url.searchParams.get("max_span_ns")).toBe("20000000");
+    expect(url.searchParams.get("max_files")).toBe("7");
+    expect(text(latest())).toContain("Computing latency comparison");
+    expect(classToggle).toHaveBeenLastCalledWith("tail-analysis-ready", true);
+    expect(panel.scrollTop).toBe(0);
+    panel.scrollTop = 123;
+    pending.resolve(response(report({ boundaryMs: 5 })));
+    await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
+    expect(panel.scrollTop).toBe(123);
+    expect(container.scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("does not repeat pending or completed requests on equivalent catalog mounts", async () => {
+    const pending = deferred<Response>();
+    const fetch = vi.fn().mockReturnValue(pending.promise);
+    vi.stubGlobal("fetch", fetch);
+    const { analysis, context, container, latest } = setup();
+    analysis.mount(container, {
+      ...context, spanType: { ...context.spanType, count: 200 },
+      view: { ...context.view }, headers: { ...context.headers },
+    });
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0]![1].signal.aborted).toBe(false);
+    pending.resolve(response(report()));
+    await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
+    analysis.mount(container, { ...context });
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it("waits until both a selected span and its container are mounted", async () => {
+    const fetch = vi.fn().mockResolvedValue(response(report()));
+    vi.stubGlobal("fetch", fetch);
+    const { analysis, context, container, latest } = setup({ mount: false });
+    analysis.mount(container, null);
+    analysis.mount(null, context);
+    expect(fetch).not.toHaveBeenCalled();
+    analysis.mount(container, context);
+    expect(fetch).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
+  });
+
+  type Context = ReturnType<typeof setup>["context"];
+  const changes: { name: string; change: (context: Context) => Context; parameter: string; expected: string }[] = [
+    { name: "span type", change: context => ({
+      ...context, spanType: { ...context.spanType, span_type_uid: "different-callsite" },
+    }), parameter: "span_type_uid", expected: "different-callsite" },
+    { name: "source", change: context => ({
+      ...context, scope: { ...context.scope, dataDir: "different-source" },
+    }), parameter: "data_dir", expected: "different-source" },
+    { name: "time window", change: context => ({
+      ...context, view: { ...context.view, startNs: "100", endNs: "200" },
+    }), parameter: "start_ns", expected: "100" },
+    { name: "attribute filters", change: context => ({
+      ...context, view: { ...context.view, attrFilters: [{ key: "status_code", value: "500" }] },
+    }), parameter: "attr", expected: "status_code=500" },
+    { name: "source file limit", change: context => ({
+      ...context, view: { ...context.view, maxFiles: 7 },
+    }), parameter: "max_files", expected: "7" },
+  ];
+
+  it.each(changes)("automatically starts a fresh comparison after changing $name", async ({ change, parameter, expected }) => {
+    const fetch = vi.fn().mockImplementation(() => Promise.resolve(response(report())));
+    vi.stubGlobal("fetch", fetch);
+    const { analysis, context, container, latest } = setup();
+    await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
+    const next = change(context);
+    analysis.mount(container, next);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect((fetch.mock.calls[1]![0] as URL).searchParams.get(parameter)).toBe(expected);
+    analysis.mount(container, { ...next });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
+  });
+
+  it("stays stopped after a failure until an explicit retry", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(new Response("Unavailable", { status: 503 }))
+      .mockResolvedValueOnce(response(report()));
+    vi.stubGlobal("fetch", fetch);
+    const { analysis, context, container, latest, classToggle } = setup();
+    await vi.waitFor(() => expect(text(latest())).toContain("Backend analysis failed (503)"));
+    analysis.mount(container, { ...context });
+    analysis.mount(container, context);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(classToggle).toHaveBeenLastCalledWith("tail-analysis-ready", false);
+    click(latest(), "Analyse source traces")();
+    await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("stays stopped after cancelling initial loading, including a late response", async () => {
+    const pending = deferred<Response>();
+    const fetch = vi.fn().mockReturnValueOnce(pending.promise).mockResolvedValueOnce(response(report()));
+    vi.stubGlobal("fetch", fetch);
+    const { analysis, context, container, latest } = setup();
+    click(latest(), "Cancel")();
+    expect(fetch.mock.calls[0]![1].signal.aborted).toBe(true);
+    analysis.mount(container, { ...context });
+    expect(fetch).toHaveBeenCalledOnce();
+    pending.resolve(response(report()));
+    await pending.promise;
+    await Promise.resolve();
+    expect(text(latest())).toContain("Analysis cancelled.");
+    click(latest(), "Analyse source traces")();
+    await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("supersedes a pending first report when its histogram band changes", async () => {
+    const old = deferred<Response>(), current = deferred<Response>();
+    const fetch = vi.fn().mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise);
+    vi.stubGlobal("fetch", fetch);
+    const { analysis, context, container, latest } = setup();
+    const next = { ...context, view: { ...context.view, bandMinNs: 5e6, bandMaxNs: 20e6 } };
+    analysis.mount(container, next);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch.mock.calls[0]![1].signal.aborted).toBe(true);
+    expect((fetch.mock.calls[1]![0] as URL).searchParams.get("min_span_ns")).toBe("5000000");
+    expect((fetch.mock.calls[1]![0] as URL).searchParams.get("max_span_ns")).toBe("20000000");
+    analysis.mount(container, { ...next });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    old.resolve(response(report({ signals: [{ ...report().signals[0]!, key: "StaleBand" }] })));
+    await old.promise;
+    await Promise.resolve();
+    expect(text(latest())).not.toContain("StaleBand");
+    expect(text(latest())).toContain("Computing latency comparison");
+    current.resolve(response(report({ boundaryMs: 5 })));
+    await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
+  });
+});
+
 describe("Span Explorer investigation", () => {
   it("shows properties and numeric results together without a chart tab", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(report())));
     const { latest, classToggle } = setup();
-    click(latest(), "Analyse source traces")();
     await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
     const rendered = text(latest());
     expect(rendered.indexOf("cache_hit")).toBeLessThan(rendered.indexOf("Numeric fields against elapsed time"));
@@ -128,7 +272,6 @@ describe("Span Explorer investigation", () => {
   it("keeps a distinct numeric section when no meaningful properties remain", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(report({ histograms: [] }))));
     const { latest } = setup();
-    click(latest(), "Analyse source traces")();
     await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
     expect(text(latest())).toContain('aria-label="Numeric fields"');
     expect(text(latest())).not.toContain('tail-property-heading');
@@ -140,7 +283,6 @@ describe("Span Explorer investigation", () => {
     signals.splice(1, 0, { ...field, key: "ElapsedAliasOnly", duplicatesLatency: true });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(report({ signals }))));
     const { latest } = setup();
-    click(latest(), "Analyse source traces")();
     await vi.waitFor(() => expect(text(latest())).toContain("field_1"));
     expect(text(latest())).not.toContain("ElapsedAliasOnly");
     expect(text(latest())).toContain("Show all 4 fields");
@@ -153,7 +295,6 @@ describe("Span Explorer investigation", () => {
     const field = { ...report().signals[0]!, correlation: 1, typicalCount: 5, typicalCoverage: .1 };
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(report({ signals: [field] }))));
     const { latest, showModal } = setup();
-    click(latest(), "Analyse source traces")();
     await vi.waitFor(() => expect(text(latest())).toContain("Perfectly correlated"));
     expect(text(latest())).not.toContain("Spearman");
     const handler = bindings(latest(), "@click=").find(value => typeof value === "function" && String(value).includes("Limited observations")) as (event: unknown) => void;
@@ -169,7 +310,6 @@ describe("Span Explorer investigation", () => {
     const field = { ...report().signals[0]!, unit: "μs", typical: 2000, slow: 8000 };
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(report({ signals: [field] }))));
     const { latest } = setup();
-    click(latest(), "Analyse source traces")();
     await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
     expect(text(latest())).toContain("2ms");
     expect(text(latest())).toContain("8ms");
@@ -180,7 +320,6 @@ describe("Span Explorer investigation", () => {
     const pending = deferred<Response>();
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(response(report())).mockReturnValueOnce(pending.promise));
     const { analysis, context, container, latest, classToggle } = setup();
-    click(latest(), "Analyse source traces")();
     await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
     analysis.mount(container, { ...context, view: { ...context.view, bandMinNs: 5e6, bandMaxNs: 20e6 } });
     expect(text(latest())).toContain("Computing latency comparison");
@@ -198,7 +337,6 @@ describe("Span Explorer investigation", () => {
     const fetch = vi.fn().mockResolvedValueOnce(response(report())).mockReturnValueOnce(pending.promise);
     vi.stubGlobal("fetch", fetch);
     const { analysis, context, container, latest, classToggle } = setup();
-    click(latest(), "Analyse source traces")();
     await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
     analysis.mount(container, { ...context, view: { ...context.view, bandMinNs: 5e6, bandMaxNs: 20e6 } });
     click(latest(), "Cancel")();
@@ -224,14 +362,12 @@ describe("Span Explorer investigation", () => {
       return Promise.resolve(response(report()));
     });
     vi.stubGlobal("fetch", fetch);
-    const { analysis, context, container, latest } = setup();
+    const { analysis, context, container, latest } = setup({ mount: false });
     analysis.mount(container, { ...context, scope: { ...context.scope, trace: "/old.bin" } });
-    click(latest(), "Analyse source traces")();
     analysis.mount(container, { ...context, scope: { ...context.scope, trace: "/current.bin" } });
     expect(fetch.mock.calls[0]?.[1]?.signal.aborted).toBe(true);
     pending.resolve({ ok: true, arrayBuffer: readOldBytes } as unknown as Response);
     await vi.waitFor(() => expect(readOldBytes).toHaveBeenCalledOnce());
-    click(latest(), "Analyse source traces")();
     await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
     expect(fetch.mock.calls.map(call => call[0].pathname)).toEqual(["/old.bin", "/current.bin", "/api/span-tail"]);
   });

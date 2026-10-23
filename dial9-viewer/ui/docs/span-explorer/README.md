@@ -1,7 +1,8 @@
 # Span Explorer latency investigation
 
 The latency investigation view lives in **Span Explorer**, below the selected span
-type's duration histogram. Click **Analyse source traces**. It works from
+type's duration histogram and opens automatically when a span is selected,
+including a deep link. It works from
 the current source, exact span-type ID, time window, and attribute filters.
 There are no service-specific fields, operation names, or datasets in the
 native feature.
@@ -88,6 +89,9 @@ missing density or shared-unit metadata.
 
 Recomputation blurs and disables previous results. Failure and cancellation
 clear stale comparisons; replacing the source retires its previous detail.
+An unchanged selection does not restart a failed or cancelled request;
+**Analyse source traces** retries it explicitly. New selections start at the
+top of the detail panel, while analysis completion preserves the scroll position.
 The paired comparison replaces the catalog's single time bar once analysis is
 available. Flamegraph links and recorded-instance browsing share one trace
 inspection section beneath the charts.
