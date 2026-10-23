@@ -11,7 +11,7 @@ The coordinator assigns batches that minimize conflicting edits.
 | Batch | Tasks | Owner | Branch | Status |
 | --- | --- | --- | --- | --- |
 | Page | 4, 5, 8, 9, 15 | page-layout | `codex/span-ui-page` | PR #1068 merged; native-page QA passed |
-| Backend | 3, 11 (aggregation), 12 | backend-analysis | `codex/span-ui-backend` | PR #1070; correcting rare-tail alias suppression |
+| Backend | 3, 11 (aggregation), 12 | backend-analysis | `codex/span-ui-backend` | Direct integration; final alias QA |
 | Histograms | 13, 14, 17, 18 | property-histograms | `codex/span-ui-histograms` | PR #1069 merged; component QA passed |
 | Numeric | 1, 2, 6, 7, 10, 11 (rendering), 16; property controls integration | page-layout | `codex/span-ui-numeric` | Implemented; combined QA and dependency integration |
 

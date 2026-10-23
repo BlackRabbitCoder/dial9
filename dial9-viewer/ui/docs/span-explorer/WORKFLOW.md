@@ -8,13 +8,19 @@ backend, and categorical latency histograms.
 
 The user authorized the coordinator to drive all tasks through subagents,
 integration, QA, and periodic demos. Assignments and feedback checkpoints are
-recorded in [TASKS.md](TASKS.md). Contribution PRs target the integration branch;
-a main-branch PR or deployment remains a separate step.
+recorded in [TASKS.md](TASKS.md). The current instruction is to merge contributions
+directly into the integration branch and hold PRs until the complete feature is
+ready for main. Do not open contribution PRs or a main-branch PR now.
+
+The earlier page and histogram contribution PRs were merged before this change
+in workflow. Preserve those commits and reconcile remaining worker branches
+against them.
 
 ## Coordinator
 
-1. Obtain the user's task assignment, including permission to push and open a
-   contribution PR. Use the assignment template below to make the scope clear.
+1. Obtain the user's task assignment and record the scope. The active workstream
+   authorizes worker pushes and coordinator integration; it does not authorize
+   opening another PR.
 2. Record the task's owner, branch, and status beside its entry in `TASKS.md`
    on the integration branch. The coordinator owns this ledger; workers report
    their status in their PRs.
@@ -24,11 +30,12 @@ a main-branch PR or deployment remains a separate step.
 4. Tasks marked with a required feedback checkpoint start with a user feedback
    conversation before implementation.
 5. Review contributions and their latest validation. Merge passing, reviewed
-   PRs into the integration branch in dependency order, then mark tasks done.
+   worker commits into the integration branch in dependency order, verify the
+   combined result, then mark tasks done.
 6. Keep integration commits intact so other agents can update their branches.
-   Use the repository's supported squash merges. Dependent workers reconcile
-   their branches onto the resulting integration commits. A main-branch PR or
-   deployment is a separate user-authorized step.
+   Use ordinary merges or fast-forward updates for direct integration. Dependent
+   workers reconcile their branches onto the resulting integration commits.
+   A main-branch PR or deployment is a separate user-authorized step.
 
 ## Worker branches
 
@@ -57,7 +64,7 @@ stylesheet; categorical rendering lives beside it in
 `dial9-viewer/src/server/span_stats/tail.rs`. Coordinate overlapping edits
 before work starts. Analysis remains in Rust.
 
-## Validation and contribution
+## Validation and direct integration
 
 - Follow the repository's required checks for the files changed. UI changes
   need the appropriate Vitest suites, type checks, Vite build, and viewer
@@ -66,26 +73,21 @@ before work starts. Analysis remains in Rust.
 - Verify the affected interaction visually using representative data. Report
   the scenario, result, and material limitations. Keep production captures,
   credentials, and internal trace links out of public commits and PRs.
-- Commit the contribution, push its task branch, and open a PR with
-  **`codex/span-tail-lab` as the base**. Include the task number, resulting
-  behavior, validation, and any remaining questions.
-- The coordinator may arrange a stacked contribution PR against an unfinished
-  dependency branch to overlap CI. Keep each layer independently buildable,
-  merge the dependency first, and reconcile or retarget the remaining layer
-  onto the integration branch. Verify CI on the final head and review the
-  final diff before merging.
-- Wait for CI on the latest contribution commit, resolve blocking failures
-  within the assigned scope, and notify the coordinator when ready.
+- Commit the contribution, push its task branch, and report the exact commit
+  to the coordinator with task numbers, resulting behavior, validation, and
+  any remaining concerns. **Do not open a PR.**
+- The coordinator reviews the diff and merges the worker commits into
+  **`codex/span-tail-lab`**. Run the required local checks and native UI QA on
+  the combined result; resolve blockers before marking tasks complete.
 - After an integration merge, update dependent work from the integration
   branch. Do not rewrite the shared branch's published history.
 
-For an authorized contribution, the PR command is:
+For coordinator integration of a reviewed worker branch:
 
 ```bash
-gh pr create --base codex/span-tail-lab \
-  --head codex/span-ui-task-01 \
-  --title "Task 1: describe the resulting behavior" \
-  --body-file /tmp/span-ui-task-01-pr.md
+git switch codex/span-tail-lab
+git merge --no-ff codex/span-ui-task-01
+git push origin codex/span-tail-lab
 ```
 
 ## Assignment template
@@ -95,7 +97,7 @@ Use only when the user is ready to start a task:
 > Implement task NUMBER from `dial9-viewer/ui/docs/span-explorer/TASKS.md`.
 > Read `WORKFLOW.md` and the repository instructions. Use an isolated
 > worktree branched from `origin/codex/span-tail-lab` and limit changes to
-> the assigned task. Push your branch and open a PR targeting
-> `codex/span-tail-lab`; wait for its latest CI and report validation to
-> the coordinator. Do not merge or start another task. If the assigned task
-> has a required feedback checkpoint, ask the user before implementation.
+> the assigned task. Run the required checks, push your branch, and report
+> its exact commit and validation to the coordinator for direct integration.
+> Do not open a PR, merge, or start another task. If the assigned task has a
+> required feedback checkpoint, discuss it with the user before implementation.
