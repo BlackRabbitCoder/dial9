@@ -35,6 +35,7 @@ import {
   removeAttrFilter,
   shouldAdoptCatalogSnapshot,
   sourceScopeFromStored,
+  spanTypeLabel,
 } from "../../lib/trace/index.js";
 import type {
   AttrFilter,
@@ -54,6 +55,7 @@ import {
   type SortKey,
 } from "./catalog.js";
 import { renderDetail } from "./detail.js";
+import { SpanTailAnalysis } from "./tail-analysis.js";
 import { renderFilterBar } from "./filters.js";
 import {
   retainMatchedHistogramPair,
@@ -80,6 +82,7 @@ import {
 } from "./raw.js";
 
 const els = pageEls();
+const tailAnalysis = new SpanTailAnalysis();
 
 // URL params are read ONCE: the load scope is fixed for the page's lifetime.
 const params = new URLSearchParams(window.location.search);
@@ -99,6 +102,7 @@ els.btnCopyLink.style.display = isSourceShareable(scope.source) ? "" : "none";
 
 let spanTypes: SpanTypeStats[] = [];
 let selectedUid = params.get("span_type_uid");
+let catalogExpanded = false;
 let band: DurationBand = {
   min_ns:
     params.get("min_span_ns") != null
@@ -238,10 +242,24 @@ function renderDetailNow(): void {
       renderDetailNow();
     },
   });
+  const selected = spanTypes.find(s => s.span_type_uid === selectedUid);
+  tailAnalysis.mount(els.detailPanel.querySelector(".span-tail-mount"), selected ? {
+    spanType: selected, scope, view: view(),
+    headers: Dial9Session.headers(Dial9Creds.headers()),
+    onClearBand: () => applyBand({ min_ns: null, max_ns: null }),
+  } : null);
 }
 
 function renderCatalogNow(): void {
   renderCatalog(els, spanTypes, sort, selectedUid, selectSpanType);
+  const selected = spanTypes.find(s => s.span_type_uid === selectedUid);
+  const expanded = !selected || catalogExpanded;
+  els.catalogSelection.style.display = selected ? "flex" : "none";
+  els.catalogSelectedName.textContent = selected ? spanTypeLabel(selected) : "";
+  els.catalogSelectedName.title = els.catalogSelectedName.textContent;
+  els.btnToggleCatalog.textContent = expanded ? "Hide span list" : `Change span · ${spanTypes.length}`;
+  els.btnToggleCatalog.setAttribute("aria-expanded", String(expanded));
+  els.catalogWrap.style.display = spanTypes.length && expanded ? "block" : "none";
 }
 
 function renderFilterBarNow(): void {
@@ -288,6 +306,7 @@ function selectSpanType(uid: string): void {
     stopStreaming();
   stopComparisonStreaming(true);
   selectedUid = uid;
+  catalogExpanded = false;
   band = { min_ns: null, max_ns: null };
   const needsRefresh =
     !rawMode && exemplarScopeByUid.get(uid) !== exemplarScopeKey(view());
@@ -296,6 +315,7 @@ function selectSpanType(uid: string): void {
   syncUrl();
   renderCatalogNow();
   renderDetailNow();
+  els.btnToggleCatalog.focus({ preventScroll: true });
   if (needsRefresh) startStreaming("exemplars");
   if (attrFilters.length > 0) startComparisonStreaming();
 }
@@ -372,6 +392,7 @@ function startStreaming(mode: StreamMode): void {
   els.error.style.display = "none";
   if (mode === "replace") {
     els.loading.classList.remove("hidden");
+    els.catalogSelection.style.display = "none";
     els.catalogWrap.style.display = "none";
     els.detailPanel.className = "detail-panel empty";
   }
@@ -703,6 +724,14 @@ els.catalog.querySelector("thead")?.addEventListener("click", (e) => {
   if (!key) return;
   sort = nextSort(sort, key as SortKey);
   renderCatalogNow();
+});
+
+els.btnToggleCatalog.addEventListener("click", () => {
+  catalogExpanded = !catalogExpanded;
+  renderCatalogNow();
+  if (catalogExpanded) {
+    els.catalogBody.querySelector(".selected")?.scrollIntoView({ block: "nearest" });
+  }
 });
 
 // ── Boot ──

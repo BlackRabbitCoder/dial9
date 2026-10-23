@@ -50,6 +50,8 @@ const SPAN_STATS_COLUMNS: &[&str] = &[
     "scheduler_delay_ns",
     "unknown_ns",
     "attributes",
+    "attribute_units",
+    "observed_active_wall_ns",
     "source_key",
     "host",
 ];
@@ -97,6 +99,8 @@ pub(super) struct SpanStatsRow {
     pub elapsed_ns: i64,
     pub exemplar: Option<Exemplar>,
     pub attributes: Vec<(String, String)>,
+    pub attribute_units: Vec<(String, String)>,
+    pub observed_active_wall_ns: Option<i64>,
     pub composition: Option<RowComposition>,
     pub details_complete: Option<bool>,
 }
@@ -261,6 +265,8 @@ impl SpansBatchReader {
         let source_key_col = column::<StringArray>(batch, "source_key");
         let host_col = column::<StringArray>(batch, "host");
         let attributes_col = column::<MapArray>(batch, "attributes");
+        let units_col = column::<MapArray>(batch, "attribute_units");
+        let active_wall_col = column::<Int64Array>(batch, "observed_active_wall_ns");
         let on_cpu_col = column::<Int64Array>(batch, "on_cpu_ns_est");
         let blocked_col = column::<Int64Array>(batch, "blocked_ns_est");
         let async_wait_col = column::<Int64Array>(batch, "async_wait_ns");
@@ -386,6 +392,10 @@ impl SpansBatchReader {
                 elapsed_ns,
                 exemplar,
                 attributes,
+                attribute_units: units_col
+                    .map(|array| parse_map_column(array, row_index))
+                    .unwrap_or_default(),
+                observed_active_wall_ns: optional_i64(active_wall_col, row_index),
                 composition,
                 details_complete: optional_bool(details_complete_col, row_index),
             }

@@ -2162,6 +2162,7 @@ dependencies = [
  "mime_guess",
  "parquet",
  "reqwest",
+ "rstest 0.26.1",
  "rust-embed",
  "rustc-hash",
  "s3s",

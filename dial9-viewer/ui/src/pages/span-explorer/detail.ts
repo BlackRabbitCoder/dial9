@@ -300,7 +300,9 @@ export function renderDetail(detailPanel: HTMLElement, m: DetailModel): void {
     html`
       ${headerTemplate(st, m, exemplars[0] ?? null)}
       <div class="histogram-wrap"></div>
-      ${bandTemplate(st, m)} ${compositionTemplate(st, m)}
+      ${bandTemplate(st, m)}
+      <div class="span-tail-mount"></div>
+      ${compositionTemplate(st, m)}
       ${flamegraphLinksTemplate(m)}
       ${exemplarsTemplate(exemplars, tableCtx, hasBand, m.exemplarRefreshPending)}
       ${
