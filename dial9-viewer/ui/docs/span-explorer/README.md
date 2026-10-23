@@ -64,6 +64,16 @@ coverage come after better-observed fields. Duration attributes that repeat
 total elapsed time and constant fields are omitted. The backend's ordering is
 descriptive, not a significance test.
 
+Elapsed aliases require declared time units and use a tolerance of 1 ns or
+0.2% of elapsed time, whichever is larger. A timer that matches every recorded
+value is omitted even when some values are missing. A near-duplicate with more
+than 98% overall matches is omitted only when every recorded value in both the
+source/group's fixed p99 tail and the current selection matches. Each checked
+cohort must be nonempty and have at least twenty recorded values or complete
+recorded coverage. A near-duplicate can reappear when a custom selection exposes
+differences or lacks enough recorded coverage; a meaningful rare-tail difference
+must remain visible. Unknown units never imply an elapsed alias.
+
 Each card shows group means, qualitative correlation, and repetition across
 qualifying source files. Click a correlation or observation badge for its
 definition and recorded counts; Escape closes the explanation and returns focus.

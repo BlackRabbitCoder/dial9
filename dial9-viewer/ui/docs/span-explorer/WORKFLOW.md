@@ -23,7 +23,7 @@ against them.
    opening another PR.
 2. Record the task's owner, branch, and status beside its entry in `TASKS.md`
    on the integration branch. The coordinator owns this ledger; workers report
-   their status in their PRs.
+   their status and exact commits to the coordinator.
 3. Assign tasks 5, 8, and 9 to one owner or establish their shared layout first.
    Complete task 3 before assigning the final shared-scale work in task 7.
    Coordinate tasks 13, 17, and 18 because they share the histogram component.
