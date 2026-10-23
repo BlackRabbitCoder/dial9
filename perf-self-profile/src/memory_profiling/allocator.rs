@@ -69,9 +69,19 @@ impl<A: GlobalAlloc> Dial9Allocator<A> {
 
     // Keep enabled dispatch separate so inactive calls can tail-call the inner
     // allocator. These helpers are hot after install; only actual samples are cold.
+    /// Allocate through the inner allocator and sample successful allocations.
+    ///
+    /// # Safety
+    ///
+    /// The caller must provide a nonzero-sized `layout`, as required by
+    /// [`GlobalAlloc::alloc`].
+    ///
+    /// Returns the inner allocator's result unchanged: a caller-owned block
+    /// with `layout`, or null on failure.
     #[inline(never)]
     unsafe fn alloc_profiled(&self, inner: &MemoryProfilerInner, layout: Layout) -> *mut u8 {
-        // SAFETY: `layout` validity contract forwarded to the inner allocator.
+        // SAFETY: this helper's contract requires a nonzero-sized layout.
+        // Passing it unchanged satisfies GlobalAlloc::alloc's precondition.
         let ptr = unsafe { self.0.alloc(layout) };
         // SAFETY: the hook guards reentrant liveset operations (see hook module
         // docs). `ptr` is non-null (checked below) and valid.
@@ -81,16 +91,38 @@ impl<A: GlobalAlloc> Dial9Allocator<A> {
         ptr
     }
 
+    /// Record the free before releasing the block through the inner allocator.
+    ///
+    /// # Safety
+    ///
+    /// The caller must provide a block currently allocated by `self.0`, with
+    /// `layout` equal to its allocation layout, per [`GlobalAlloc::dealloc`].
+    ///
+    /// This consumes the block; its memory must not be accessed afterwards.
     #[inline(never)]
     unsafe fn dealloc_profiled(&self, inner: &MemoryProfilerInner, ptr: *mut u8, layout: Layout) {
         // SAFETY: the hook guards reentrant liveset operations (see hook module
         // docs). `ptr` is valid per the `dealloc` contract.
         crate::memory_profiling::hook::on_dealloc(inner, ptr, layout.size());
-        // SAFETY: `ptr`/`layout` validity contract forwarded to the inner
-        // allocator.
+        // SAFETY: the helper's contract supplies a live self.0 block and its
+        // exact layout. The hook only handles metadata; the block is still live.
+        // This call releases it exactly once.
         unsafe { self.0.dealloc(ptr, layout) };
     }
 
+    /// Reallocate through the inner allocator while updating sampled metadata.
+    ///
+    /// # Safety
+    ///
+    /// The caller must provide a block currently allocated by `self.0`, with
+    /// `old_layout` equal to its allocation layout. `new_size` must be nonzero
+    /// and, rounded up to `old_layout.align()`, must not exceed `isize::MAX`,
+    /// as required by [`GlobalAlloc::realloc`].
+    ///
+    /// A non-null result transfers the old block to the allocator; only the
+    /// returned pointer may access the new block, using `new_size` and the
+    /// original alignment. A null result leaves the old block and its contents
+    /// unchanged and owned by the caller.
     #[inline(never)]
     unsafe fn realloc_profiled(
         &self,
@@ -108,8 +140,10 @@ impl<A: GlobalAlloc> Dial9Allocator<A> {
         // SAFETY: the hook guards reentrant liveset operations (see hook module
         // docs). `ptr` is valid per the `realloc` contract.
         let state = crate::memory_profiling::hook::on_realloc_before(inner, ptr);
-        // SAFETY: `ptr`/`old_layout`/`new_size` validity contract forwarded
-        // to the inner allocator.
+        // SAFETY: the helper's contract supplies a live self.0 block, its exact
+        // layout, and a nonzero new_size whose alignment-rounded size fits isize.
+        // The preceding hook only removes metadata, leaving the block live;
+        // all three arguments are passed unchanged to GlobalAlloc::realloc.
         let new_ptr = unsafe { self.0.realloc(ptr, old_layout, new_size) };
         // SAFETY: both hooks preserve the reentrancy guard (see hook module docs).
         if new_ptr.is_null() {
@@ -122,9 +156,19 @@ impl<A: GlobalAlloc> Dial9Allocator<A> {
         new_ptr
     }
 
+    /// Allocate zeroed memory through the inner allocator and sample it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must provide a nonzero-sized `layout`, as required by
+    /// [`GlobalAlloc::alloc_zeroed`].
+    ///
+    /// Returns a caller-owned, zero-initialized block with `layout`, or null
+    /// on failure, without changing the inner allocator's result.
     #[inline(never)]
     unsafe fn alloc_zeroed_profiled(&self, inner: &MemoryProfilerInner, layout: Layout) -> *mut u8 {
-        // SAFETY: forwarded to the inner allocator.
+        // SAFETY: this helper's contract requires a nonzero-sized layout.
+        // Passing it unchanged satisfies GlobalAlloc::alloc_zeroed's precondition.
         let ptr = unsafe { self.0.alloc_zeroed(layout) };
         // SAFETY: the hook guards reentrant liveset operations (see hook module
         // docs). `ptr` is non-null (checked below) and valid.
@@ -136,8 +180,10 @@ impl<A: GlobalAlloc> Dial9Allocator<A> {
 }
 
 // SAFETY: forwarding to the inner `GlobalAlloc` impl. The `unsafe` contract on
-// each method is exactly the same as the inner allocator's. Hooks preserve
-// their reentrancy guards across liveset operations — see
+// each method is exactly the same as the inner allocator's. Every returned
+// block comes from self.0 unchanged, and the same self.0 handles its free or
+// realloc; hooks only handle metadata and never access the block's contents.
+// Hooks preserve their reentrancy guards across liveset operations — see
 // [`crate::memory_profiling::hook`] module docs and design §6.
 unsafe impl<A: GlobalAlloc> GlobalAlloc for Dial9Allocator<A> {
     #[inline]
@@ -145,9 +191,11 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Dial9Allocator<A> {
         // Sample profiler state at entry so the inactive path can tail-call the
         // inner allocator without retaining its result for a later hook.
         match ACTIVE.get() {
-            // SAFETY: valid layout; the helper preserves the hook contract.
+            // SAFETY: GlobalAlloc::alloc's caller supplies a nonzero-sized
+            // layout, which is passed unchanged to the helper.
             Some(inner) => unsafe { self.alloc_profiled(inner, layout) },
-            // SAFETY: forwarded from the caller.
+            // SAFETY: the caller supplies a nonzero-sized layout, which is
+            // passed unchanged to the inner GlobalAlloc::alloc.
             None => unsafe { self.0.alloc(layout) },
         }
     }
@@ -156,11 +204,13 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Dial9Allocator<A> {
     #[inline(never)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         match ACTIVE.get() {
-            // SAFETY: ptr/layout are valid; the hook runs before the inner free.
+            // SAFETY: the wrapper's blocks come from self.0 unchanged, so the
+            // caller's live-block/exact-layout obligations satisfy the helper.
             Some(inner) if inner.liveset.is_some() => unsafe {
                 self.dealloc_profiled(inner, ptr, layout)
             },
-            // SAFETY: forwarded from the caller; frees need no hook without a liveset.
+            // SAFETY: the caller's live block belongs to self.0 with this exact
+            // layout. Without a liveset, no metadata needs to be removed.
             _ => unsafe { self.0.dealloc(ptr, layout) },
         }
     }
@@ -168,10 +218,12 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Dial9Allocator<A> {
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
         match ACTIVE.get() {
-            // SAFETY: the helper removes liveset metadata before realloc and
-            // restores it on failure, while forwarding the caller's contract.
+            // SAFETY: wrapper blocks belong to self.0 unchanged. The caller's
+            // exact layout and nonzero, alignment-rounded size bound are the
+            // helper's preconditions; all arguments are passed unchanged.
             Some(inner) => unsafe { self.realloc_profiled(inner, ptr, old_layout, new_size) },
-            // SAFETY: forwarded from the caller.
+            // SAFETY: the same-inner-allocator invariant and unchanged arguments
+            // preserve the caller's GlobalAlloc::realloc preconditions.
             None => unsafe { self.0.realloc(ptr, old_layout, new_size) },
         }
     }
@@ -179,9 +231,11 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Dial9Allocator<A> {
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         match ACTIVE.get() {
-            // SAFETY: valid layout; the helper preserves the hook contract.
+            // SAFETY: GlobalAlloc::alloc_zeroed's caller supplies a nonzero-sized
+            // layout, which is passed unchanged to the helper.
             Some(inner) => unsafe { self.alloc_zeroed_profiled(inner, layout) },
-            // SAFETY: forwarded from the caller.
+            // SAFETY: the caller supplies a nonzero-sized layout, which is
+            // passed unchanged to the inner GlobalAlloc::alloc_zeroed.
             None => unsafe { self.0.alloc_zeroed(layout) },
         }
     }
