@@ -173,6 +173,9 @@ dial9-tokio-telemetry = { path = ".", features = [
 ] }
 nix = { version = "0.29", features = ["process"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+tikv-jemallocator = "0.6"
+
 [[bench]]
 name = "overhead_bench"
 harness = false
@@ -183,6 +186,36 @@ harness = false
 
 [[bench]]
 name = "memory_profiling_bench"
+harness = false
+required-features = ["memory-profiling"]
+
+[[bench]]
+name = "allocator_workload_plain"
+harness = false
+required-features = ["memory-profiling"]
+
+[[bench]]
+name = "allocator_workload_dial9"
+harness = false
+required-features = ["memory-profiling"]
+
+[[bench]]
+name = "allocator_calls_jemalloc_plain"
+harness = false
+required-features = ["memory-profiling"]
+
+[[bench]]
+name = "allocator_calls_jemalloc_dial9"
+harness = false
+required-features = ["memory-profiling"]
+
+[[bench]]
+name = "allocator_calls_system_plain"
+harness = false
+required-features = ["memory-profiling"]
+
+[[bench]]
+name = "allocator_calls_system_dial9"
 harness = false
 required-features = ["memory-profiling"]
 
