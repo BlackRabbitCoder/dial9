@@ -16,7 +16,7 @@ The coordinator assigns batches that minimize conflicting edits.
 | Backend | 3, 11 (aggregation), 12 | backend-analysis | `codex/span-ui-backend` | Integrated; full Rust/stress and raw/aggregate QA passed |
 | Histograms | 13, 14, 17, 18 | property-histograms | `codex/span-ui-histograms` | Integrated; component and mobile QA passed |
 | Numeric | 1, 2, 6, 7, 10, 11 (rendering), 16; property controls integration | page-layout | `codex/span-ui-numeric` | Integrated; density colors, keyboard and native QA passed |
-| Default analysis | 19 | page-layout | `codex/span-ui-default-analysis` | Assigned; automatic initial and changed-selection loading |
+| Default analysis | 19 | page-layout | `codex/span-ui-default-analysis` | Integrated; full UI and 16 native lifecycle checks passed |
 | True stacked distribution | 20 | property-histograms | `codex/span-ui-true-stacked` | Assigned; cumulative layers on one graph |
 | Tail evidence | 21, 24 (data) | backend-analysis | `codex/span-ui-tail-evidence` | Investigating metric with user discussion; point attributes assigned |
 | Property interaction | 22, 23, 24 (rendering) | page-layout | Pending task 19 integration | Queued; shared controls and point tooltips |
@@ -141,7 +141,7 @@ feedback when work starts.
 
 ## Follow-up feedback
 
-- [ ] **19. Open the analysis by default for the selected span.**
+- [x] **19. Open the analysis by default for the selected span.**
   Start the backend comparison automatically on initial selection and when
   the selected span or source changes. Repeated rendering of the same context
   must not issue duplicate requests or retry a cancelled or failed analysis.
@@ -176,7 +176,7 @@ feedback when work starts.
 ## Completion evidence
 
 The combined feature passes 1,670 Rust tests and the required stress run,
-2,764 UI tests, TypeScript checks, and the Vite/release builds. Focused numeric
+2,775 UI tests, TypeScript checks, and the Vite/release builds. Focused numeric
 browser checks cover qualitative labels, explanations, shared axes, exact
 density color boundaries, keyboard trace samples, loading/failure/cancellation,
 custom brushing, and mobile layout.
@@ -186,3 +186,7 @@ raw/aggregate/mobile checks. Alias suppression was verified on both source
 modes; deterministic fixtures preserve rare-tail and brushed-cohort divergences.
 Production captures and recordings remain private, outside the repository.
 Clippy reports only the pre-existing background-symbolization warning.
+
+Automatic initial analysis additionally passes 16 native aggregate/raw checks,
+including unchanged selection, custom deep links, failure/retry, cancellation,
+span switching, and mobile. The current UI embedding build passes.
