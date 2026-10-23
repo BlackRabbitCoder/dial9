@@ -1,7 +1,9 @@
 import { html, nothing, render, svg } from "lit-html";
+import { ref } from "lit-html/directives/ref.js";
 import type { TailRecord, TailSignal, TailValueAxis } from "../../lib/trace/span-tail-analysis.js";
 import { formatHumanDuration } from "../../lib/trace/api_format.js";
 import { latencyToHistogramPosition } from "./categorical-histogram-scale.js";
+import { renderRecordedFields, tooltipPosition } from "./recorded-fields.js";
 
 export interface NumericPlotOptions {
   signals: readonly TailSignal[];
@@ -113,21 +115,54 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
     </g>`;
   };
   const tooltipFor = (element: Element) => element.closest(".tail-plot")!.querySelector<HTMLElement>(".tail-plot-tooltip")!;
-  const hideTooltip = (event: Event) => { tooltipFor(event.currentTarget as Element).hidden = true; };
-  const showTooltip = (element: Element, content: unknown, x: number, y: number, keyboard: boolean) => {
+  let hideTimer: ReturnType<typeof setTimeout> | null = null;
+  let tooltipTrigger: Element | null = null;
+  const retainTooltip = () => { if (hideTimer != null) clearTimeout(hideTimer); hideTimer = null; };
+  const hideTooltip = (event: Event) => { retainTooltip(); tooltipFor(event.currentTarget as Element).hidden = true; };
+  const leaveTooltip = (event: Event) => {
+    retainTooltip();
+    const tooltip = tooltipFor(event.currentTarget as Element);
+    hideTimer = setTimeout(() => {
+      if (!tooltip.contains(document.activeElement) && document.activeElement !== tooltipTrigger) tooltip.hidden = true;
+    }, 180);
+  };
+  const blurTooltip = (event: FocusEvent) => {
+    const tooltip = tooltipFor(event.currentTarget as Element);
+    if (!tooltip.contains(event.relatedTarget as Node | null)) hideTooltip(event);
+  };
+  const showTooltip = (element: Element, content: unknown, x: number, y: number, keyboard: boolean, interactive = false) => {
+    retainTooltip();
+    tooltipTrigger = element;
     const tooltip = tooltipFor(element);
     render(content, tooltip);
     tooltip.hidden = false;
-    tooltip.style.left = x < width / 2 ? `${Math.max(0, x / width * 100)}%` : "auto";
-    tooltip.style.right = x < width / 2 ? "auto" : `${Math.max(0, (width - x) / width * 100)}%`;
-    tooltip.style.top = `${Math.max(24, Math.min(y / height * 100, 68))}%`;
+    const plot = element.closest(".tail-plot")!;
+    const plotRect = plot.getBoundingClientRect();
+    const svgRect = plot.querySelector("svg")!.getBoundingClientRect();
+    const clip = plot.closest(".tail-plot-dialog, .detail-panel")?.getBoundingClientRect();
+    const bounds = {
+      left: Math.max(8, (clip?.left ?? 0) + 8), top: Math.max(8, (clip?.top ?? 0) + 8),
+      right: Math.min(window.innerWidth - 8, (clip?.right ?? window.innerWidth) - 8),
+      bottom: Math.min(window.innerHeight - 8, (clip?.bottom ?? window.innerHeight) - 8),
+    };
+    tooltip.style.maxWidth = `${Math.min(330, bounds.right - bounds.left)}px`;
+    tooltip.style.maxHeight = `${bounds.bottom - bounds.top}px`;
+    const position = tooltipPosition(
+      { x: svgRect.left + x / width * svgRect.width, y: svgRect.top + y / height * svgRect.height },
+      tooltip.getBoundingClientRect(), bounds);
+    tooltip.style.left = `${position.left - plotRect.left}px`;
+    tooltip.style.right = "auto";
+    tooltip.style.top = `${position.top - plotRect.top}px`;
+    tooltip.setAttribute("role", interactive ? "dialog" : "tooltip");
+    tooltip.setAttribute("aria-label", interactive ? "Recorded span details" : "Density cell count");
     tooltip.setAttribute("aria-live", keyboard ? "polite" : "off");
   };
-  const pointTooltip = (element: Element, elapsed: number, raw: number, keyboard: boolean) => showTooltip(element, html`
+  const pointTooltip = (element: Element, elapsed: number, raw: number, row: TailRecord, keyboard: boolean) => showTooltip(element, html`
     <strong>${duration(elapsed)} elapsed</strong>
     <span>${signal.key}: ${fieldValue(raw * axis.multiplier, axis.unit)}</span>
-    <b>Open trace focused on this span ↗</b>
-    ${keyboard ? html`<small>Left/right choose samples · Enter opens the trace</small>` : nothing}`, px(elapsed), py(raw * axis.multiplier), keyboard);
+    <button type="button" class="tail-tooltip-trace" @click=${() => options.onJump(row)}>Open trace focused on this span ↗</button>
+    ${renderRecordedFields(row)}
+    ${keyboard ? html`<small>Left/right choose samples · Enter opens the trace · Tab inspects fields</small>` : nothing}`, px(elapsed), py(raw * axis.multiplier), keyboard, true);
   const cellTooltip = (element: Element, x: number, y: number, keyboard: boolean) => {
     if (!density) return;
     const count = density.counts[y * xBins + x]!;
@@ -157,7 +192,7 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
       aria-label="${signal.key}; ${axis.unit ?? "unit not recorded"} against span elapsed time; logarithmic elapsed axis, linear value axis. ${density ? `${number(density.count)} observations in the density grid; arrow keys inspect cells.` : "Trace-linked point sample; density unavailable in this cached report."}"
       @keydown=${keydown}
       @focus=${(event: FocusEvent) => { if (density) cellTooltip(event.currentTarget as Element, keyboardCell % xBins, Math.floor(keyboardCell / xBins), true); }}
-      @blur=${hideTooltip} @pointerleave=${hideTooltip}>
+      @blur=${blurTooltip} @pointerleave=${leaveTooltip}>
       ${[0, .5, 1].map(f => svg`<text x=${left - 6} y=${py(axis.minimum + f * (axis.maximum - axis.minimum)) + 4} text-anchor="end">${numericAxisTick(axis.minimum + f * (axis.maximum - axis.minimum), axis.unit)}</text>`)}
       ${density ? density.counts.map((count, index) => {
         if (!count) return nothing;
@@ -187,14 +222,14 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
         stroke-width="1.4" tabindex=${index === 0 ? "0" : "-1"} role="link"
         aria-keyshortcuts="ArrowLeft ArrowRight Home End Enter Escape"
         aria-label="${duration(elapsed)} elapsed; ${signal.key} ${fieldValue(raw * axis.multiplier, axis.unit)}. Open trace focused on this span."
-        @pointerenter=${(event: PointerEvent) => pointTooltip(event.currentTarget as Element, elapsed, raw, false)}
-        @pointerleave=${hideTooltip}
+        @pointerenter=${(event: PointerEvent) => pointTooltip(event.currentTarget as Element, elapsed, raw, row, false)}
+        @pointerleave=${leaveTooltip}
         @focus=${(event: FocusEvent) => {
           const element = event.currentTarget as SVGCircleElement;
           element.ownerSVGElement!.querySelectorAll(".tail-trace-point").forEach(point => point.setAttribute("tabindex", point === element ? "0" : "-1"));
-          pointTooltip(element, elapsed, raw, true);
+          pointTooltip(element, elapsed, raw, row, true);
         }}
-        @blur=${hideTooltip}
+        @blur=${blurTooltip}
         @click=${() => options.onJump(row)}
         @keydown=${(event: KeyboardEvent) => {
           if (event.key === "Enter") { event.preventDefault(); options.onJump(row); }
@@ -208,7 +243,20 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
         }}></circle>`)}
       <text x=${(left + right) / 2} y=${height - 3} text-anchor="middle">Span elapsed (ms · log scale) →</text>
     </svg>
-    <div class="tail-plot-tooltip" role="tooltip" hidden></div>
+    <div class="tail-plot-tooltip" role="tooltip" hidden
+      ${ref(element => {
+        // Imperative details belong to this plotted report and its handlers.
+        retainTooltip();
+        if (element) (element as HTMLElement).hidden = true;
+      })}
+      @pointerenter=${retainTooltip} @pointerleave=${leaveTooltip} @focusout=${blurTooltip}
+      @keydown=${(event: KeyboardEvent) => {
+        if (event.key !== "Escape") return;
+        (tooltipTrigger as HTMLElement | null)?.focus({ preventScroll: true });
+        hideTooltip(event);
+        event.preventDefault();
+        event.stopPropagation();
+      }}></div>
     <div class="tail-density-legend">${density ? html`
       <span>${number(density.count)} recorded spans</span>
       <span class="tail-density-key"><i style="background-image:linear-gradient(to right,${densityColor(1, density.maxCount)},${densityColor(density.maxCount, density.maxCount)}),linear-gradient(to right,${densityColor(1, density.maxCount, true)},${densityColor(density.maxCount, density.maxCount, true)})"></i>1–${number(density.maxCount)} / cell</span>

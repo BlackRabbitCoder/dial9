@@ -1,4 +1,4 @@
-import { html, nothing, render, svg } from "lit-html";
+import { html, nothing, render, svg, type TemplateResult } from "lit-html";
 import type { CategoricalHistogram, CategoryLatency } from "../../lib/trace/span-tail-analysis.js";
 import { formatHumanDuration } from "../../lib/trace/api_format.js";
 import {
@@ -25,6 +25,7 @@ export interface PropertyHistogramOptions extends CategoricalHistogramOptions {
   selectedKey: string | null;
   onSelectProperty: (key: string) => void;
   onModeChange: (mode: HistogramViewMode) => void;
+  controls?: TemplateResult | typeof nothing;
 }
 
 const colors = [
@@ -295,16 +296,17 @@ export function renderPropertyHistograms(
   if (!histogram) return nothing;
   const mode = options.mode ?? "overlay";
   return html`<section class="tail-properties">
-    <div class="tail-property-heading"><h4>Properties</h4>
+    <div class="tail-property-heading"><h4>${histograms.length === 1 ? histogram.key : "Properties"}</h4>
       <div class="tail-histogram-modes" role="group" aria-label="Property histogram view">
         <button type="button" aria-pressed=${mode === "overlay"} @click=${() => options.onModeChange("overlay")}>Overlay</button>
         <button type="button" aria-pressed=${mode === "stacked"} @click=${() => options.onModeChange("stacked")}>Stacked</button>
       </div>
     </div>
-    <div class="tail-property-filters" role="group" aria-label="Displayed property">
+    ${histograms.length > 1 ? html`<div class="tail-property-filters" role="group" aria-label="Displayed property">
       ${histograms.map(h => html`<button type="button" aria-pressed=${h.key === histogram.key}
         @click=${() => options.onSelectProperty(h.key)} title="Show latency by ${h.key}">${h.key}</button>`)}
-    </div>
+    </div>` : nothing}
+    ${options.controls ?? nothing}
     ${renderCategoricalHistogram(histogram, options)}
   </section>`;
 }

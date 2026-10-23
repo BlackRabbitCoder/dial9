@@ -16,6 +16,7 @@ import { buildApiUrl, type PageScope, type ViewState } from "./scope.js";
 import { fetchRawTraceBytes } from "./raw.js";
 import { renderPropertyHistograms } from "./categorical-histograms.js";
 import { correlationLabel } from "./correlation-label.js";
+import { tailDifferenceLabel } from "./tail-difference-label.js";
 import { renderNumericPlot } from "./numeric-plot.js";
 import { renderPropertyCohorts } from "./property-cohorts.js";
 import { formatHumanDuration } from "../../lib/trace/api_format.js";
@@ -185,6 +186,41 @@ export class SpanTailAnalysis {
     if (this.report) void this.load();
   }
 
+  private scopeTo(key: string | null, value: string | null): void {
+    if (key === this.selection.groupKey && value === this.selection.groupValue) return;
+    this.selection.groupKey = key;
+    this.selection.groupValue = value;
+    void this.load();
+  }
+
+  private propertyScope(selectedKey?: string) {
+    const active = this.selection.groupKey != null && this.selection.groupValue != null;
+    const encoded = active ? JSON.stringify([this.selection.groupKey, this.selection.groupValue]) : "";
+    const groups = [...(this.report?.groups ?? [])].sort((a, b) =>
+      Number(b.key === selectedKey) - Number(a.key === selectedKey));
+    const activeAvailable = groups.some(group => group.key === this.selection.groupKey
+      && group.values.includes(this.selection.groupValue!));
+    if (!groups.length && !active) return nothing;
+    return html`<div class="tail-property-scope">
+      ${groups.length ? html`<label><strong>${selectedKey ?? this.selection.groupKey ?? "Properties"}</strong>
+        <select aria-label="Scope spans by property value" .value=${encoded} ?disabled=${this.busy}
+          @change=${(event: Event) => {
+            const selected = (event.currentTarget as HTMLSelectElement).value;
+            const [key, value] = selected ? JSON.parse(selected) as [string, string] : [null, null];
+            this.scopeTo(key, value);
+          }}>
+          <option value="" .selected=${!active}>All instances</option>
+          ${active && !activeAvailable ? html`<option value=${encoded} .selected=${true}>${this.selection.groupKey} = ${this.selection.groupValue}</option>` : nothing}
+          ${groups.map(group => html`<optgroup label=${group.key}>${group.values.map(value => html`
+            <option value=${JSON.stringify([group.key, value])}
+              .selected=${group.key === this.selection.groupKey && value === this.selection.groupValue}>${value}</option>
+          `)}</optgroup>`)}
+        </select></label>` : nothing}
+      ${active ? html`<span class="tail-active-scope">Scope: <strong>${this.selection.groupKey} = ${this.selection.groupValue}</strong></span>
+        <button type="button" ?disabled=${this.busy} @click=${() => this.scopeTo(null, null)}>All instances</button>` : nothing}
+    </div>`;
+  }
+
   private jump(row: TailRecord): void {
     if (!this.context) return;
     const url = buildExemplarViewerUrl({
@@ -221,9 +257,45 @@ export class SpanTailAnalysis {
         <dd>${number(group.count, 0)} recorded values · ${percent(group.coverage)} coverage</dd>`)}</dl>
       <ul>${groups.flatMap(group => [
         group.count < 20 ? html`<li>${group.name} has ${group.count} recorded values; at least 20 are required.</li>` : nothing,
-        group.coverage < .5 ? html`<li>${group.name} records this field for ${percent(group.coverage)} of spans; at least 50% coverage is required.</li>` : nothing,
+        group.coverage < .5 ? html`<li>${group.name} records this field for ${percent(group.coverage)} of spans; the coverage warning threshold is 50%.</li>` : nothing,
       ])}</ul>
-      <p>The badge appears below either threshold in either group. Missing values are excluded; they are never treated as zero. The visible difference can be unstable with few observations or selective recording.</p>`;
+      <p>The badge appears below either threshold in either group. Coverage warnings are separate from the backend's tail-difference ranking. Missing values are excluded; they are never treated as zero. Few observations or selective recording can make a difference unstable.</p>`;
+  }
+
+  private signalDetails(signal: TailSignal): TemplateResult {
+    const selected = this.selection.minMs != null || this.selection.maxMs != null;
+    const label = selected ? "Selected" : "Slow";
+    const difference = signal.tailDifference;
+    const rows = [
+      { label: "Typical", count: signal.typicalCount, coverage: signal.typicalCoverage, mean: signal.typical,
+        median: difference?.typicalMedian ?? null, p99: difference?.typicalP99 ?? null },
+      { label, count: signal.slowCount, coverage: signal.slowCoverage, mean: signal.slow,
+        median: difference?.slowMedian ?? null, p99: difference?.slowP99 ?? null },
+    ];
+    return html`<div class="tail-signal-table-wrap" role="region" tabindex="0" aria-label="Typical and ${label.toLowerCase()} field values">
+      <table class="tail-signal-table"><caption>${signal.key}${signal.unit ? ` · recorded unit ${signal.unit}` : " · unit not recorded"}</caption>
+        <thead><tr><th scope="col">Spans</th><th scope="col">Recorded</th><th scope="col">Coverage</th><th scope="col">Mean</th><th scope="col">Median</th><th scope="col">p99</th></tr></thead>
+        <tbody>${rows.map(row => html`<tr><th scope="row">${row.label}</th>
+          <td>${number(row.count, 0)}</td><td>${percent(row.coverage)}</td><td>${value(row.mean, signal.unit)}</td>
+          <td>${value(row.median, signal.unit)}</td><td>${value(row.p99, signal.unit)}</td></tr>`)}</tbody>
+      </table>
+    </div>
+    ${difference ? html`<dl class="tail-info-values">
+      <dt>Observed distribution gap</dt><dd>${percent(difference.cdfGap)}</dd>
+      <dt>Sampling margin</dt><dd>${percent(difference.samplingMargin)}</dd>
+      <dt>Conservative gap used for ranking</dt><dd>${percent(difference.lowerBound)}</dd>
+    </dl>
+    <p>The gap is the largest difference between the proportions of Typical and ${label} recorded values at or below any threshold. The backend subtracts a sampling margin; clusters can differ even when there is no steady increase across recorded values.</p>
+    <details><summary>Labels and ranking</summary>
+      <p>After the sampling margin: zero means no clear difference; above zero to 10% is small; 10% to 30% is moderate; 30% or more is strong. Both groups need at least 20 recorded values for a qualitative label.</p>
+      <p>The backend ranks by this conservative gap, with groups below 20 values following. Coverage is separate. The margin considers ${number(difference.comparisons, 0)} candidate fields with a ${percent(difference.samplingBudget)} sampling budget and assumes independent observations. This is a descriptive lead, not a p-value or proof of a cause.</p>
+    </details>` : html`<p>Tail comparison unavailable in this report. Missing medians, p99s, and distribution gaps are not inferred from the plotted sample.</p>`}
+    <details class="tail-spearman-details"><summary>Overall recorded trend: ${correlationLabel(signal.correlation)}</summary>
+      <dl class="tail-info-values"><dt>Spearman rank correlation</dt><dd>${number(signal.correlation, 4)}</dd>
+        <dt>Recorded spans compared</dt><dd>${number(signal.correlationCount, 0)}</dd></dl>
+      <p>Spearman compares the order of field values with elapsed times across up to 2,048 sampled recorded observations. +1 means both orders match; −1 means they are reversed. Near zero means no consistent increase or decrease across recorded values and can miss a difference confined to the ${selected ? "selected group" : "slow tail"}.</p>
+      <p>Labels use the magnitude: below 0.1 not correlated; 0.1–0.3 weak; 0.3–0.7 moderate; 0.7–1 high. Only exactly +1 or −1 is perfect. Neither measure establishes a cause.</p>
+    </details>`;
   }
 
   private plot(signal: TailSignal, large = false) {
@@ -240,22 +312,18 @@ export class SpanTailAnalysis {
 
   private signal(signal: TailSignal, i: number) {
     const band = this.selection.minMs != null || this.selection.maxMs != null;
-    const limited = Math.min(signal.typicalCount, signal.slowCount) < 20 || Math.min(signal.typicalCoverage, signal.slowCoverage) < 0.5;
+    const limitedCoverage = Math.min(signal.typicalCoverage, signal.slowCoverage) < 0.5;
     return html`<article class="tail-field">
-      <div class="tail-field-heading"><h4><span class="tail-rank" title="Ordered by the backend's comparison of group distributions; limited observations come last.">${i + 1}</span>${signal.key}</h4>
+      <div class="tail-field-heading"><h4><span class="tail-rank" title="Ordered by the backend's conservative Typical versus ${band ? "Selected" : "Slow"} value-distribution gap. Groups below 20 values follow; coverage is separate.">${i + 1}</span>${signal.key}</h4>
         <button class="tail-expand" aria-label="Enlarge ${signal.key} plot" title="Enlarge plot" @click=${() => this.expand(signal)}>⤢</button>
       </div>
       <div class="tail-field-means"><span><span class="tail-dot typical"></span>Typical <strong>${value(signal.typical, signal.unit)}</strong></span>
         <span><span class="tail-dot slow"></span>${band ? "Selected" : "Slow"} <strong>${value(signal.slow, signal.unit)}</strong></span></div>
       ${this.plot(signal)}
       <div class="tail-signal-stats">
-        <button class="tail-correlation" type="button" aria-label="${correlationLabel(signal.correlation)}: explain ${signal.key} correlation"
-          @click=${(event: Event) => this.explain(event, correlationLabel(signal.correlation), html`
-            <dl class="tail-info-values"><dt>Spearman rank correlation</dt><dd>${number(signal.correlation, 4)}</dd>
-              <dt>Recorded spans compared</dt><dd>${number(signal.correlationCount, 0)}</dd></dl>
-            <p>Spearman compares the order of field values with the order of elapsed times. +1 means both orders match perfectly; −1 means they are perfectly reversed. Near zero means no consistent increase or decrease; separate clusters can still exist.</p>
-            <p>The backend compares up to 2,048 recorded observations sampled across latency ranks. Labels use the magnitude: below 0.1 not correlated, 0.1–0.3 weak, 0.3–0.7 moderate, and 0.7–1 high. Only exactly +1 or −1 is called perfect. This is descriptive and does not prove a cause.</p>`)}>
-          ${correlationLabel(signal.correlation)} <span aria-hidden="true">ⓘ</span>
+        <button class="tail-difference" type="button" aria-label="${tailDifferenceLabel(signal, band)}: compare ${signal.key} values"
+          @click=${(event: Event) => this.explain(event, `${signal.key}: ${tailDifferenceLabel(signal, band)}`, this.signalDetails(signal))}>
+          ${tailDifferenceLabel(signal, band)} <span aria-hidden="true">ⓘ</span>
         </button>
       </div>
       <div class="tail-signal-meta">
@@ -266,8 +334,8 @@ export class SpanTailAnalysis {
         </button>
         ${signal.typicalCoverage < 1 || signal.slowCoverage < 1 ? html`<span title="Recorded-value coverage: typical / slow. Missing values are excluded, never treated as zero.">${percent(signal.typicalCoverage)} / ${percent(signal.slowCoverage)} coverage</span>` : nothing}
       </div>
-      ${limited ? html`<button class="tail-badge" type="button" aria-label="Explain limited observations for ${signal.key}"
-        @click=${(event: Event) => this.explain(event, "Limited observations", this.observationExplanation(signal))}>Limited observations <span aria-hidden="true">ⓘ</span></button>` : nothing}
+      ${limitedCoverage ? html`<button class="tail-badge" type="button" aria-label="Explain limited coverage for ${signal.key}"
+        @click=${(event: Event) => this.explain(event, "Limited coverage", this.observationExplanation(signal))}>Limited coverage <span aria-hidden="true">ⓘ</span></button>` : nothing}
     </article>`;
   }
 
@@ -310,6 +378,7 @@ export class SpanTailAnalysis {
       ${this.status ? html`<p class="tail-status ${this.busy ? "computing" : ""}" role="status">
         ${this.busy ? html`<span class="tail-loading-spinner" aria-hidden="true"></span>` : nothing}${this.status}
         ${this.busy ? html`<button class="secondary" @click=${() => this.cancel()}>Cancel</button>` : nothing}</p>` : nothing}
+      ${!r ? this.propertyScope() : nothing}
       ${r ? html`
         <div class="tail-results ${this.busy ? "recomputing" : ""}" ?inert=${this.busy} aria-hidden=${this.busy}>
         <div class="tail-controls">
@@ -323,11 +392,6 @@ export class SpanTailAnalysis {
             }}>
             ${band ? html`<option value="custom">Custom selection: ${ms(this.selection.minMs ?? 0)} to ${this.selection.maxMs == null ? "∞" : ms(this.selection.maxMs)}</option>` : nothing}
             <option value="95">p95+ · slowest 5%</option><option value="99">p99+ · slowest 1%</option><option value="99.9">p99.9+ · slowest 0.1%</option>
-          </select></label>
-          <label>Compare similar spans <select .value=${this.selection.groupKey ? JSON.stringify([this.selection.groupKey, this.selection.groupValue]) : ""} ?disabled=${this.busy}
-            @change=${(e: Event) => { const v = (e.target as HTMLSelectElement).value; [this.selection.groupKey, this.selection.groupValue] = v ? JSON.parse(v) as [string, string] : [null, null]; this.compare(); }}>
-            <option value="">All instances</option>
-            ${r.groups.map(g => g.values.map(v => html`<option value=${JSON.stringify([g.key, v])}>${g.key} = ${v}</option>`))}
           </select></label>
         </div>
         <div class="tail-cohorts">
@@ -343,10 +407,11 @@ export class SpanTailAnalysis {
           Partial sample · ${this.sourceUsed}/${this.sourceCount} files <span aria-hidden="true">ⓘ</span>
         </button>` : nothing}
         ${r.slowCount < 20 ? html`<button class="tail-warning tail-warning-button" type="button" @click=${(event: Event) => this.explain(event, "Few comparison spans", html`
-          <p>${number(r.slowCount, 0)} ${band ? "selected" : "slow"} spans are compared with ${number(r.typicalCount, 0)} typical spans. At least 20 recorded values in each group are needed to avoid the limited-observation badge on a field.</p>
+          <p>${number(r.slowCount, 0)} ${band ? "selected" : "slow"} spans are compared with ${number(r.typicalCount, 0)} typical spans. Each numeric field needs 20 recorded values in both groups for a tail-difference label.</p>
           <p>Widen the group or time window before relying on this difference. A small observed tail can change substantially when more spans arrive.</p>`)}>
           Only ${r.slowCount} ${band ? "selected" : "slow"} spans <span aria-hidden="true">ⓘ</span>
         </button>` : nothing}
+        ${!histogram ? this.propertyScope() : nothing}
         ${renderPropertyHistograms(histograms, {
           selectedKey: this.categoryKey,
           mode: this.categoryMode,
@@ -354,6 +419,7 @@ export class SpanTailAnalysis {
           onSelectProperty: key => { this.categoryKey = key; this.draw(); },
           onModeChange: mode => { this.categoryMode = mode; this.draw(); },
           onSelectRange: (minMs, maxMs) => this.context?.onBand(minMs, maxMs),
+          controls: this.propertyScope(histogram?.key),
         })}
         ${r.propertyScreen?.examined ? html`<details class="tail-property-screen"><summary>
           ${r.propertyScreen.shown}/${r.propertyScreen.examined} properties show differences
@@ -371,7 +437,7 @@ export class SpanTailAnalysis {
           <details class="tail-chart-help"><summary>Reading these charts</summary><div id="tail-chart-guide">
             <p>Blue marks other spans; orange marks ${band ? "the selection" : "slow spans"}. Brighter cells contain more observations. Colors split at the cutoff; counts cover whole cells. Hover or focus the plot and use arrow keys for counts. Outlined dots are trace samples; hover or focus one before opening its trace.</p>
             <p>X uses logarithmic elapsed time with a zero-inclusive first bin. Y is linear in the displayed unit. The backend shares limits across fields with the same unit and converts declared time units to milliseconds. Unknown units stay separate. Orange dashed lines mark the labelled slow cutoff or selection endpoints.</p>
-            <p>Fields are ordered by the backend's comparison of group distributions, with limited observations last. Correlation describes a separate pattern. These are associations, not causes; click a badge for its definition and recorded counts.</p>
+            <p>Fields are ordered by conservative differences between Typical and ${band ? "Selected" : "Slow"} recorded value distributions. Groups below 20 values follow; coverage is separate. Click a difference badge for means, medians, p99s, sampling margins, and the overall recorded trend. These are associations, not causes.</p>
           </div></details>
         </div>
         ${r.signals.some(signal => !signal.density) ? html`<button class="tail-badge tail-cached-plots" type="button"

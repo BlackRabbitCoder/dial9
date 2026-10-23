@@ -32,6 +32,12 @@
 .tail-controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: end; margin: 12px 0 8px; }
 .tail-controls label { display: grid; gap: 4px; font-size: 11px; color: var(--tail-muted); }
 .tail-controls select { background: #141c27; color: #e6edf5; border: 1px solid #586778; padding: 6px 8px; border-radius: 5px; max-width: 100%; font-size: 12px; }
+.tail-property-scope { display: flex; flex-wrap: wrap; align-items: end; gap: 8px 14px; margin: 10px 0; font-size: 11px; color: var(--tail-muted); }
+.tail-property-scope label { display: grid; gap: 4px; }
+.tail-property-scope select { max-width: min(350px, 100%); padding: 5px 8px; border: 1px solid #586778; border-radius: 5px; background: #141c27; color: #e6edf5; font: inherit; }
+.tail-active-scope { max-width: 100%; overflow-wrap: anywhere; align-self: center; }
+.tail-active-scope strong { color: #e6edf5; }
+.span-tail-analysis .tail-property-scope button { padding: 5px 8px; font-size: 11px; }
 .tail-cohorts { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 8px 0; font-size: 12px; color: #b5c2cf; }
 .tail-cohorts strong { color: #e6edf5; }
 .tail-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; }
@@ -71,10 +77,17 @@
 .tail-scatter circle:hover, .tail-scatter circle:focus { stroke: #fff; stroke-width: 2px; outline: none; }
 .tail-scatter:focus-visible { outline: 2px solid #8bb7e8; outline-offset: 2px; }
 .tail-plot { position: relative; }
-.tail-plot-tooltip { position: absolute; z-index: 9; display: grid; gap: 4px; width: max-content; max-width: min(290px, 95%); padding: 9px 11px; border: 1px solid #8bb7e8; border-radius: 5px; background: #0f1928f5; box-shadow: 0 5px 16px #0009; color: #e6edf5; font-size: 11px; line-height: 1.4; pointer-events: none; overflow-wrap: anywhere; }
+.tail-plot-tooltip { position: absolute; z-index: 9; display: flex; flex-direction: column; gap: 4px; box-sizing: border-box; width: max-content; max-width: min(330px, calc(100vw - 32px)); padding: 9px 11px; border: 1px solid #8bb7e8; border-radius: 5px; background: #0f1928f5; box-shadow: 0 5px 16px #0009; color: #e6edf5; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; overflow: hidden; }
 .tail-plot-tooltip[hidden] { display: none; }
 .tail-plot-tooltip b { color: #a8c8ee; }
 .tail-plot-tooltip small { color: #a4b0bd; font-size: 10px; }
+.span-tail-analysis .tail-tooltip-trace { flex-shrink: 0; padding: 3px 0; text-align: left; color: #a8c8ee; background: none; border: 0; font-size: 11px; }
+.tail-recorded-fields-heading { padding-top: 4px; border-top: 1px solid #344354; color: #b7c7d8; font-size: 10px; }
+.tail-recorded-fields { min-height: 0; max-height: min(240px, 35vh); overflow: auto; overscroll-behavior: contain; }
+.tail-recorded-fields:focus-visible { outline: 1px solid #8bb7e8; outline-offset: -1px; }
+.tail-recorded-fields dl { display: grid; grid-template-columns: minmax(65px, 1fr) minmax(90px, 1.5fr); gap: 4px 10px; margin: 3px 0; }
+.tail-recorded-fields dt { color: #9bb2c9; }
+.tail-recorded-fields dd { margin: 0; white-space: pre-wrap; color: #e6edf5; }
 .tail-density-cell:hover { stroke: #ccefff; stroke-width: .8px; }
 .tail-density-legend { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 5px 8px; color: #a4b0bd; font-size: 10px; }
 .tail-density-key { display: inline-flex; align-items: center; gap: 5px; }
@@ -83,8 +96,8 @@
 .tail-signal-stats, .tail-signal-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 3px 8px; font-size: 11px; }
 .tail-signal-stats { padding-top: 7px; border-top: 1px solid #344354; }
 .tail-signal-stats strong { color: #e5edf6; }
-.span-tail-analysis .tail-correlation { padding: 1px 0; background: transparent; border-color: transparent; color: #cce0f8; font-size: 11px; }
-.span-tail-analysis .tail-correlation:hover { text-decoration: underline; background: transparent; border-color: transparent; }
+.span-tail-analysis .tail-difference { padding: 1px 0; background: transparent; border-color: transparent; color: #cce0f8; font-size: 11px; text-align: left; }
+.span-tail-analysis .tail-difference:hover { text-decoration: underline; background: transparent; border-color: transparent; }
 .tail-signal-meta { color: #8fa4bb; font-size: 10px; margin-top: 5px; }
 .span-tail-analysis .tail-meta-button { padding: 0; font-size: 10px; background: transparent; border-color: transparent; color: #8fa4bb; }
 .tail-badge { display: inline-block; margin-top: 7px; color: #d9c09e; font-size: 10px; border: 1px solid #695b47; padding: 1px 6px; border-radius: 9px; }
@@ -136,6 +149,14 @@
 .tail-info-values { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 6px 14px; }
 .tail-info-values dt { color: #a4b0bd; }
 .tail-info-values dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.tail-signal-table-wrap { max-width: 100%; overflow: auto; margin-bottom: 12px; }
+.tail-signal-table-wrap:focus-visible { outline: 2px solid #8bb7e8; outline-offset: 2px; }
+.tail-signal-table { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
+.tail-signal-table caption { text-align: left; margin-bottom: 6px; color: #b7c7d8; }
+.tail-signal-table th, .tail-signal-table td { padding: 6px 7px; border-bottom: 1px solid #344354; text-align: right; white-space: nowrap; }
+.tail-signal-table th:first-child { text-align: left; }
+.tail-signal-table thead th { color: #9bb2c9; font-weight: 500; }
+.tail-spearman-details { margin-top: 12px; }
 @media (max-width: 1050px) {
   .tail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
