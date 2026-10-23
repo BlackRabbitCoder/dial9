@@ -401,6 +401,7 @@ function startStreaming(mode: StreamMode): void {
   updateStreamingUi();
   els.error.style.display = "none";
   if (mode === "replace") {
+    catalogExpanded = false;
     spanTypes = [];
     lastCoverage = null;
     exemplarScopeByUid.clear();

@@ -57,6 +57,8 @@ export class SpanTailAnalysis {
   private report: TailReport | null = null;
   private status = "";
   private busy = false;
+  // A failed or cancelled context stays stopped until an explicit retry.
+  private started = false;
   private more = false;
   private categoryKey = "";
   private categoryMode: "overlay" | "stacked" = "overlay";
@@ -70,7 +72,7 @@ export class SpanTailAnalysis {
   mount(container: HTMLElement | null, context: Context | null): void {
     const key = context ? JSON.stringify([
       context.spanType.span_type_uid, context.scope,
-      context.view.startNs, context.view.endNs, context.view.attrFilters,
+      context.view.startNs, context.view.endNs, context.view.attrFilters, context.view.maxFiles,
     ]) : "";
     if (key !== this.key) {
       this.request?.abort();
@@ -80,6 +82,7 @@ export class SpanTailAnalysis {
       this.report = null;
       this.status = "";
       this.busy = false;
+      this.started = false;
       this.more = false;
       this.categoryKey = "";
       this.categoryMode = "overlay";
@@ -92,12 +95,20 @@ export class SpanTailAnalysis {
     this.context = context;
     const minMs = context?.view.bandMinNs == null ? null : context.view.bandMinNs / 1e6;
     const maxMs = context?.view.bandMaxNs == null ? null : context.view.bandMaxNs / 1e6;
-    if (minMs !== this.selection.minMs || maxMs !== this.selection.maxMs) {
+    const bandChanged = minMs !== this.selection.minMs || maxMs !== this.selection.maxMs;
+    if (bandChanged) {
       this.selection.minMs = minMs;
       this.selection.maxMs = maxMs;
-      if (this.report) this.compare();
     }
-    this.draw();
+    if (container && context && (!this.started || (bandChanged && (this.report != null || this.busy)))) {
+      if (!this.started) {
+        const panel = container.closest<HTMLElement>(".detail-panel");
+        if (panel) panel.scrollTop = 0;
+      }
+      void this.load();
+    } else {
+      this.draw();
+    }
   }
 
   private cancel(): void {
@@ -112,12 +123,12 @@ export class SpanTailAnalysis {
 
   private async load(): Promise<void> {
     const context = this.context;
-    if (!context) return;
+    if (!context || !this.container) return;
+    this.started = true;
     const generation = ++this.generation;
     this.request?.abort();
     const request = new AbortController();
     this.request = request;
-    const firstReport = this.report == null;
     this.expandedKey = null;
     this.info = null;
     this.busy = true;
@@ -160,7 +171,6 @@ export class SpanTailAnalysis {
       this.busy = false;
       this.status = "";
       this.draw();
-      if (firstReport) this.container?.scrollIntoView({ block: "start" });
     } catch (error) {
       if (generation !== this.generation) return;
       // A failed request cannot leave a previous comparison under new labels.
@@ -291,7 +301,7 @@ export class SpanTailAnalysis {
     const histograms = r?.histograms ?? [];
     const histogram = histograms.find(h => h.key === this.categoryKey) ?? histograms[0];
     const group = r?.groups.find(g => g.key === histogram?.key);
-    this.container.closest(".detail-panel")?.classList.toggle("tail-analysis-ready", r != null);
+    this.container.closest(".detail-panel")?.classList.toggle("tail-analysis-ready", r != null || this.busy);
     render(html`<section class="span-tail-analysis" aria-busy=${this.busy}>
       <div class="tail-heading"><h3>How are slow spans different?</h3>
         ${!r && !this.busy ? html`<button @click=${() => void this.load()}>Analyse source traces</button>` : r ? html`<span class="tail-source-count">${number(r.count, 0)} spans · ${this.sourceUsed}/${this.sourceCount} files</span>` : nothing}
