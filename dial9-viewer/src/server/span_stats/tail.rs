@@ -18,8 +18,19 @@ use crate::server::{AppState, credentials::MaybeCreds};
 const MAX_FILES: usize = 24;
 const MAX_RECORDS: usize = 1_000_000;
 const MAX_FIELDS: usize = 32;
+// Discovery needs room for elapsed aliases and constants before the visible
+// field limit is applied. Both discovery and output remain bounded.
+const MAX_NUMERIC_CANDIDATES: usize = MAX_FIELDS * 4;
 const MAX_GROUP_VALUES: usize = 12;
 const HISTOGRAM_LOG_BINS: usize = 36;
+const DENSITY_VALUE_BINS: usize = 32;
+const ALIAS_MIN_COHORT_OBSERVATIONS: usize = 20;
+const PROPERTY_MIN_SAMPLES: usize = 100;
+const PROPERTY_MIN_TAIL_SAMPLES: usize = 2_000;
+const PROPERTY_MIN_COVERAGE: f64 = 0.5;
+const PROPERTY_MIN_CDF_GAP: f64 = 0.2;
+const PROPERTY_MIN_TAIL_RATIO: f64 = 1.5;
+const PROPERTY_SAMPLING_BUDGET: f64 = 0.01;
 // Keep permits in blocking workers as well: dropping a timed-out HTTP future
 // must not release capacity while its CPU work is still running.
 static ANALYSIS_LIMIT: Semaphore = Semaphore::const_new(2);
@@ -125,6 +136,29 @@ struct Signal {
     files_compared: usize,
     files_agree: usize,
     points: Vec<(f64, f64, Example)>,
+    value_axis: ValueAxis,
+    // Populated after the final visible field set establishes shared axes.
+    density: Option<Density>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValueAxis {
+    unit: Option<String>,
+    multiplier: f64,
+    minimum: f64,
+    maximum: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Density {
+    elapsed_edges_ms: Vec<f64>,
+    value_edges: Vec<f64>,
+    // Row-major: counts[value_bin * elapsed_bin_count + elapsed_bin].
+    counts: Vec<usize>,
+    count: usize,
+    max_count: usize,
 }
 
 #[derive(Serialize)]
@@ -149,8 +183,37 @@ struct CategoryLatency {
     value: String,
     count: usize,
     shares: Vec<f64>,
+    bin_counts: Vec<usize>,
     median_ms: f64,
     p99_ms: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PropertyValueComparison {
+    value: String,
+    count: usize,
+    p99_ms: f64,
+    p99_window: Option<QuantileWindow>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuantileWindow {
+    lower_ms: f64,
+    upper_ms: f64,
+    lower_rank: usize,
+    upper_rank: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PropertyRelevance {
+    reason: &'static str,
+    values: [PropertyValueComparison; 2],
+    cdf_gap: f64,
+    cdf_margin: f64,
+    tail_ratio_lower_bound: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -162,6 +225,25 @@ struct CategoricalHistogram {
     bin_edges_ms: Vec<f64>,
     max_share: f64,
     values: Vec<CategoryLatency>,
+    relevance: Option<PropertyRelevance>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PropertyScreen {
+    examined: usize,
+    shown: usize,
+    limited_coverage: usize,
+    limited_observations: usize,
+    similar_distributions: usize,
+    pairs_compared: usize,
+    minimum_samples: usize,
+    minimum_tail_samples: usize,
+    minimum_coverage: f64,
+    minimum_cdf_gap: f64,
+    minimum_tail_ratio: f64,
+    sampling_budget: f64,
+    interpretation: &'static str,
 }
 
 #[derive(Serialize)]
@@ -202,6 +284,8 @@ struct Report {
     signals: Vec<Signal>,
     groups: Vec<Group>,
     histograms: Vec<CategoricalHistogram>,
+    property_screen: PropertyScreen,
+    numeric_fields_omitted: usize,
     mix_changes: Vec<MixChange>,
     examples: Vec<Example>,
 }
@@ -277,7 +361,7 @@ impl Collector {
                 continue;
             }
             if let Some(n) = numeric(&value) {
-                if !self.fields.contains_key(&key) && self.fields.len() >= MAX_FIELDS {
+                if !self.fields.contains_key(&key) && self.fields.len() >= MAX_NUMERIC_CANDIDATES {
                     self.fields_truncated = true;
                     continue;
                 }
@@ -359,6 +443,13 @@ impl Collector {
                 .elapsed_ms
         };
         let median_ms = quantile(0.5);
+        // Approximate aliases must also agree in the source/group's fixed p99
+        // tail, independent of the selected percentile or brushed band.
+        let p99_ms = quantile(0.99);
+        let tail_total = rows
+            .iter()
+            .filter(|row| row.example.elapsed_ms >= p99_ms)
+            .count();
         let boundary_ms = selection.min_ms.unwrap_or_else(|| {
             if selection.max_ms.is_some() {
                 0.0
@@ -379,16 +470,72 @@ impl Collector {
                     && selection.max_ms.is_none_or(|n| r.example.elapsed_ms <= n)
             })
             .collect();
-        let mut signals = Vec::new();
+        let mut fields = Vec::new();
         for (key, unit) in &self.fields {
             let Ok(unit) = unit else { continue };
+            let multiplier = time_multiplier(unit.as_deref()).unwrap_or(1.0);
+            let mut count = 0;
+            let mut matches = 0;
+            let mut tail_count = 0;
+            let mut tail_matches = 0;
+            let mut selected_count = 0;
+            let mut selected_matches = 0;
+            let mut minimum = f64::INFINITY;
+            let mut maximum = f64::NEG_INFINITY;
+            for row in &rows {
+                if let Some(value) = row.numeric.get(key) {
+                    count += 1;
+                    let value = value * multiplier;
+                    minimum = minimum.min(value);
+                    maximum = maximum.max(value);
+                    let matches_elapsed = (value - row.example.elapsed_ms).abs()
+                        <= 1e-6_f64.max(row.example.elapsed_ms * 0.002);
+                    matches += usize::from(matches_elapsed);
+                    if row.example.elapsed_ms >= p99_ms {
+                        tail_count += 1;
+                        tail_matches += usize::from(matches_elapsed);
+                    }
+                    if row.example.elapsed_ms >= boundary_ms
+                        && selection.max_ms.is_none_or(|n| row.example.elapsed_ms <= n)
+                    {
+                        selected_count += 1;
+                        selected_matches += usize::from(matches_elapsed);
+                    }
+                }
+            }
+            // A true alias can have missing values. Permit ordinary jitter
+            // only when p99 and selected cohorts entirely agree, each with
+            // 20 recorded values or complete coverage of its nonempty cohort.
+            // Rare divergences in either cohort remain visible.
+            let verified = |recorded: usize, total: usize| {
+                recorded > 0 && (recorded >= ALIAS_MIN_COHORT_OBSERVATIONS || recorded == total)
+            };
+            let repeats_elapsed = matches == count
+                || (fraction(matches, count) > 0.98
+                    && verified(tail_count, tail_total)
+                    && tail_matches == tail_count
+                    && verified(selected_count, slow.len())
+                    && selected_matches == selected_count);
+            if count == 0
+                || minimum == maximum
+                || (time_multiplier(unit.as_deref()).is_some() && repeats_elapsed)
+            {
+                continue;
+            }
+            let displayed_unit = if time_multiplier(unit.as_deref()).is_some() {
+                Some("ms".to_string())
+            } else {
+                unit.clone()
+            };
+            fields.push((key, unit, multiplier, displayed_unit, minimum, maximum));
+        }
+        let elapsed_edges_ms = elapsed_bin_edges(&rows);
+        let mut signals = Vec::new();
+        for (key, unit, multiplier, displayed_unit, minimum, maximum) in fields {
             let all: Vec<_> = rows
                 .iter()
                 .filter_map(|r| r.numeric.get(key).map(|n| (*r, *n)))
                 .collect();
-            if all.is_empty() || all.iter().all(|(_, n)| *n == all[0].1) {
-                continue;
-            }
             let a: Vec<_> = typical
                 .iter()
                 .filter_map(|r| r.numeric.get(key).copied())
@@ -398,23 +545,6 @@ impl Collector {
                 .filter_map(|r| r.numeric.get(key).copied())
                 .collect();
             let difference = separation(&a, &b);
-            let scale = match unit.as_deref() {
-                Some("ns") => Some(1e-6),
-                Some("us" | "µs") => Some(1e-3),
-                Some("ms") => Some(1.0),
-                Some("s") => Some(1000.0),
-                _ => None,
-            };
-            let duplicates_latency = scale.is_some_and(|scale| {
-                all.iter()
-                    .filter(|(r, n)| {
-                        (n * scale - r.example.elapsed_ms).abs()
-                            <= 0.001_f64.max(r.example.elapsed_ms * 0.002)
-                    })
-                    .count() as f64
-                    / all.len() as f64
-                    > 0.98
-            });
             let mut files: BTreeMap<usize, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
             for row in &typical {
                 if let Some(n) = row.numeric.get(key) {
@@ -459,6 +589,12 @@ impl Collector {
                         .then(|| (r.example.elapsed_ms, *n, r.example.clone()))
                 })
                 .collect();
+            let value_axis = ValueAxis {
+                unit: displayed_unit,
+                multiplier,
+                minimum: minimum.min(0.0),
+                maximum: maximum.max(0.0),
+            };
             signals.push(Signal {
                 key: key.clone(),
                 unit: unit.clone(),
@@ -471,7 +607,9 @@ impl Collector {
                 separation: difference,
                 correlation: spearman(&sampled),
                 correlation_count: sampled.len(),
-                duplicates_latency,
+                // Retained as an additive wire-compatibility field. Aliases
+                // are removed before constructing any visible signal.
+                duplicates_latency: false,
                 files_compared: differences.len(),
                 files_agree: differences
                     .iter()
@@ -482,12 +620,12 @@ impl Collector {
                     })
                     .count(),
                 points,
+                value_axis,
+                density: None,
             });
         }
         let quality = |s: &Signal| {
-            if s.duplicates_latency {
-                -1
-            } else if s.typical_count.min(s.slow_count) < 20
+            if s.typical_count.min(s.slow_count) < 20
                 || s.typical_coverage.min(s.slow_coverage) < 0.5
             {
                 0
@@ -506,6 +644,35 @@ impl Collector {
                 })
                 .then_with(|| a.key.cmp(&b.key))
         });
+        let numeric_fields_omitted = signals.len().saturating_sub(MAX_FIELDS);
+        signals.truncate(MAX_FIELDS);
+        let mut axes: BTreeMap<(Option<String>, String), (f64, f64)> = BTreeMap::new();
+        let axis_key = |signal: &Signal| {
+            // Unknown producer units cannot be assumed compatible.
+            (
+                signal.value_axis.unit.clone(),
+                if signal.value_axis.unit.is_none() {
+                    signal.key.clone()
+                } else {
+                    String::new()
+                },
+            )
+        };
+        for signal in &signals {
+            let limits = axes.entry(axis_key(signal)).or_insert((0.0, 0.0));
+            limits.0 = limits.0.min(signal.value_axis.minimum);
+            limits.1 = limits.1.max(signal.value_axis.maximum);
+        }
+        for signal in &mut signals {
+            let (minimum, maximum) = axes[&axis_key(signal)];
+            signal.value_axis.minimum = minimum;
+            signal.value_axis.maximum = maximum;
+            let all: Vec<_> = rows
+                .iter()
+                .filter_map(|row| row.numeric.get(&signal.key).map(|n| (*row, *n)))
+                .collect();
+            signal.density = Some(numeric_density(&all, &elapsed_edges_ms, &signal.value_axis));
+        }
         let prevalence = |cohort: &[&Observation], key: &str, values: &BTreeSet<String>| {
             values
                 .iter()
@@ -562,7 +729,7 @@ impl Collector {
                 .filter(|r| r.example.inside_ms.is_some())
                 .count()
         };
-        let histograms = categorical_histograms(&rows, &self.groups);
+        let (histograms, property_screen) = meaningful_histograms(&rows, &self.groups);
         Ok(Report {
             count: rows.len(),
             typical_count: typical.len(),
@@ -589,6 +756,8 @@ impl Collector {
             signals,
             groups,
             histograms,
+            property_screen,
+            numeric_fields_omitted,
             mix_changes,
             examples: slow
                 .iter()
@@ -601,12 +770,18 @@ impl Collector {
     }
 }
 
-/// Shared logarithmic bins and per-value normalization preserve distribution
-/// shape when category frequencies differ. The first bin includes zero.
-fn categorical_histograms(
-    rows: &[&Observation],
-    groups: &BTreeMap<String, Option<BTreeSet<String>>>,
-) -> Vec<CategoricalHistogram> {
+fn time_multiplier(unit: Option<&str>) -> Option<f64> {
+    match unit {
+        Some("ns") => Some(1e-6),
+        Some("us" | "µs" | "μs") => Some(1e-3),
+        Some("ms") => Some(1.0),
+        Some("s") => Some(1000.0),
+        _ => None,
+    }
+}
+
+/// Shared logarithmic elapsed bins include zero and the maximum observation.
+fn elapsed_bin_edges(rows: &[&Observation]) -> Vec<f64> {
     let positive_min = rows
         .iter()
         .map(|r| r.example.elapsed_ms)
@@ -623,6 +798,51 @@ fn categorical_histograms(
         (0..=HISTOGRAM_LOG_BINS)
             .map(|i| low * (high / low).powf(i as f64 / HISTOGRAM_LOG_BINS as f64)),
     );
+    edges
+}
+
+fn bin_index(edges: &[f64], value: f64) -> usize {
+    edges
+        .partition_point(|edge| *edge <= value)
+        .saturating_sub(1)
+        .min(edges.len() - 2)
+}
+
+fn numeric_density(
+    observations: &[(&Observation, f64)],
+    elapsed_edges_ms: &[f64],
+    axis: &ValueAxis,
+) -> Density {
+    let mut value_edges: Vec<_> = (0..=DENSITY_VALUE_BINS)
+        .map(|i| {
+            axis.minimum + (axis.maximum - axis.minimum) * (i as f64 / DENSITY_VALUE_BINS as f64)
+        })
+        .collect();
+    // Very small values may have fewer than 32 representable intervals.
+    value_edges.dedup();
+    let elapsed_bins = elapsed_edges_ms.len() - 1;
+    let mut counts = vec![0; elapsed_bins * (value_edges.len() - 1)];
+    for (row, value) in observations {
+        let x = bin_index(elapsed_edges_ms, row.example.elapsed_ms);
+        let y = bin_index(&value_edges, value * axis.multiplier);
+        counts[y * elapsed_bins + x] += 1;
+    }
+    let max_count = counts.iter().copied().max().unwrap_or(0);
+    Density {
+        elapsed_edges_ms: elapsed_edges_ms.to_vec(),
+        value_edges,
+        counts,
+        count: observations.len(),
+        max_count,
+    }
+}
+
+/// Per-value normalization preserves shape when category frequencies differ.
+fn categorical_histograms(
+    rows: &[&Observation],
+    groups: &BTreeMap<String, Option<BTreeSet<String>>>,
+) -> Vec<CategoricalHistogram> {
+    let edges = elapsed_bin_edges(rows);
     let bins = edges.len() - 1;
     groups
         .iter()
@@ -647,15 +867,11 @@ fn categorical_histograms(
                 // rows are already sorted by elapsed time for exact quantiles.
                 let mut counts = vec![0; bins];
                 for latency in &latencies {
-                    let bin = edges
-                        .partition_point(|edge| edge <= latency)
-                        .saturating_sub(1)
-                        .min(bins - 1);
-                    counts[bin] += 1;
+                    counts[bin_index(&edges, *latency)] += 1;
                 }
                 let shares: Vec<_> = counts
-                    .into_iter()
-                    .map(|n| fraction(n, latencies.len()))
+                    .iter()
+                    .map(|n| fraction(*n, latencies.len()))
                     .collect();
                 max_share = shares.iter().copied().fold(max_share, f64::max);
                 let quantile = |p: f64| {
@@ -668,6 +884,7 @@ fn categorical_histograms(
                     median_ms: quantile(0.5),
                     p99_ms: quantile(0.99),
                     shares,
+                    bin_counts: counts,
                 });
             }
             // A field constant within a selected group offers no comparison.
@@ -678,9 +895,187 @@ fn categorical_histograms(
                 bin_edges_ms: edges.clone(),
                 max_share,
                 values,
+                relevance: None,
             })
         })
         .collect()
+}
+
+/// This is a descriptive screen, not a test of causation or significance.
+/// Its sampling margins assume independent observations; shared load and
+/// temporal dependence can still explain an association.
+fn meaningful_histograms(
+    rows: &[&Observation],
+    groups: &BTreeMap<String, Option<BTreeSet<String>>>,
+) -> (Vec<CategoricalHistogram>, PropertyScreen) {
+    let candidates = categorical_histograms(rows, groups);
+    let pairs_compared: usize = candidates
+        .iter()
+        .filter(|h| fraction(h.count, rows.len()) >= PROPERTY_MIN_COVERAGE)
+        .map(|h| {
+            let values = h
+                .values
+                .iter()
+                .filter(|v| v.count >= PROPERTY_MIN_SAMPLES)
+                .count();
+            values * values.saturating_sub(1) / 2
+        })
+        .sum();
+    let mut screen = PropertyScreen {
+        examined: candidates.len(),
+        shown: 0,
+        limited_coverage: 0,
+        limited_observations: 0,
+        similar_distributions: 0,
+        pairs_compared,
+        minimum_samples: PROPERTY_MIN_SAMPLES,
+        minimum_tail_samples: PROPERTY_MIN_TAIL_SAMPLES,
+        minimum_coverage: PROPERTY_MIN_COVERAGE,
+        minimum_cdf_gap: PROPERTY_MIN_CDF_GAP,
+        minimum_tail_ratio: PROPERTY_MIN_TAIL_RATIO,
+        sampling_budget: PROPERTY_SAMPLING_BUDGET,
+        interpretation: "Descriptive distribution or p99 screen. Sampling windows assume independent observations; shared load, temporal dependence, missing values, and other properties can explain an association. No causal or significance claim.",
+    };
+    let log_budget = (2.0 * pairs_compared.max(1) as f64 / PROPERTY_SAMPLING_BUDGET).ln();
+    let mut histograms = Vec::new();
+    for mut histogram in candidates {
+        if fraction(histogram.count, rows.len()) < PROPERTY_MIN_COVERAGE {
+            screen.limited_coverage += 1;
+            continue;
+        }
+        let adequate: Vec<_> = histogram
+            .values
+            .iter()
+            .filter(|v| v.count >= PROPERTY_MIN_SAMPLES)
+            .collect();
+        if adequate.len() < 2 {
+            screen.limited_observations += 1;
+            continue;
+        }
+        // The collector's elapsed order is retained in every value's samples.
+        let mut samples: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+        for row in rows {
+            if let Some(value) = row.groups.get(&histogram.key) {
+                samples
+                    .entry(value)
+                    .or_default()
+                    .push(row.example.elapsed_ms);
+            }
+        }
+        let mut relevance = None;
+        for (index, a) in adequate.iter().enumerate() {
+            for b in &adequate[index + 1..] {
+                let a_samples = &samples[a.value.as_str()];
+                let b_samples = &samples[b.value.as_str()];
+                let cdf_gap = cdf_distance(a_samples, b_samples);
+                let cdf_margin = (log_budget / (2.0 * a.count as f64)).sqrt()
+                    + (log_budget / (2.0 * b.count as f64)).sqrt();
+                let a_window = (a.count >= PROPERTY_MIN_TAIL_SAMPLES)
+                    .then(|| quantile_window(a_samples, 0.99, log_budget));
+                let b_window = (b.count >= PROPERTY_MIN_TAIL_SAMPLES)
+                    .then(|| quantile_window(b_samples, 0.99, log_budget));
+                let tail_ratio = a_window.as_ref().zip(b_window.as_ref()).and_then(|(a, b)| {
+                    let (lower, higher) = if a.lower_ms < b.lower_ms {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    };
+                    (higher.lower_ms - lower.upper_ms >= 1e-6
+                        && higher.lower_ms >= lower.upper_ms * PROPERTY_MIN_TAIL_RATIO)
+                        .then(|| {
+                            if lower.upper_ms > 0.0 {
+                                higher.lower_ms / lower.upper_ms
+                            } else {
+                                // A zero baseline has no finite ratio.
+                                f64::INFINITY
+                            }
+                        })
+                });
+                let reason = if tail_ratio.is_some() {
+                    Some("tail")
+                } else if cdf_gap >= PROPERTY_MIN_CDF_GAP + cdf_margin {
+                    Some("distribution")
+                } else {
+                    None
+                };
+                let Some(reason) = reason else { continue };
+                let candidate = PropertyRelevance {
+                    reason,
+                    values: [
+                        PropertyValueComparison {
+                            value: a.value.clone(),
+                            count: a.count,
+                            p99_ms: a.p99_ms,
+                            p99_window: a_window,
+                        },
+                        PropertyValueComparison {
+                            value: b.value.clone(),
+                            count: b.count,
+                            p99_ms: b.p99_ms,
+                            p99_window: b_window,
+                        },
+                    ],
+                    cdf_gap,
+                    cdf_margin,
+                    tail_ratio_lower_bound: tail_ratio.filter(|n| n.is_finite()),
+                };
+                let preferable = relevance.as_ref().is_none_or(|old: &PropertyRelevance| {
+                    (candidate.reason == "tail" && old.reason != "tail")
+                        || (candidate.reason == old.reason && candidate.cdf_gap > old.cdf_gap)
+                });
+                if preferable {
+                    relevance = Some(candidate);
+                }
+            }
+        }
+        if relevance.is_some() {
+            histogram.relevance = relevance;
+            histograms.push(histogram);
+        } else {
+            screen.similar_distributions += 1;
+        }
+    }
+    screen.shown = histograms.len();
+    (histograms, screen)
+}
+
+/// Maximum gap between exact empirical CDFs; equal values are advanced together.
+fn cdf_distance(a: &[f64], b: &[f64]) -> f64 {
+    let (mut ai, mut bi) = (0, 0);
+    let mut distance = 0.0_f64;
+    while ai < a.len() || bi < b.len() {
+        let value = match (a.get(ai), b.get(bi)) {
+            (Some(a), Some(b)) => a.min(*b),
+            (Some(a), None) => *a,
+            (None, Some(b)) => *b,
+            (None, None) => break,
+        };
+        while a.get(ai).is_some_and(|n| *n <= value) {
+            ai += 1;
+        }
+        while b.get(bi).is_some_and(|n| *n <= value) {
+            bi += 1;
+        }
+        distance = distance.max((fraction(ai, a.len()) - fraction(bi, b.len())).abs());
+    }
+    distance
+}
+
+/// Conservative order-statistic rank window, using a bounded-Bernoulli
+/// concentration margin. Ranks are one-based and refer to observed values.
+fn quantile_window(samples: &[f64], quantile: f64, log_budget: f64) -> QuantileWindow {
+    let count = samples.len() as f64;
+    let center = count * quantile;
+    let radius =
+        (2.0 * count * quantile * (1.0 - quantile) * log_budget).sqrt() + (2.0 / 3.0) * log_budget;
+    let lower_rank = ((center - radius).floor() as usize).clamp(1, samples.len());
+    let upper_rank = ((center + radius).ceil() as usize).clamp(1, samples.len());
+    QuantileWindow {
+        lower_ms: samples[lower_rank - 1],
+        upper_ms: samples[upper_rank - 1],
+        lower_rank,
+        upper_rank,
+    }
 }
 
 /// Same equal-per-instance shares as the catalog's five-way composition.
@@ -918,12 +1313,15 @@ pub(crate) async fn get_tail(
     }
     let response = tokio::task::spawn_blocking(move || {
         let (collector, selection, _permit) = work;
-        collector.report(&selection).map(|report| TailResponse {
-            report,
-            files_used,
-            files_matched,
-            truncated: collector.truncated,
-            fields_truncated: collector.fields_truncated,
+        collector.report(&selection).map(|report| {
+            let fields_truncated = collector.fields_truncated || report.numeric_fields_omitted > 0;
+            TailResponse {
+                report,
+                files_used,
+                files_matched,
+                truncated: collector.truncated,
+                fields_truncated,
+            }
         })
     })
     .await
@@ -1004,12 +1402,13 @@ pub(crate) async fn post_tail(
             collector.push(row, &selection, 0, "");
         }
         let report = collector.report(&selection).map_err(anyhow::Error::msg)?;
+        let fields_truncated = collector.fields_truncated || report.numeric_fields_omitted > 0;
         Ok::<_, anyhow::Error>(TailResponse {
             report,
             files_used: 1,
             files_matched: 1,
             truncated: collector.truncated,
-            fields_truncated: collector.fields_truncated,
+            fields_truncated,
         })
     })
     .await
@@ -1134,10 +1533,10 @@ mod tests {
         assert_eq!(report.slow_elapsed_ms, Some(995.0));
         assert_eq!(report.typical_attributed, 250);
         assert_eq!(report.slow_attributed, 6);
-        assert_eq!(report.signals.len(), 2);
+        assert_eq!(report.signals.len(), 1);
         assert_eq!(report.signals[0].key, "Work");
         assert_eq!(report.signals[0].correlation, Some(1.0));
-        assert!(report.signals[1].duplicates_latency);
+        assert!(report.signals.iter().all(|s| !s.duplicates_latency));
         assert!(report.signals.iter().all(|s| s.points.len() <= 330));
         assert_eq!(report.examples.len(), 8);
         let group = params("group_key=Mode&group_value=bulk")
@@ -1165,6 +1564,24 @@ mod tests {
         row
     }
 
+    fn unfiltered_histograms(
+        collector: &Collector,
+        selection: &Selection,
+    ) -> Vec<CategoricalHistogram> {
+        let mut rows: Vec<_> = collector
+            .rows
+            .iter()
+            .filter(|r| {
+                selection
+                    .group
+                    .as_ref()
+                    .is_none_or(|(key, value)| r.groups.get(key) == Some(value))
+            })
+            .collect();
+        rows.sort_by(|a, b| a.example.elapsed_ms.total_cmp(&b.example.elapsed_ms));
+        categorical_histograms(&rows, &collector.groups)
+    }
+
     #[test]
     fn categorical_histograms_normalize_unequal_groups_and_include_the_last_edge() {
         let selection = params("").selection().unwrap();
@@ -1176,14 +1593,15 @@ mod tests {
                 }
             }
         }
-        let report = collector.report(&selection).unwrap();
-        let histogram = &report.histograms[0];
+        let histograms = unfiltered_histograms(&collector, &selection);
+        let histogram = &histograms[0];
         assert_eq!(histogram.count, 303);
         assert_eq!(histogram.missing_count, 0);
         assert_eq!(histogram.values[0].count, 300);
         assert_eq!(histogram.values[1].count, 3);
         assert_eq!(histogram.values[0].shares, histogram.values[1].shares);
         for value in &histogram.values {
+            assert_eq!(value.bin_counts.iter().sum::<usize>(), value.count);
             assert!((value.shares.iter().sum::<f64>() - 1.0).abs() < 1e-12);
             assert_eq!(value.median_ms, 10.0);
             assert_eq!(value.p99_ms, 100.0);
@@ -1203,8 +1621,8 @@ mod tests {
         ] {
             collector.push(tagged_row(n, value), &selection, 0, "");
         }
-        let report = collector.report(&selection).unwrap();
-        let histogram = &report.histograms[0];
+        let histograms = unfiltered_histograms(&collector, &selection);
+        let histogram = &histograms[0];
         assert_eq!((histogram.count, histogram.missing_count), (3, 1));
         assert_eq!(histogram.bin_edges_ms[0], 0.0);
         assert_eq!(histogram.values[0].shares[0], 0.5);
@@ -1235,8 +1653,8 @@ mod tests {
             row.elapsed_ns = elapsed_ns;
             collector.push(row, &selection, 0, "");
         }
-        let report = collector.report(&selection).unwrap();
-        let histogram = &report.histograms[0];
+        let histograms = unfiltered_histograms(&collector, &selection);
+        let histogram = &histograms[0];
         assert!(
             histogram
                 .bin_edges_ms
@@ -1264,17 +1682,574 @@ mod tests {
             ]);
             collector.push(row, &selection, 0, "");
         }
-        let all = collector.report(&selection).unwrap();
-        assert_eq!(all.histograms.len(), 2);
+        let all = unfiltered_histograms(&collector, &selection);
+        assert_eq!(all.len(), 2);
         let selected = params("group_key=Region&group_value=east")
             .selection()
             .unwrap();
-        let grouped = collector.report(&selected).unwrap();
-        assert_eq!(grouped.histograms.len(), 1);
-        assert_eq!(grouped.histograms[0].key, "Mode");
-        assert_eq!(grouped.histograms[0].count, 13);
-        assert_eq!(grouped.histograms[0].values[0].count, 7);
-        assert_eq!(grouped.histograms[0].values[1].count, 6);
+        let grouped = unfiltered_histograms(&collector, &selected);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].key, "Mode");
+        assert_eq!(grouped[0].count, 13);
+        assert_eq!(grouped[0].values[0].count, 7);
+        assert_eq!(grouped[0].values[1].count, 6);
+    }
+
+    #[test]
+    fn density_counts_all_observations_instead_of_the_latency_rank_sample() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 0..10_000 {
+            let mut row = row(if n < 9_000 { 1 } else { 100 });
+            row.attributes = vec![("Work".into(), if n < 9_000 { "2" } else { "10" }.into())];
+            // Some observations have no navigable exemplar, but still count.
+            if n % 2 == 0 {
+                row.exemplar = None;
+            }
+            collector.push(row, &selection, 0, "/source");
+        }
+        let report = collector.report(&selection).unwrap();
+        let signal = &report.signals[0];
+        assert!(signal.points.len() <= 330);
+        assert_eq!(signal.density.as_ref().unwrap().count, 10_000);
+        assert_eq!(
+            signal
+                .density
+                .as_ref()
+                .unwrap()
+                .counts
+                .iter()
+                .sum::<usize>(),
+            10_000
+        );
+        assert_eq!(signal.density.as_ref().unwrap().max_count, 9_000);
+        assert_eq!(signal.density.as_ref().unwrap().elapsed_edges_ms[0], 0.0);
+        assert_eq!(
+            signal.density.as_ref().unwrap().counts.len(),
+            (signal.density.as_ref().unwrap().elapsed_edges_ms.len() - 1)
+                * (signal.density.as_ref().unwrap().value_edges.len() - 1)
+        );
+        let x = bin_index(&signal.density.as_ref().unwrap().elapsed_edges_ms, 1.0);
+        let y = bin_index(&signal.density.as_ref().unwrap().value_edges, 2.0);
+        assert_eq!(
+            signal.density.as_ref().unwrap().counts
+                [y * (signal.density.as_ref().unwrap().elapsed_edges_ms.len() - 1) + x],
+            9_000
+        );
+    }
+
+    #[test]
+    fn density_respects_group_scope_and_missing_numeric_values() {
+        let selection = params("group_key=Mode&group_value=a").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 1..=300 {
+            let mut row = row(n);
+            row.attributes = vec![("Mode".into(), if n <= 100 { "a" } else { "b" }.into())];
+            if n % 2 == 0 {
+                row.attributes.push(("Work".into(), (n / 2).to_string()));
+            }
+            collector.push(row, &selection, 0, "");
+        }
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(report.count, 100);
+        assert_eq!(report.signals[0].density.as_ref().unwrap().count, 50);
+        assert_eq!(
+            report.signals[0]
+                .density
+                .as_ref()
+                .unwrap()
+                .counts
+                .iter()
+                .sum::<usize>(),
+            50
+        );
+        assert!(
+            report.signals[0]
+                .density
+                .as_ref()
+                .unwrap()
+                .elapsed_edges_ms
+                .last()
+                .unwrap()
+                >= &100.0
+        );
+    }
+
+    #[test]
+    fn known_units_share_normalized_axes_and_unknown_units_remain_independent() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 1..=20 {
+            let mut row = row(n * 100);
+            row.attributes = vec![
+                ("A".into(), (n * 1_000_000).to_string()),
+                ("B".into(), (n * 2).to_string()),
+                ("C".into(), (n * 3).to_string()),
+                ("D".into(), (n * 10).to_string()),
+                ("UnknownA".into(), n.to_string()),
+                ("UnknownB".into(), (n * 4).to_string()),
+                ("ElapsedAlias".into(), (n * 100).to_string()),
+                ("Constant".into(), "1000000".into()),
+            ];
+            row.attribute_units = vec![
+                ("A".into(), "ns".into()),
+                ("B".into(), "ms".into()),
+                ("C".into(), "bytes".into()),
+                ("D".into(), "bytes".into()),
+                ("ElapsedAlias".into(), "ms".into()),
+                ("Constant".into(), "ms".into()),
+            ];
+            collector.push(row, &selection, 0, "");
+        }
+        let report = collector.report(&selection).unwrap();
+        let signal = |key: &str| report.signals.iter().find(|s| s.key == key).unwrap();
+        let a = signal("A");
+        let b = signal("B");
+        assert_eq!(a.value_axis.unit.as_deref(), Some("ms"));
+        assert_eq!(a.value_axis.multiplier, 1e-6);
+        assert_eq!(b.value_axis.multiplier, 1.0);
+        assert_eq!(a.value_axis.maximum, 40.0);
+        assert_eq!(
+            a.density.as_ref().unwrap().value_edges,
+            b.density.as_ref().unwrap().value_edges
+        );
+        assert_eq!(signal("C").value_axis.maximum, 200.0);
+        assert_eq!(
+            signal("C").density.as_ref().unwrap().value_edges,
+            signal("D").density.as_ref().unwrap().value_edges
+        );
+        assert_eq!(signal("UnknownA").value_axis.maximum, 20.0);
+        assert_eq!(signal("UnknownB").value_axis.maximum, 80.0);
+        assert_eq!(signal("UnknownA").value_axis.unit, None);
+        assert!(report.signals.iter().all(|s| s.key != "ElapsedAlias"));
+        assert!(report.signals.iter().all(|s| s.key != "Constant"));
+    }
+
+    #[test]
+    fn elapsed_aliases_do_not_consume_the_visible_field_capacity() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 1..=100 {
+            let mut row = row(n);
+            row.attributes.clear();
+            row.attribute_units.clear();
+            for index in 0..MAX_FIELDS {
+                let key = format!("Alias{index:02}");
+                row.attributes.push((key.clone(), n.to_string()));
+                row.attribute_units.push((key, "ms".into()));
+            }
+            for index in 0..MAX_FIELDS {
+                let key = format!("Work{index:02}");
+                row.attributes
+                    .push((key.clone(), (n * (index as i64 + 1)).to_string()));
+                row.attribute_units.push((key, "bytes".into()));
+            }
+            collector.push(row, &selection, 0, "");
+        }
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(report.signals.len(), MAX_FIELDS);
+        assert!(report.signals.iter().all(|s| s.key.starts_with("Work")));
+        assert_eq!(report.numeric_fields_omitted, 0);
+        assert!(!collector.fields_truncated);
+    }
+
+    #[test]
+    fn rare_tail_divergence_is_not_mistaken_for_an_elapsed_alias() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 1..=1_000 {
+            let mut row = row(n);
+            // This timer repeats elapsed time in the ordinary 99% but exposes
+            // different work in the slowest 1%. Overall agreement hides it.
+            row.attributes.push((
+                "TailTimer".into(),
+                if n <= 990 { n } else { n * 4 }.to_string(),
+            ));
+            row.attribute_units.push(("TailTimer".into(), "ms".into()));
+            row.attributes
+                .push(("UnknownElapsed".into(), n.to_string()));
+            if n % 37 == 0 {
+                row.attributes.retain(|(key, _)| key != "ElapsedAlias");
+            }
+            collector.push(row, &selection, 0, "");
+        }
+        let report = collector.report(&selection).unwrap();
+        let timer = report
+            .signals
+            .iter()
+            .find(|s| s.key == "TailTimer")
+            .expect("a meaningful rare-tail divergence must remain visible");
+        assert_eq!(timer.slow_count, 11);
+        assert_eq!(timer.density.as_ref().unwrap().count, 1_000);
+        assert!(report.signals.iter().all(|s| s.key != "ElapsedAlias"));
+        let unknown = report
+            .signals
+            .iter()
+            .find(|s| s.key == "UnknownElapsed")
+            .unwrap();
+        assert_eq!(unknown.unit, None);
+        assert_eq!(unknown.value_axis.unit, None);
+        assert_eq!(unknown.value_axis.maximum, 1_000.0);
+    }
+
+    fn jittered_timer_rows(selection: &Selection, count: i64, jitter_count: i64) -> Collector {
+        let mut collector = Collector::default();
+        for n in 1..=count {
+            let mut row = row(0);
+            row.elapsed_ns = 100_000 + n * 100;
+            let elapsed_ms = row.elapsed_ns as f64 / 1e6;
+            let difference_ms = if n <= jitter_count { 0.005 } else { 0.0002 };
+            row.attributes = vec![
+                (
+                    "JitteredTimer".into(),
+                    (elapsed_ms - difference_ms).to_string(),
+                ),
+                ("ExactTimer".into(), elapsed_ms.to_string()),
+                ("UnknownElapsed".into(), elapsed_ms.to_string()),
+            ];
+            row.attribute_units = vec![
+                ("JitteredTimer".into(), "ms".into()),
+                ("ExactTimer".into(), "ms".into()),
+            ];
+            if n % 37 == 0 {
+                row.attributes.retain(|(key, _)| key != "ExactTimer");
+            }
+            collector.push(row, selection, 0, "");
+        }
+        collector
+    }
+
+    #[rstest]
+    #[case("", 10_000, 20, false)]
+    #[case("slow_percentile=95", 10_000, 20, false)]
+    // The selected band contains ordinary jitter.
+    #[case("min_span_ns=100000&max_span_ns=105000", 10_000, 20, true)]
+    // A completely recorded five-value selected cohort has no missing evidence.
+    #[case("min_span_ns=1099600", 10_000, 20, false)]
+    // The completely recorded p99 tail has only 11 values.
+    #[case("slow_percentile=50", 1_000, 3, false)]
+    // An empty selected cohort cannot confirm approximate redundancy.
+    #[case("min_span_ns=2000000", 10_000, 20, true)]
+    fn ordinary_jitter_is_hidden_only_with_verified_tail_and_selected_cohorts(
+        #[case] query: &str,
+        #[case] count: i64,
+        #[case] jitter_count: i64,
+        #[case] visible: bool,
+    ) {
+        let selection = params(query).selection().unwrap();
+        let collector = jittered_timer_rows(&selection, count, jitter_count);
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(
+            report.signals.iter().any(|s| s.key == "JitteredTimer"),
+            visible,
+        );
+        // Missing values do not invalidate a true alias's all-match path.
+        assert!(report.signals.iter().all(|s| s.key != "ExactTimer"));
+        let unknown = report
+            .signals
+            .iter()
+            .find(|s| s.key == "UnknownElapsed")
+            .unwrap();
+        assert_eq!(unknown.value_axis.unit, None);
+    }
+
+    #[test]
+    fn a_verified_brush_does_not_hide_divergence_in_the_fixed_global_p99_tail() {
+        let selection = params("min_span_ns=110000&max_span_ns=130000")
+            .selection()
+            .unwrap();
+        let mut collector = jittered_timer_rows(&selection, 10_000, 0);
+        for (index, row) in collector.rows.iter_mut().enumerate() {
+            if index >= 9_900 {
+                row.numeric
+                    .insert("JitteredTimer".into(), row.example.elapsed_ms * 0.5);
+            }
+        }
+        let report = collector.report(&selection).unwrap();
+        assert!(report.slow_count >= ALIAS_MIN_COHORT_OBSERVATIONS);
+        assert!(report.signals.iter().any(|s| s.key == "JitteredTimer"));
+    }
+
+    #[test]
+    fn missing_tail_values_do_not_confirm_an_approximate_elapsed_alias() {
+        let selection = params("slow_percentile=95").selection().unwrap();
+        let mut collector = jittered_timer_rows(&selection, 10_000, 20);
+        for (index, row) in collector.rows.iter_mut().enumerate() {
+            if index >= 9_899 {
+                row.numeric.remove("JitteredTimer");
+            }
+        }
+        let report = collector.report(&selection).unwrap();
+        let timer = report
+            .signals
+            .iter()
+            .find(|s| s.key == "JitteredTimer")
+            .unwrap();
+        assert!(timer.slow_count >= ALIAS_MIN_COHORT_OBSERVATIONS);
+        assert_eq!(timer.density.as_ref().unwrap().count, 9_899);
+    }
+
+    #[rstest]
+    #[case("slow_percentile=50", 1_000, 3)]
+    #[case("min_span_ns=1099600", 10_000, 20)]
+    fn incomplete_small_cohorts_do_not_confirm_an_approximate_elapsed_alias(
+        #[case] query: &str,
+        #[case] count: i64,
+        #[case] jitter_count: i64,
+    ) {
+        let selection = params(query).selection().unwrap();
+        let mut collector = jittered_timer_rows(&selection, count, jitter_count);
+        let complete = collector.report(&selection).unwrap();
+        assert!(complete.signals.iter().all(|s| s.key != "JitteredTimer"));
+        // One missing value makes either the 11-value p99 tail or five-value
+        // selected cohort incomplete. Both remain below the 20-value guard.
+        collector
+            .rows
+            .last_mut()
+            .unwrap()
+            .numeric
+            .remove("JitteredTimer");
+        let incomplete = collector.report(&selection).unwrap();
+        assert!(incomplete.signals.iter().any(|s| s.key == "JitteredTimer"));
+        assert!(incomplete.signals.iter().all(|s| s.key != "ExactTimer"));
+    }
+
+    #[test]
+    fn candidate_and_visible_field_limits_are_explicit() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 1..=2 {
+            let mut row = row(n);
+            row.attributes = (0..=MAX_NUMERIC_CANDIDATES)
+                .map(|index| (format!("Value{index:03}"), n.to_string()))
+                .collect();
+            row.attribute_units.clear();
+            collector.push(row, &selection, 0, "");
+        }
+        let report = collector.report(&selection).unwrap();
+        assert!(collector.fields_truncated);
+        assert_eq!(report.signals.len(), MAX_FIELDS);
+        assert_eq!(
+            report.numeric_fields_omitted,
+            MAX_NUMERIC_CANDIDATES - MAX_FIELDS
+        );
+    }
+
+    #[test]
+    fn omitted_fields_and_unknown_units_do_not_distort_visible_time_axes() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 1..=100 {
+            let mut row = row(n * 1_000);
+            row.attributes.clear();
+            row.attribute_units.clear();
+            for index in 0..MAX_FIELDS {
+                let key = format!("Work{index:02}");
+                row.attributes.push((key.clone(), n.to_string()));
+                row.attribute_units.push((key, "ms".into()));
+            }
+            row.attributes
+                .push(("ZZHuge".into(), (n * 1_000_000).to_string()));
+            row.attribute_units.push(("ZZHuge".into(), "ms".into()));
+            row.attributes
+                .push(("UnknownElapsed".into(), (n * 1_000).to_string()));
+            collector.push(row, &selection, 0, "");
+        }
+        let report = collector.report(&selection).unwrap();
+        // Exact numeric equality without a declared unit is not a time alias.
+        let unknown = report
+            .signals
+            .iter()
+            .find(|s| s.key == "UnknownElapsed")
+            .unwrap();
+        assert_eq!(unknown.value_axis.unit, None);
+        assert_eq!(unknown.value_axis.maximum, 100_000.0);
+        assert!(report.signals.iter().all(|s| s.key != "ZZHuge"));
+        assert!(
+            report
+                .signals
+                .iter()
+                .filter(|s| s.unit.as_deref() == Some("ms"))
+                .all(|s| s.value_axis.maximum == 100.0)
+        );
+        assert!(report.signals.iter().all(|s| s.density.is_some()));
+    }
+
+    #[rstest]
+    #[case("ns", 1e-6)]
+    #[case("us", 1e-3)]
+    #[case("µs", 1e-3)]
+    #[case("μs", 1e-3)]
+    #[case("ms", 1.0)]
+    #[case("s", 1e3)]
+    fn time_unit_aliases_are_excluded_without_hiding_real_submicrosecond_work(
+        #[case] unit: &str,
+        #[case] multiplier: f64,
+    ) {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for elapsed_ns in [100, 500, 1000] {
+            let mut row = row(0);
+            row.elapsed_ns = elapsed_ns;
+            let elapsed_ms = elapsed_ns as f64 / 1e6;
+            row.attributes = vec![
+                ("Alias".into(), (elapsed_ms / multiplier).to_string()),
+                ("Work".into(), (elapsed_ms * 0.5 / multiplier).to_string()),
+            ];
+            row.attribute_units = vec![("Alias".into(), unit.into()), ("Work".into(), unit.into())];
+            collector.push(row, &selection, 0, "");
+        }
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(report.signals.len(), 1);
+        assert_eq!(report.signals[0].key, "Work");
+    }
+
+    #[rstest]
+    #[case(vec![1.0, 1.0], vec![1.0, 1.0], 0.0)]
+    #[case(vec![1.0, 2.0], vec![3.0, 4.0], 1.0)]
+    #[case(vec![1.0, 2.0], vec![1.0, 3.0], 0.5)]
+    fn exact_cdf_distance_handles_ties_and_shape_changes(
+        #[case] a: Vec<f64>,
+        #[case] b: Vec<f64>,
+        #[case] expected: f64,
+    ) {
+        assert_eq!(cdf_distance(&a, &b), expected);
+    }
+
+    #[test]
+    fn property_screen_hides_identical_distributions_even_with_unequal_volume() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for (value, repetitions) in [("common", 1_000), ("less-common", 100)] {
+            for _ in 0..repetitions {
+                for latency in [1, 10, 100] {
+                    collector.push(tagged_row(latency, Some(value)), &selection, 0, "");
+                }
+            }
+        }
+        let report = collector.report(&selection).unwrap();
+        assert!(report.histograms.is_empty());
+        assert_eq!(report.property_screen.similar_distributions, 1);
+        assert_eq!(report.property_screen.pairs_compared, 1);
+    }
+
+    #[test]
+    fn property_screen_keeps_adequately_observed_broad_distribution_changes() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for (value, latency) in [("fast", 1), ("slow", 100)] {
+            for _ in 0..500 {
+                collector.push(tagged_row(latency, Some(value)), &selection, 0, "");
+            }
+        }
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(report.histograms.len(), 1);
+        let relevance = report.histograms[0].relevance.as_ref().unwrap();
+        assert_eq!(relevance.reason, "distribution");
+        assert_eq!(relevance.cdf_gap, 1.0);
+        assert!(relevance.cdf_margin > 0.0);
+        assert!(
+            relevance
+                .values
+                .iter()
+                .all(|v| v.count == 500 && v.p99_window.is_none())
+        );
+        assert_eq!(report.property_screen.shown, 1);
+    }
+
+    #[test]
+    fn property_screen_keeps_p99_changes_when_the_distribution_body_is_identical() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for (value, tail_latency) in [("fast-tail", 10), ("slow-tail", 100)] {
+            for index in 0..20_000 {
+                let latency = if index < 19_600 { 1 } else { tail_latency };
+                collector.push(tagged_row(latency, Some(value)), &selection, 0, "");
+            }
+        }
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(report.histograms.len(), 1);
+        assert_eq!(report.histograms[0].values[0].median_ms, 1.0);
+        assert_eq!(report.histograms[0].values[1].median_ms, 1.0);
+        let relevance = report.histograms[0].relevance.as_ref().unwrap();
+        assert_eq!(relevance.reason, "tail");
+        assert!(relevance.cdf_gap < PROPERTY_MIN_CDF_GAP);
+        assert_eq!(relevance.tail_ratio_lower_bound, Some(10.0));
+        assert_eq!(
+            relevance.values[0].p99_window.as_ref().unwrap().upper_ms,
+            10.0
+        );
+        assert_eq!(
+            relevance.values[1].p99_window.as_ref().unwrap().lower_ms,
+            100.0
+        );
+        assert!(
+            relevance
+                .values
+                .iter()
+                .all(|v| v.p99_window.as_ref().unwrap().lower_rank
+                    < v.p99_window.as_ref().unwrap().upper_rank)
+        );
+    }
+
+    #[rstest]
+    #[case(20, 10_000, 0, "limitedObservations")]
+    #[case(200, 200, 1_200, "limitedCoverage")]
+    #[case(500, 500, 0, "similarDistributions")]
+    fn rare_missing_and_underobserved_tails_do_not_pass_the_property_screen(
+        #[case] fast_count: usize,
+        #[case] slow_count: usize,
+        #[case] missing: usize,
+        #[case] expected_reason: &str,
+    ) {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for (value, count, tail_latency) in [("fast", fast_count, 10), ("slow", slow_count, 100)] {
+            for index in 0..count {
+                let latency = if index < count * 98 / 100 {
+                    1
+                } else {
+                    tail_latency
+                };
+                collector.push(tagged_row(latency, Some(value)), &selection, 0, "");
+            }
+        }
+        for _ in 0..missing {
+            collector.push(tagged_row(1, None), &selection, 0, "");
+        }
+        let report = collector.report(&selection).unwrap();
+        assert!(report.histograms.is_empty());
+        let screen = serde_json::to_value(report.property_screen).unwrap();
+        assert_eq!(screen[expected_reason], 1);
+        assert!(
+            screen["interpretation"]
+                .as_str()
+                .unwrap()
+                .contains("independent")
+        );
+    }
+
+    #[test]
+    fn property_sampling_margin_accounts_for_all_compared_pairs() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 0..2_000 {
+            let mut row = tagged_row(
+                if n < 1_000 { 1 } else { 100 },
+                Some(if n < 1_000 { "a" } else { "b" }),
+            );
+            row.attributes
+                .push(("Other".into(), if n < 1_000 { "x" } else { "y" }.into()));
+            collector.push(row, &selection, 0, "");
+        }
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(report.property_screen.pairs_compared, 2);
+        let margin = report.histograms[0].relevance.as_ref().unwrap().cdf_margin;
+        assert!(margin > 2.0 * ((2.0 / PROPERTY_SAMPLING_BUDGET).ln() / 2_000.0).sqrt());
+        let selected = params("group_key=Other&group_value=x").selection().unwrap();
+        let report = collector.report(&selected).unwrap();
+        assert!(report.histograms.is_empty());
+        assert_eq!(report.property_screen.examined, 0);
     }
 
     fn composed_row(n: i64, parts: [i64; 5]) -> SpanStatsRow {
@@ -1452,6 +2427,112 @@ mod tests {
         });
         result.unwrap();
         assert_eq!(seen, 1);
+    }
+
+    #[tokio::test]
+    async fn synthetic_raw_and_parquet_reports_have_identical_density_and_property_screens() {
+        use dial9_core::schema_extensions::{self, roles};
+        use dial9_trace_format::encoder::{Encoder, Schema};
+        use dial9_trace_format::schema::{FieldAnnotation, FieldDef, SchemaEntry};
+        use dial9_trace_format::types::{FieldType, FieldValue};
+
+        let schema = Schema::from_entry(SchemaEntry::with_annotations(
+            "producer:LatencyFixture",
+            vec![
+                FieldDef::new("started", FieldType::Varint),
+                FieldDef::new("operation", FieldType::String),
+                FieldDef::new("Work", FieldType::Varint),
+                FieldDef::new("ElapsedAlias", FieldType::Varint),
+                FieldDef::new("Mode", FieldType::String),
+                FieldDef::new("Unrelated", FieldType::String),
+            ],
+            [
+                FieldAnnotation::new(0, schema_extensions::ROLE_KEY, roles::SPAN_START),
+                FieldAnnotation::new(0, "unit", "ns"),
+                FieldAnnotation::new(0, schema_extensions::SPAN_TYPE_KEY, "latency-fixture"),
+                FieldAnnotation::new(1, schema_extensions::ROLE_KEY, roles::SPAN_NAME),
+                FieldAnnotation::new(2, "unit", "ms"),
+                FieldAnnotation::new(3, "unit", "ms"),
+            ],
+        ));
+        let mut encoder = Encoder::new();
+        let mut started = 1;
+        for index in 0..2_000 {
+            let latency = if index < 1_000 { 10 } else { 1_000 };
+            let ended = started + latency * 1_000_000;
+            encoder
+                .write_event(
+                    &schema,
+                    ended,
+                    &[
+                        FieldValue::Varint(started),
+                        FieldValue::String("fixture-operation".into()),
+                        FieldValue::Varint(latency / 2),
+                        FieldValue::Varint(latency),
+                        FieldValue::String(if index < 1_000 { "fast" } else { "slow" }.into()),
+                        FieldValue::String(if index % 2 == 0 { "a" } else { "b" }.into()),
+                    ],
+                )
+                .unwrap();
+            started = ended + 1;
+        }
+        let trace = encoder.into_inner();
+        let (_, _, _, spans) = decode::decode_samples(&trace, "raw-trace").unwrap();
+        assert_eq!(spans.len(), 2_000);
+        let uid = spans[0].span_type_uid;
+        let uri = format!(
+            "/api/span-tail?span_type_uid={}&min_span_ns=1000000000&max_span_ns=1000000000",
+            hex::encode(uid)
+        )
+        .parse()
+        .unwrap();
+        let response = post_tail(
+            Query::<SpanStatsParams>::try_from_uri(&uri).unwrap(),
+            Query::<TailOptions>::try_from_uri(&uri).unwrap(),
+            Bytes::from(trace),
+        )
+        .await
+        .unwrap()
+        .0;
+        let selection = TailParams {
+            scope: Query::<SpanStatsParams>::try_from_uri(&uri).unwrap().0,
+            options: Query::<TailOptions>::try_from_uri(&uri).unwrap().0,
+        }
+        .selection()
+        .unwrap();
+        let mut parquet = Vec::new();
+        crate::ingest::parquet_writer::write_spans(&mut parquet, &spans).unwrap();
+        let mut collector = Collector::default();
+        let (_, result) =
+            SpansBatchReader::new(None, None, Some(uid), None).read(parquet, |input| {
+                if let SpanStatsInput::Row(row) = input {
+                    collector.push(*row, &selection, 0, "");
+                }
+                Ok(())
+            });
+        result.unwrap();
+        let folded = collector.report(&selection).unwrap();
+        assert_eq!(response.report.signals.len(), 1);
+        assert_eq!(response.report.signals[0].key, "Work");
+        assert_eq!(
+            response.report.signals[0].density.as_ref().unwrap().count,
+            2_000
+        );
+        assert_eq!(response.report.histograms.len(), 1);
+        assert_eq!(response.report.histograms[0].key, "Mode");
+        assert_eq!(response.report.property_screen.similar_distributions, 1);
+        assert_eq!(
+            serde_json::to_value(response.report.signals).unwrap(),
+            serde_json::to_value(folded.signals).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(response.report.histograms).unwrap(),
+            serde_json::to_value(folded.histograms).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(response.report.property_screen).unwrap(),
+            serde_json::to_value(folded.property_screen).unwrap(),
+        );
     }
 
     #[tokio::test]
