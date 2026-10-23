@@ -3,9 +3,12 @@ import type { CategoricalHistogram, CategoryLatency } from "../../lib/trace/span
 import { formatHumanDuration } from "../../lib/trace/api_format.js";
 import {
   categoryBinCount,
+  categoricalHistogramStack,
   histogramBrushRange,
   histogramMarkerRows,
+  histogramStackArea,
   latencyToHistogramPosition,
+  type CategoricalStack,
   type HistogramRange,
 } from "./categorical-histogram-scale.js";
 import "./categorical-histograms.css";
@@ -39,6 +42,7 @@ interface Series {
   value: CategoryLatency;
   color: string;
 }
+type AvailableStack = Extract<CategoricalStack, { available: true }>;
 
 function legend({ value, color }: Series) {
   return html`<div class="tail-category-value">
@@ -66,28 +70,36 @@ function ticksForHistogram(edges: readonly number[]) {
   return ticks;
 }
 
-function binReadout(histogram: CategoricalHistogram, series: readonly Series[], bin: number) {
+function binReadout(histogram: CategoricalHistogram, series: readonly Series[], bin: number, stack: AvailableStack | null) {
   const finalBin = bin === histogram.binEdgesMs.length - 2;
   return html`<div class="tail-category-tooltip-range">
       ${duration(histogram.binEdgesMs[bin]!)}–${duration(histogram.binEdgesMs[bin + 1]!)}
       <span>${finalBin ? "inclusive" : "upper bound excluded"}</span>
     </div>
-    ${series.map(({ value, color }) => html`<div class="tail-category-tooltip-series">
-      <span><i style="background:${color}"></i>${value.value}</span>
-      <strong>${categoryBinCount(value, bin) == null ? "Unavailable" : spanCount(categoryBinCount(value, bin)!)}</strong>
-      <span>${value.shares[bin] == null ? "—" : percent(value.shares[bin]!)} of ${number(value.count)}</span>
-    </div>`)}`;
+    ${series.map(({ value, color }) => {
+      const count = categoryBinCount(value, bin);
+      const share = stack ? count! / stack.population : value.shares[bin];
+      return html`<div class="tail-category-tooltip-series">
+        <span><i style="background:${color}"></i>${value.value}</span>
+        <strong>${count == null ? "Unavailable" : spanCount(count)}</strong>
+        <span>${share == null ? "—" : percent(share)} of ${number(stack?.population ?? value.count)}</span>
+      </div>`;
+    })}
+    ${stack ? html`<div class="tail-category-tooltip-series tail-category-tooltip-total">
+      <span>Total</span><strong>${spanCount(stack.totalCounts[bin]!)}</strong>
+      <span>${percent(stack.totalShares[bin]!)} of ${number(stack.population)}</span>
+    </div>` : nothing}`;
 }
 
 function plot(
   histogram: CategoricalHistogram,
   series: readonly Series[],
-  compact: boolean,
   options: CategoricalHistogramOptions,
+  stack: AvailableStack | null,
 ) {
   const edges = histogram.binEdgesMs;
   const bins = edges.length - 1;
-  const maximum = Math.max(.1, Math.min(1, Math.ceil(histogram.maxShare * 10) / 10));
+  const maximum = Math.max(.1, Math.min(1, Math.ceil((stack?.maximum ?? histogram.maxShare) * 10) / 10));
   const ticks = ticksForHistogram(edges);
   const markerPositions = series.map(s => latencyToHistogramPosition(edges, s.value.p99Ms) / bins);
   const markerRows = histogramMarkerRows(markerPositions);
@@ -101,6 +113,9 @@ function plot(
     shares.forEach((share, i) => { path += `V${1 - share / maximum}H${i + 1}`; });
     return `${path}V1Z`;
   };
+  const totalLine = stack
+    ? `M0 ${1 - stack.totalShares[0]! / maximum}${stack.totalShares.map((share, bin) => `V${1 - share / maximum}H${bin + 1}`).join("")}`
+    : "";
 
   let dragStart: number | null = null;
   let dragPointer: number | null = null;
@@ -127,7 +142,7 @@ function plot(
     const bounded = Math.max(0, Math.min(bins - 1, bin));
     highlight.setAttribute("x", String(bounded));
     highlight.style.display = "block";
-    render(binReadout(histogram, series, bounded), tooltip);
+    render(binReadout(histogram, series, bounded, stack), tooltip);
     tooltip.hidden = false;
     // Anchor to one half so long value labels remain in bounds.
     tooltip.style.left = bounded < bins / 2 ? "5px" : "auto";
@@ -201,7 +216,7 @@ function plot(
     }
   };
 
-  return html`<div class="tail-category-plot ${compact ? "compact" : ""}">
+  return html`<div class="tail-category-plot">
     <div class="tail-category-y" style="padding-top:${markerHeight}px">
       <span>${percent(maximum)}</span><span>${percent(maximum / 2)}</span><span>0%</span>
     </div>
@@ -214,7 +229,7 @@ function plot(
         </span>`)}
       </div>
       <svg viewBox="0 0 ${bins} 1" preserveAspectRatio="none" role="group" tabindex="0"
-        aria-label="${histogram.key}: ${series.map(s => s.value.value).join(" versus ")} elapsed-time distributions. Arrow keys inspect latency bins. Shift and arrow keys extend a selection; Enter selects it."
+        aria-label="${histogram.key}: ${stack ? "stacked contributions to the total elapsed-time distribution" : "overlaid elapsed-time distributions"} for ${series.map(s => s.value.value).join(", ")}. Arrow keys inspect latency bins. Shift and arrow keys extend a selection; Enter selects it."
         @pointerdown=${onPointerDown} @pointermove=${onPointerMove} @pointerup=${onPointerUp}
         @pointercancel=${cancelDrag} @lostpointercapture=${cancelDrag}
         @pointerleave=${(event: PointerEvent) => { if (dragStart == null) hideBin(event.currentTarget as SVGSVGElement); }}
@@ -223,7 +238,10 @@ function plot(
         @blur=${(event: FocusEvent) => { hideBin(event.currentTarget as SVGSVGElement); hideBrush(event.currentTarget as SVGSVGElement); }}>
         ${[0, .5, 1].map(y => svg`<path d="M0 ${y}H${bins}" class="tail-category-grid"></path>`)}
         ${ticks.map(t => svg`<path d="M${t.position} 0V1" class="tail-category-grid"></path>`)}
-        ${series.map(s => svg`<path class="tail-category-distribution" d=${step(s.value.shares)} fill=${s.color} stroke=${s.color} fill-opacity=${series.length > 1 ? .08 : .16}></path>`)}
+        ${series.map((s, i) => svg`<path class="tail-category-distribution"
+          d=${stack ? histogramStackArea(stack.layers[i]!.lower, stack.layers[i]!.upper, maximum) : step(s.value.shares)}
+          fill=${s.color} stroke=${s.color} fill-opacity=${stack ? .65 : series.length > 1 ? .08 : .16}></path>`)}
+        ${stack ? svg`<path class="tail-category-total" d=${totalLine}><title>Total distribution of spans with recorded ${histogram.key}</title></path>` : nothing}
         ${banded ? svg`<rect x="0" y="0" width=${selectedFrom} height="1" class="tail-category-outside"></rect>
           <rect x=${selectedTo} y="0" width=${Math.max(0, bins - selectedTo)} height="1" class="tail-category-outside"></rect>` : nothing}
         ${series.map(s => svg`<line x1=${latencyToHistogramPosition(edges, s.value.p99Ms)} x2=${latencyToHistogramPosition(edges, s.value.p99Ms)}
@@ -249,15 +267,22 @@ export function renderCategoricalHistogram(
 ) {
   const series = histogram.values.map((value, i) => ({ value, color: propertyValueColor(i) }));
   const overlay = (options.mode ?? "overlay") === "overlay";
+  const stack = overlay ? null : categoricalHistogramStack(histogram);
+  const availableStack = stack?.available ? stack : null;
   return html`<section class="tail-category-chart ${overlay ? "overlay" : "stacked"}">
-    <div class="tail-category-caption"><span>% of spans within each value</span>
+    <div class="tail-category-caption"><span>${overlay ? "% of spans within each value" : `% of ${spanCount(histogram.count)} with a recorded value`}</span>
       ${histogram.missingCount ? html`<span>${number(histogram.missingCount)} missing values excluded</span>` : nothing}
-      ${options.onSelectRange ? html`<span class="tail-category-brush-hint">Drag to select latency</span>` : nothing}
+      ${options.onSelectRange && (overlay || availableStack) ? html`<span class="tail-category-brush-hint">Drag to select latency</span>` : nothing}
     </div>
-    ${overlay ? html`<div class="tail-category-overlay-legend">${series.map(legend)}</div>
-      ${plot(histogram, series, false, options)}` : series.map(s => html`<div class="tail-category-row">
-        ${legend(s)}${plot(histogram, [s], true, options)}
-      </div>`)}
+    <div class="tail-category-overlay-legend">${series.map(legend)}
+      ${availableStack ? html`<span class="tail-category-total-key"><i></i>Total</span>` : nothing}
+    </div>
+    ${overlay || availableStack ? plot(histogram, series, options, availableStack)
+      : html`<p class="tail-category-unavailable" role="status">${stack?.available === false && stack.reason === "incomplete-values"
+        ? "Some recorded values are omitted; the total distribution is unavailable."
+        : stack?.available === false && stack.reason === "missing-counts"
+          ? "Exact bin counts are unavailable in this cached report. Refresh analysis to stack."
+          : "Exact bin counts are incomplete; the total distribution is unavailable."}</p>`}
   </section>`;
 }
 
