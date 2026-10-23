@@ -18,6 +18,24 @@ export interface TailSelection {
   minMs: number | null;
   maxMs: number | null;
 }
+export interface TailValueAxis {
+  /** Declared compatible time units normalize to ms; unknown units remain null. */
+  unit: string | null;
+  /** Multiply raw point/summary values by this number for the display axis. */
+  multiplier: number;
+  minimum: number;
+  maximum: number;
+}
+export interface TailDensity {
+  elapsedEdgesMs: number[];
+  /** Edges already use the display unit in valueAxis. */
+  valueEdges: number[];
+  /** Row-major: counts[y * (elapsedEdgesMs.length - 1) + x]. */
+  counts: number[];
+  /** Every loaded observation with this field; points are a navigation sample. */
+  count: number;
+  maxCount: number;
+}
 export interface TailSignal {
   key: string;
   unit: string | null;
@@ -34,6 +52,9 @@ export interface TailSignal {
   filesCompared: number;
   filesAgree: number;
   points: [number, number, TailRecord][];
+  /** Optional only for compatibility with previously cached reports. */
+  valueAxis?: TailValueAxis;
+  density?: TailDensity;
 }
 export interface TailComposition {
   count: number;
@@ -45,8 +66,44 @@ export interface CategoryLatency {
   value: string;
   count: number;
   shares: number[];
+  /** Exact per-bin counts, optional for previously cached reports. */
+  binCounts?: number[];
   medianMs: number;
   p99Ms: number;
+}
+export interface TailQuantileWindow {
+  lowerMs: number;
+  upperMs: number;
+  lowerRank: number;
+  upperRank: number;
+}
+export interface PropertyRelevance {
+  reason: 'distribution' | 'tail';
+  values: {
+    value: string;
+    count: number;
+    p99Ms: number;
+    p99Window: TailQuantileWindow | null;
+  }[];
+  cdfGap: number;
+  cdfMargin: number;
+  /** null when the winning comparison has a zero baseline or is body-only. */
+  tailRatioLowerBound: number | null;
+}
+export interface PropertyScreen {
+  examined: number;
+  shown: number;
+  limitedCoverage: number;
+  limitedObservations: number;
+  similarDistributions: number;
+  pairsCompared: number;
+  minimumSamples: number;
+  minimumTailSamples: number;
+  minimumCoverage: number;
+  minimumCdfGap: number;
+  minimumTailRatio: number;
+  samplingBudget: number;
+  interpretation: string;
 }
 export interface CategoricalHistogram {
   key: string;
@@ -55,6 +112,7 @@ export interface CategoricalHistogram {
   binEdgesMs: number[];
   maxShare: number;
   values: CategoryLatency[];
+  relevance?: PropertyRelevance | null;
 }
 export interface TailReport {
   count: number;
@@ -75,6 +133,8 @@ export interface TailReport {
   signals: TailSignal[];
   groups: { key: string; values: string[]; typical: Record<string, number>; slow: Record<string, number> }[];
   histograms: CategoricalHistogram[];
+  propertyScreen?: PropertyScreen;
+  numericFieldsOmitted?: number;
   mixChanges: { key: string; value: string; typical: number; slow: number }[];
   examples: TailRecord[];
 }
