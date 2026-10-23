@@ -37,7 +37,8 @@ The view starts with:
   the shapes comparable. Overlay heights are percentages within each value;
   stacked layers use exact bin counts divided by the full recorded population,
   so their heights add up to the pooled total distribution.
-  Missing values are counted separately. Property buttons change fields.
+  Missing values are counted separately. A sole property is a plain heading;
+  buttons switch fields when several properties are available.
   Paired bars below the distributions show typical and slow value proportions,
   with the same colors, actual cohort counts, and explicit missing values.
 - A **Numeric fields** section directly below the property graphs, with three
@@ -65,10 +66,13 @@ definitions are available on demand; an excluded field can have no clear
 difference in this sample or insufficient observations. Group counts remain
 visible because a small sample's observed p99 is a weak basis for a conclusion.
 
-Numeric fields with fewer than twenty recorded values in either group follow
-better-observed fields. Other fields are ranked by the conservative gap between
-typical and slow recorded-value distributions. Coverage warnings are separate
-from this ordering. Duration attributes that repeat
+Numeric comparisons use every recorded value to find the largest difference
+between the two cumulative distributions at any value threshold, including
+ties. The backend subtracts a descriptive sampling margin that accounts for
+cohort sizes and the number of candidate fields. The remaining gap determines
+ranking. Fields with fewer than twenty recorded values in either group follow
+adequately observed fields; unavailable comparisons remain explicit.
+Coverage warnings are separate from this ordering. Duration attributes that repeat
 total elapsed time and constant fields are omitted. The backend's ordering is
 descriptive, not a significance test.
 
@@ -86,17 +90,20 @@ Each card shows group means, a qualitative tail-difference label, and repetition
 across qualifying source files. Click its difference badge for a table of
 recorded counts, coverage, means, medians, and p99s. The popup explains the CDF
 gap, sampling margin, and conservative lower bound used for ordering; labels
-are descriptive cutoffs, not significance claims. Whole-range Spearman
+are descriptive cutoffs, not significance claims. Spearman across recorded values
 correlation is a secondary expandable detail. Coverage warnings remain separate;
 Escape closes the explanation and returns focus.
 File repetition needs five observations in each cohort. Spearman compares up to
-2,048 evenly spaced observations across latency ranks; comparison means use
-every loaded recorded value. Drawing uses up to 330 trace-link dots in addition
+2,048 evenly spaced observations across latency ranks; comparison means,
+medians, and p99s use every loaded recorded value in their original units.
+Drawing uses up to 330 trace-link dots in addition
 to the full-observation density grid. Hover or focus a dot to see its values and
 the trace action before opening it. Point popovers preserve the original recorded
 key/value strings, including duplicate keys, in a bounded scroll region. Hover
 retention and keyboard focus let users read long records. Backend omissions are
 explicit; unavailable cached metadata is never inferred from the active field.
+Resizing the viewport or plot dismisses an obsolete popup and returns keyboard
+focus to its dot when the popup contained focus.
 A dot, popover action, or slow-example button opens its
 original trace focused on the selected span, preserving the credential contract.
 Older cached reports show an explicit sample-only warning and do not invent
@@ -142,6 +149,17 @@ separate callsites with the same name. Occurrence-time filtering uses
 `end_ns` in the same half-open interval as the catalog. Each comparison
 request reads cached Parquet after any required folds.
 
+Point metadata is hydrated in a second pass over only the sources containing
+bounded examples. Aggregate requests reuse cached Parquet; raw requests decode
+the source again after releasing the full observation collection. The join
+uses source identity, span identity, and exact time bounds; ambiguous matches
+remain unavailable. This avoids retaining full key/value records for every
+loaded span. Each example includes at most 64 whole pairs and 8 KiB of serialized
+attribute arrays, with a 16 MiB budget across all emitted references. Omitted
+pair counts are explicit, and values are never clipped into plausible strings.
+Null or absent attributes mean unavailable metadata; an empty array with zero
+omissions means no recorded fields.
+
 Time composition uses the same estimated five-way accounting as the catalog.
 Each positive-time instance contributes equally to the bar's shares; category
 durations are means across all instances in that cohort. Missing composition
@@ -179,4 +197,5 @@ equal-weighted time composition, missing/zero composition, categorical bin
 boundaries, unequal group sizes, zero/extreme durations, scoped category
 distributions, and raw/Parquet parity.
 Browser verification should cover multiple span types and raw/aggregate
-sources, group/percentile/band changes, trace jumps, and desktop/mobile layout.
+sources, group/percentile/band changes, trace jumps, cohort details, recorded
+point fields, and desktop/mobile layout.

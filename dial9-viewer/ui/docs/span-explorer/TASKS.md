@@ -1,6 +1,6 @@
 # Span Explorer UI task list
 
-Status: follow-ups in progress. The original eighteen tasks are integrated and verified. The user
+Status: all twenty-four tasks are integrated and verified. The user
 authorized direct integration through subagents, coordination, QA, and demos;
 the feature remains on the shared branch for final review before main.
 Keep the task numbers stable.
@@ -18,8 +18,8 @@ The coordinator assigns batches that minimize conflicting edits.
 | Numeric | 1, 2, 6, 7, 10, 11 (rendering), 16; property controls integration | page-layout | `codex/span-ui-numeric` | Integrated; density colors, keyboard and native QA passed |
 | Default analysis | 19 | page-layout | `codex/span-ui-default-analysis` | Integrated; full UI and 16 native lifecycle checks passed |
 | True stacked distribution | 20 | property-histograms | `codex/span-ui-true-stacked` | Integrated; exact pooled counts and native one-graph replay passed |
-| Tail evidence | 21, 24 (data) | backend-analysis | `codex/span-ui-tail-evidence` | Implementing agreed CDF comparison and bounded point metadata |
-| Property interaction | 21 (rendering), 22, 23, 24 (rendering) | page-layout | `codex/span-ui-property-interaction` | Implementing property scope, details table, and point popovers |
+| Tail evidence | 21, 24 (data) | backend-analysis | `codex/span-ui-tail-evidence` | Integrated; full Rust/stress and metadata bounds/parity checks passed |
+| Property interaction | 21 (rendering), 22, 23, 24 (rendering) | page-layout | `codex/span-ui-property-interaction` | Integrated; native table/scope/point fields and resize regression passed |
 
 Design guidance: start with why the user is here, minimize the explanation a
 visual needs, and make the initial view useful for deciding where to go deeper.
@@ -153,7 +153,7 @@ feedback when work starts.
   independently normalized curves. Preserve overlay mode, colors, markers,
   exact readouts, and brushing.
 
-- [ ] **21. Make numeric ranking and tail association useful and consistent.**
+- [x] **21. Make numeric ranking and tail association useful and consistent.**
   **Feedback received:** the user agreed to a primary typical/slow distribution
   difference with coverage separate and overall correlation available on
   demand, and requested a pop-out table of details. Use the backend's exact
@@ -163,31 +163,38 @@ feedback when work starts.
   better suited to finding slow-tail leads. Discuss the proposal with the
   user; do not reinstate the discarded pairs statistic or imply causation.
 
-- [ ] **22. Remove property controls with no meaningful action.**
+- [x] **22. Remove property controls with no meaningful action.**
   A sole already-selected property name must not look like an inert button.
   Multiple-property selection must visibly change the displayed distribution.
 
-- [ ] **23. Put value-scoping controls beside the relevant property.**
+- [x] **23. Put value-scoping controls beside the relevant property.**
   Make the selectable property values apparent near the graph. Retain a
   visible way to return to all values even if the scoped property no longer
   passes the distribution screen.
 
-- [ ] **24. Show the span's recorded key/value fields on point hover.**
+- [x] **24. Show the span's recorded key/value fields on point hover.**
   Supply point metadata from the backend and show it on hover and keyboard
   focus. Keep trace navigation discoverable and metadata/readouts bounded;
   missing or truncated fields must be explicit.
 
 ## Completion evidence
 
-The combined feature passes 1,670 Rust tests and the required stress run,
-2,775 UI tests, TypeScript checks, and the Vite/release builds. Focused numeric
+The combined feature passes 1,682 Rust tests and the required stress run,
+2,805 UI tests, TypeScript checks, and the Vite, viewer embedding, and release
+builds. Focused numeric
 browser checks cover qualitative labels, explanations, shared axes, exact
 density color boundaries, keyboard trace samples, loading/failure/cancellation,
 custom brushing, and mobile layout.
 
-Final native replay passes 24 aggregate interaction checks and 26 independent
-raw/aggregate/mobile checks. Alias suppression was verified on both source
-modes; deterministic fixtures preserve rare-tail and brushed-cohort divergences.
+The latest combined replay passes 32 native aggregate checks and 37 independent
+aggregate/raw/mobile and metadata edge checks, with zero browser exceptions.
+These cover exact cohort table values, conservative ranking, sparse coverage,
+true stacked contributions, property scope and persistent reset, failure
+recovery, ordered original fields, hover/keyboard inspection, and resize
+dismissal with focus restoration. Controlled responses additionally exercise
+long strings, duplicate keys, safe literal text, and empty/omitted/unavailable
+metadata. Alias suppression was verified on both source modes; deterministic
+fixtures preserve rare-tail and brushed-cohort divergences.
 Production captures and recordings remain private, outside the repository.
 Clippy reports only the pre-existing background-symbolization warning.
 
