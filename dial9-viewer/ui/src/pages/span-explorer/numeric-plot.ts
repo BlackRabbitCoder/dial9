@@ -40,10 +40,24 @@ export function numericValueAxis(signal: TailSignal): TailValueAxis {
 }
 
 /** Count colors use the returned maximum; a sampled point never adds density. */
-export function densityColor(count: number, maxCount: number): string {
+export function densityColor(count: number, maxCount: number, selected = false): string {
   if (count <= 0) return "transparent";
   const amount = maxCount <= 1 ? 1 : Math.log1p(count) / Math.log1p(maxCount);
-  return `hsl(194 80% ${18 + amount * 42}%)`;
+  return `hsl(${selected ? 31 : 194} 80% ${18 + amount * 42}%)`;
+}
+
+/** Split at exact display positions without inventing counts within a cell. */
+export function densityCellSegments(
+  edges: readonly number[], bin: number, lowerMs: number, upperMs: number | null,
+): { start: number; end: number; selected: boolean }[] {
+  const lower = latencyToHistogramPosition(edges, lowerMs);
+  const upper = upperMs == null ? edges.length - 1 : latencyToHistogramPosition(edges, upperMs);
+  const cuts = [bin, ...[lower, upper].filter(n => n > bin && n < bin + 1), bin + 1];
+  const sorted = [...new Set(cuts)].sort((a, b) => a - b);
+  return sorted.slice(0, -1).map((start, index) => {
+    const end = sorted[index + 1]!;
+    return { start, end, selected: start >= lower && end <= upper };
+  });
 }
 
 /** One Tab entry per plot; arrow keys move through the bounded trace sample. */
@@ -117,10 +131,11 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
   const cellTooltip = (element: Element, x: number, y: number, keyboard: boolean) => {
     if (!density) return;
     const count = density.counts[y * xBins + x]!;
-    showTooltip(element, html`<strong>${number(count)} ${count === 1 ? "span" : "spans"}</strong>
+    const split = densityCellSegments(edges, x, options.boundaryMs, options.maxMs).length > 1;
+    showTooltip(element, html`<strong>${number(count)} ${count === 1 ? "span" : "spans"} in whole cell</strong>
       <span>${duration(edges[x]!)}–${duration(edges[x + 1]!)} elapsed</span>
       <span>${signal.key}: ${fieldValue(density.valueEdges[y]!, axis.unit)}–${fieldValue(density.valueEdges[y + 1]!, axis.unit)}</span>
-      <small>All loaded observations · upper bounds ${x === xBins - 1 && y === yBins - 1 ? "included" : "excluded except final bins"}</small>`,
+      <small>${split ? "Colors split at the cutoff; the count covers both parts. " : ""}Upper bounds ${x === xBins - 1 && y === yBins - 1 ? "included" : "excluded except final bins"}</small>`,
     left + (x + .5) / xBins * (right - left), py(density.valueEdges[y + 1]!), keyboard);
   };
   let keyboardCell = density ? Math.max(0, density.counts.indexOf(density.maxCount)) : 0;
@@ -147,11 +162,18 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
       ${density ? density.counts.map((count, index) => {
         if (!count) return nothing;
         const x = index % xBins, y = Math.floor(index / xBins);
+        const cellY = py(density.valueEdges[y + 1]!);
+        const cellHeight = (density.valueEdges[y + 1]! - density.valueEdges[y]!) / (axis.maximum - axis.minimum) * (bottom - top) + .1;
         return svg`<rect class="tail-density-cell" x=${left + x / xBins * (right - left)}
-          y=${py(density.valueEdges[y + 1]!)} width=${(right - left) / xBins + .1}
-          height=${(density.valueEdges[y + 1]! - density.valueEdges[y]!) / (axis.maximum - axis.minimum) * (bottom - top) + .1}
-          fill=${densityColor(count, density.maxCount)} data-count=${count}
-          @pointerenter=${(event: PointerEvent) => cellTooltip(event.currentTarget as Element, x, y, false)}></rect>`;
+          y=${cellY} width=${(right - left) / xBins}
+          height=${cellHeight} fill=${densityColor(count, density.maxCount)}
+          data-count=${count} data-cell-index=${index}
+          @pointerenter=${(event: PointerEvent) => cellTooltip(event.currentTarget as Element, x, y, false)}></rect>
+          ${densityCellSegments(edges, x, options.boundaryMs, options.maxMs).filter(segment => segment.selected).map(segment => svg`
+          <rect class="tail-density-selected" x=${left + segment.start / xBins * (right - left)}
+          y=${cellY} width=${(segment.end - segment.start) / xBins * (right - left)}
+          height=${cellHeight} fill=${densityColor(count, density.maxCount, true)}
+          data-cell-index=${index} pointer-events="none"></rect>`)}`;
       }) : nothing}
       ${[0, .5, 1].map(f => svg`<path d="M${left} ${py(axis.minimum + f * (axis.maximum - axis.minimum))}H${right}" stroke="#516475" stroke-opacity=".55" stroke-dasharray="2 3" pointer-events="none"></path>`)}
       ${ticks.map((elapsed, i) => svg`<text x=${px(elapsed)} y=${bottom + 17} text-anchor=${i === 0 ? "start" : i === ticks.length - 1 ? "end" : "middle"}>${elapsed === 0 ? "0" : axisNumber(elapsed)}</text>`)}
@@ -161,7 +183,7 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
       ${band && options.maxMs != null ? marker(options.maxMs, `End: ${duration(options.maxMs)}`, 41) : nothing}
       ${signal.points.map(([elapsed, raw, row], index) => svg`<circle class="tail-trace-point"
         cx=${px(elapsed)} cy=${py(raw * axis.multiplier)} r=${options.large ? 3 : 2.5} fill="#121c27"
-        stroke=${elapsed >= options.boundaryMs && (options.maxMs == null || elapsed <= options.maxMs) ? "#f6ae65" : "#b0bbc9"}
+        stroke=${densityColor(1, 1, elapsed >= options.boundaryMs && (options.maxMs == null || elapsed <= options.maxMs))}
         stroke-width="1.4" tabindex=${index === 0 ? "0" : "-1"} role="link"
         aria-keyshortcuts="ArrowLeft ArrowRight Home End Enter Escape"
         aria-label="${duration(elapsed)} elapsed; ${signal.key} ${fieldValue(raw * axis.multiplier, axis.unit)}. Open trace focused on this span."
@@ -189,7 +211,7 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
     <div class="tail-plot-tooltip" role="tooltip" hidden></div>
     <div class="tail-density-legend">${density ? html`
       <span>${number(density.count)} recorded spans</span>
-      <span class="tail-density-key"><i style="background:linear-gradient(to right,${densityColor(1, density.maxCount)},${densityColor(density.maxCount, density.maxCount)})"></i>1–${number(density.maxCount)} / cell</span>
+      <span class="tail-density-key"><i style="background-image:linear-gradient(to right,${densityColor(1, density.maxCount)},${densityColor(density.maxCount, density.maxCount)}),linear-gradient(to right,${densityColor(1, density.maxCount, true)},${densityColor(density.maxCount, density.maxCount, true)})"></i>1–${number(density.maxCount)} / cell</span>
       <span class="tail-trace-key">○ ${number(signal.points.length)} trace links</span>` : html`<span class="tail-trace-key">○ ${number(signal.points.length)} trace links</span>`}
     </div>
   </div>`;

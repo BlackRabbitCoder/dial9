@@ -359,7 +359,7 @@ export class SpanTailAnalysis {
         <section class="tail-numeric" aria-label="Numeric fields"><div class="tail-chart-heading"><h4>Numeric fields against elapsed time</h4>
           <span class="tail-legend"><span class="tail-dot typical"></span>Other spans <span class="tail-dot slow"></span>${band ? "Selected" : "Slow"}</span>
           <details class="tail-chart-help"><summary>Reading these charts</summary><div id="tail-chart-guide">
-            <p>Colored cells count every loaded span with this field. Hover or focus the plot and use arrow keys for cell counts. Outlined dots are trace samples; hover or focus one before opening its trace.</p>
+            <p>Blue marks other spans; orange marks ${band ? "the selection" : "slow spans"}. Brighter cells contain more observations. Colors split at the cutoff; counts cover whole cells. Hover or focus the plot and use arrow keys for counts. Outlined dots are trace samples; hover or focus one before opening its trace.</p>
             <p>X uses logarithmic elapsed time with a zero-inclusive first bin. Y is linear in the displayed unit. The backend shares limits across fields with the same unit and converts declared time units to milliseconds. Unknown units stay separate. Orange dashed lines mark the labelled slow cutoff or selection endpoints.</p>
             <p>Fields are ordered by the backend's comparison of group distributions, with limited observations last. Correlation describes a separate pattern. These are associations, not causes; click a badge for its definition and recorded counts.</p>
           </div></details>

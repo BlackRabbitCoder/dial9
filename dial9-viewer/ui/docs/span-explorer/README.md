@@ -37,6 +37,9 @@ The view starts with:
 - A **Numeric fields** section directly below the property graphs, with three
   compact plots ordered by group-distribution differences. Density cells count
   every loaded recorded value; outlined dots are trace-linked samples.
+  Blue marks other spans and orange marks slow or selected spans, including
+  exact color splits where cutoffs cross a cell. Brightness uses the same count
+  scale for both hues; split-cell tooltips retain the whole cell's count.
   Elapsed time uses a shared logarithmic axis with a zero-inclusive first bin.
   The backend shares value limits across identical units and normalizes declared
   time units to milliseconds. Unknown units remain separate. Additional fields
