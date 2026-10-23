@@ -24,6 +24,7 @@ const MAX_NUMERIC_CANDIDATES: usize = MAX_FIELDS * 4;
 const MAX_GROUP_VALUES: usize = 12;
 const HISTOGRAM_LOG_BINS: usize = 36;
 const DENSITY_VALUE_BINS: usize = 32;
+const ALIAS_MIN_COHORT_OBSERVATIONS: usize = 20;
 const PROPERTY_MIN_SAMPLES: usize = 100;
 const PROPERTY_MIN_TAIL_SAMPLES: usize = 2_000;
 const PROPERTY_MIN_COVERAGE: f64 = 0.5;
@@ -442,6 +443,13 @@ impl Collector {
                 .elapsed_ms
         };
         let median_ms = quantile(0.5);
+        // Approximate aliases must also agree in the source/group's fixed p99
+        // tail, independent of the selected percentile or brushed band.
+        let p99_ms = quantile(0.99);
+        let tail_total = rows
+            .iter()
+            .filter(|row| row.example.elapsed_ms >= p99_ms)
+            .count();
         let boundary_ms = selection.min_ms.unwrap_or_else(|| {
             if selection.max_ms.is_some() {
                 0.0
@@ -468,6 +476,10 @@ impl Collector {
             let multiplier = time_multiplier(unit.as_deref()).unwrap_or(1.0);
             let mut count = 0;
             let mut matches = 0;
+            let mut tail_count = 0;
+            let mut tail_matches = 0;
+            let mut selected_count = 0;
+            let mut selected_matches = 0;
             let mut minimum = f64::INFINITY;
             let mut maximum = f64::NEG_INFINITY;
             for row in &rows {
@@ -476,17 +488,37 @@ impl Collector {
                     let value = value * multiplier;
                     minimum = minimum.min(value);
                     maximum = maximum.max(value);
-                    matches += usize::from(
-                        (value - row.example.elapsed_ms).abs()
-                            <= 1e-6_f64.max(row.example.elapsed_ms * 0.002),
-                    );
+                    let matches_elapsed = (value - row.example.elapsed_ms).abs()
+                        <= 1e-6_f64.max(row.example.elapsed_ms * 0.002);
+                    matches += usize::from(matches_elapsed);
+                    if row.example.elapsed_ms >= p99_ms {
+                        tail_count += 1;
+                        tail_matches += usize::from(matches_elapsed);
+                    }
+                    if row.example.elapsed_ms >= boundary_ms
+                        && selection.max_ms.is_none_or(|n| row.example.elapsed_ms <= n)
+                    {
+                        selected_count += 1;
+                        selected_matches += usize::from(matches_elapsed);
+                    }
                 }
             }
+            // A true alias can have missing values. Permit ordinary jitter
+            // only when p99 and selected cohorts entirely agree, each with
+            // 20 recorded values or complete coverage of its nonempty cohort.
+            // Rare divergences in either cohort remain visible.
+            let verified = |recorded: usize, total: usize| {
+                recorded > 0 && (recorded >= ALIAS_MIN_COHORT_OBSERVATIONS || recorded == total)
+            };
+            let repeats_elapsed = matches == count
+                || (fraction(matches, count) > 0.98
+                    && verified(tail_count, tail_total)
+                    && tail_matches == tail_count
+                    && verified(selected_count, slow.len())
+                    && selected_matches == selected_count);
             if count == 0
                 || minimum == maximum
-                // A rare divergence can explain the slow tail. Only hide
-                // declared timers that repeat elapsed in every recorded value.
-                || (time_multiplier(unit.as_deref()).is_some() && matches == count)
+                || (time_multiplier(unit.as_deref()).is_some() && repeats_elapsed)
             {
                 continue;
             }
@@ -1858,6 +1890,128 @@ mod tests {
         assert_eq!(unknown.unit, None);
         assert_eq!(unknown.value_axis.unit, None);
         assert_eq!(unknown.value_axis.maximum, 1_000.0);
+    }
+
+    fn jittered_timer_rows(selection: &Selection, count: i64, jitter_count: i64) -> Collector {
+        let mut collector = Collector::default();
+        for n in 1..=count {
+            let mut row = row(0);
+            row.elapsed_ns = 100_000 + n * 100;
+            let elapsed_ms = row.elapsed_ns as f64 / 1e6;
+            let difference_ms = if n <= jitter_count { 0.005 } else { 0.0002 };
+            row.attributes = vec![
+                (
+                    "JitteredTimer".into(),
+                    (elapsed_ms - difference_ms).to_string(),
+                ),
+                ("ExactTimer".into(), elapsed_ms.to_string()),
+                ("UnknownElapsed".into(), elapsed_ms.to_string()),
+            ];
+            row.attribute_units = vec![
+                ("JitteredTimer".into(), "ms".into()),
+                ("ExactTimer".into(), "ms".into()),
+            ];
+            if n % 37 == 0 {
+                row.attributes.retain(|(key, _)| key != "ExactTimer");
+            }
+            collector.push(row, selection, 0, "");
+        }
+        collector
+    }
+
+    #[rstest]
+    #[case("", 10_000, 20, false)]
+    #[case("slow_percentile=95", 10_000, 20, false)]
+    // The selected band contains ordinary jitter.
+    #[case("min_span_ns=100000&max_span_ns=105000", 10_000, 20, true)]
+    // A completely recorded five-value selected cohort has no missing evidence.
+    #[case("min_span_ns=1099600", 10_000, 20, false)]
+    // The completely recorded p99 tail has only 11 values.
+    #[case("slow_percentile=50", 1_000, 3, false)]
+    // An empty selected cohort cannot confirm approximate redundancy.
+    #[case("min_span_ns=2000000", 10_000, 20, true)]
+    fn ordinary_jitter_is_hidden_only_with_verified_tail_and_selected_cohorts(
+        #[case] query: &str,
+        #[case] count: i64,
+        #[case] jitter_count: i64,
+        #[case] visible: bool,
+    ) {
+        let selection = params(query).selection().unwrap();
+        let collector = jittered_timer_rows(&selection, count, jitter_count);
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(
+            report.signals.iter().any(|s| s.key == "JitteredTimer"),
+            visible,
+        );
+        // Missing values do not invalidate a true alias's all-match path.
+        assert!(report.signals.iter().all(|s| s.key != "ExactTimer"));
+        let unknown = report
+            .signals
+            .iter()
+            .find(|s| s.key == "UnknownElapsed")
+            .unwrap();
+        assert_eq!(unknown.value_axis.unit, None);
+    }
+
+    #[test]
+    fn a_verified_brush_does_not_hide_divergence_in_the_fixed_global_p99_tail() {
+        let selection = params("min_span_ns=110000&max_span_ns=130000")
+            .selection()
+            .unwrap();
+        let mut collector = jittered_timer_rows(&selection, 10_000, 0);
+        for (index, row) in collector.rows.iter_mut().enumerate() {
+            if index >= 9_900 {
+                row.numeric
+                    .insert("JitteredTimer".into(), row.example.elapsed_ms * 0.5);
+            }
+        }
+        let report = collector.report(&selection).unwrap();
+        assert!(report.slow_count >= ALIAS_MIN_COHORT_OBSERVATIONS);
+        assert!(report.signals.iter().any(|s| s.key == "JitteredTimer"));
+    }
+
+    #[test]
+    fn missing_tail_values_do_not_confirm_an_approximate_elapsed_alias() {
+        let selection = params("slow_percentile=95").selection().unwrap();
+        let mut collector = jittered_timer_rows(&selection, 10_000, 20);
+        for (index, row) in collector.rows.iter_mut().enumerate() {
+            if index >= 9_899 {
+                row.numeric.remove("JitteredTimer");
+            }
+        }
+        let report = collector.report(&selection).unwrap();
+        let timer = report
+            .signals
+            .iter()
+            .find(|s| s.key == "JitteredTimer")
+            .unwrap();
+        assert!(timer.slow_count >= ALIAS_MIN_COHORT_OBSERVATIONS);
+        assert_eq!(timer.density.as_ref().unwrap().count, 9_899);
+    }
+
+    #[rstest]
+    #[case("slow_percentile=50", 1_000, 3)]
+    #[case("min_span_ns=1099600", 10_000, 20)]
+    fn incomplete_small_cohorts_do_not_confirm_an_approximate_elapsed_alias(
+        #[case] query: &str,
+        #[case] count: i64,
+        #[case] jitter_count: i64,
+    ) {
+        let selection = params(query).selection().unwrap();
+        let mut collector = jittered_timer_rows(&selection, count, jitter_count);
+        let complete = collector.report(&selection).unwrap();
+        assert!(complete.signals.iter().all(|s| s.key != "JitteredTimer"));
+        // One missing value makes either the 11-value p99 tail or five-value
+        // selected cohort incomplete. Both remain below the 20-value guard.
+        collector
+            .rows
+            .last_mut()
+            .unwrap()
+            .numeric
+            .remove("JitteredTimer");
+        let incomplete = collector.report(&selection).unwrap();
+        assert!(incomplete.signals.iter().any(|s| s.key == "JitteredTimer"));
+        assert!(incomplete.signals.iter().all(|s| s.key != "ExactTimer"));
     }
 
     #[test]
