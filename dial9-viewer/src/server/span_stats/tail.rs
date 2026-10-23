@@ -344,6 +344,7 @@ fn numeric(value: &str) -> Option<f64> {
 
 /// Exact cohort CDF difference with the same descriptive sampling margin as
 /// property screening. Independence is assumed; this is not a p-value or cause.
+/// Both cohorts must be sorted in ascending value order.
 fn numeric_tail_difference(
     typical: &[f64],
     slow: &[f64],
@@ -827,11 +828,11 @@ impl Collector {
         signals.sort_by(|a, b| {
             quality(b)
                 .cmp(&quality(a))
-                .then_with(|| {
-                    b.tail_difference
-                        .as_ref()
-                        .map_or(0.0, |d| d.lower_bound)
-                        .total_cmp(&a.tail_difference.as_ref().map_or(0.0, |d| d.lower_bound))
+                .then_with(|| match (&a.tail_difference, &b.tail_difference) {
+                    (Some(a), Some(b)) => b.lower_bound.total_cmp(&a.lower_bound),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
                 })
                 .then_with(|| a.key.cmp(&b.key))
         });
@@ -1826,6 +1827,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unavailable_comparison_is_not_ranked_as_an_observed_zero_difference() {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for n in 1..=100 {
+            let mut row = row(n);
+            row.attributes = vec![("ZAvailable".into(), (n % 2).to_string())];
+            row.attribute_units.clear();
+            if n <= 50 {
+                row.attributes
+                    .push(("AUnavailable".into(), (n % 2).to_string()));
+            }
+            collector.push(row, &selection, 0, "/source");
+        }
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(report.signals[0].key, "ZAvailable");
+        let available = report.signals[0].tail_difference.as_ref().unwrap();
+        assert_eq!(available.cdf_gap, 0.0);
+        assert_eq!(available.lower_bound, 0.0);
+        assert_eq!(report.signals[1].key, "AUnavailable");
+        assert!(report.signals[1].tail_difference.is_none());
+        assert_eq!(report.signals[1].slow_count, 0);
+    }
+
+    #[test]
     fn numeric_cohort_summaries_use_every_recorded_value_in_original_units() {
         let selection = params("").selection().unwrap();
         let mut collector = Collector::default();
@@ -1973,6 +1998,17 @@ mod tests {
             })
             .sum();
         assert!(emitted_bytes <= MAX_REPORT_ATTRIBUTE_BYTES);
+    }
+
+    #[test]
+    fn no_included_pairs_can_still_have_recorded_fields_omitted_by_limits() {
+        let mut report = metadata_report();
+        let mut metadata = MetadataHydrator::new(&report);
+        let pairs = vec![("TooBig".into(), "x".repeat(MAX_EXAMPLE_ATTRIBUTE_BYTES))];
+        metadata.record(0, "1", 1, 1_000_001, &pairs).unwrap();
+        metadata.finish(&mut report);
+        assert_eq!(report.examples[0].attributes, Some(Vec::new()));
+        assert_eq!(report.examples[0].attributes_omitted, Some(1));
     }
 
     #[rstest]
