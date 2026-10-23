@@ -17,9 +17,9 @@ The coordinator assigns batches that minimize conflicting edits.
 | Histograms | 13, 14, 17, 18 | property-histograms | `codex/span-ui-histograms` | Integrated; component and mobile QA passed |
 | Numeric | 1, 2, 6, 7, 10, 11 (rendering), 16; property controls integration | page-layout | `codex/span-ui-numeric` | Integrated; density colors, keyboard and native QA passed |
 | Default analysis | 19 | page-layout | `codex/span-ui-default-analysis` | Integrated; full UI and 16 native lifecycle checks passed |
-| True stacked distribution | 20 | property-histograms | `codex/span-ui-true-stacked` | Assigned; cumulative layers on one graph |
-| Tail evidence | 21, 24 (data) | backend-analysis | `codex/span-ui-tail-evidence` | Investigating metric with user discussion; point attributes assigned |
-| Property interaction | 22, 23, 24 (rendering) | page-layout | Pending task 19 integration | Queued; shared controls and point tooltips |
+| True stacked distribution | 20 | property-histograms | `codex/span-ui-true-stacked` | Integrated; exact pooled counts and native one-graph replay passed |
+| Tail evidence | 21, 24 (data) | backend-analysis | `codex/span-ui-tail-evidence` | Implementing agreed CDF comparison and bounded point metadata |
+| Property interaction | 21 (rendering), 22, 23, 24 (rendering) | page-layout | `codex/span-ui-property-interaction` | Implementing property scope, details table, and point popovers |
 
 Design guidance: start with why the user is here, minimize the explanation a
 visual needs, and make the initial view useful for deciding where to go deeper.
@@ -147,13 +147,17 @@ feedback when work starts.
   must not issue duplicate requests or retry a cancelled or failed analysis.
   Preserve explicit cancellation and retry, and make initial loading visible.
 
-- [ ] **20. Stack categorical contributions on one graph.**
+- [x] **20. Stack categorical contributions on one graph.**
   In stacked mode, draw cumulative layers whose sum is the total recorded
   distribution. Weight each value by its exact population instead of summing
   independently normalized curves. Preserve overlay mode, colors, markers,
   exact readouts, and brushing.
 
 - [ ] **21. Make numeric ranking and tail association useful and consistent.**
+  **Feedback received:** the user agreed to a primary typical/slow distribution
+  difference with coverage separate and overall correlation available on
+  demand, and requested a pop-out table of details. Use the backend's exact
+  recorded-value CDF difference with a descriptive sampling allowance.
   Explain why ranking can differ from the overall-correlation badge. Inspect
   actual recorded coverage and tail observations before proposing a metric
   better suited to finding slow-tail leads. Discuss the proposal with the
