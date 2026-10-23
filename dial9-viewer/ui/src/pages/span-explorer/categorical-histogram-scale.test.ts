@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   categoryBinCount,
+  categoricalHistogramStack,
   histogramBrushRange,
   histogramMarkerRows,
   histogramPositionToLatency,
   latencyToHistogramPosition,
 } from "./categorical-histogram-scale.js";
+import type { CategoricalHistogram } from "../../lib/trace/span-tail-analysis.js";
 
 const edges = [0, .01, .1, 1, 10, 100];
 
@@ -50,13 +52,80 @@ describe("Property histogram raw counts", () => {
     expect(categoryBinCount({ ...value, binCounts: [0, 3] }, 1)).toBe(3);
   });
 
-  it("recovers integer counts from unrounded shares in cached older reports", () => {
-    expect(categoryBinCount(value, 0)).toBe(1);
-    expect(categoryBinCount(value, 1)).toBe(2);
-    expect(categoryBinCount({ ...value, count: 1_000_000, shares: [123457 / 1_000_000] }, 0)).toBe(123457);
+  it("does not invent exact counts from percentages in cached older reports", () => {
+    expect(categoryBinCount(value, 0)).toBeNull();
+    expect(categoryBinCount(value, 1)).toBeNull();
   });
 
   it("does not invent a count for a missing bin", () => {
     expect(categoryBinCount(value, 2)).toBeNull();
+  });
+});
+
+describe("Property histogram pooled stack", () => {
+  const histogram = (): CategoricalHistogram => ({
+    key: "Cache",
+    count: 100,
+    missingCount: 0,
+    binEdgesMs: [0, 1, 10],
+    maxShare: 1,
+    values: [
+      { value: "hit", count: 90, binCounts: [45, 45], shares: [.5, .5], medianMs: 1, p99Ms: 9 },
+      { value: "miss", count: 10, binCounts: [10, 0], shares: [1, 0], medianMs: .1, p99Ms: .9 },
+    ],
+  });
+
+  it("weights unequal populations so layers sum to the total distribution", () => {
+    const stack = categoricalHistogramStack(histogram());
+    expect(stack.available).toBe(true);
+    if (!stack.available) throw new Error(stack.reason);
+    expect(stack.population).toBe(100);
+    expect(stack.totalCounts).toEqual([55, 45]);
+    expect(stack.totalShares).toEqual([.55, .45]);
+    expect(stack.layers[0]).toEqual({ lower: [0, 0], upper: [.45, .45] });
+    expect(stack.layers[1]).toEqual({ lower: [.45, .45], upper: [.55, .45] });
+    expect(stack.totalShares.reduce((sum, share) => sum + share, 0)).toBe(1);
+    expect(stack.maximum).toBe(.55);
+  });
+
+  it("excludes missing values from the explicitly recorded population", () => {
+    const stack = categoricalHistogramStack({ ...histogram(), missingCount: 500 });
+    expect(stack.available).toBe(true);
+    if (!stack.available) throw new Error(stack.reason);
+    expect(stack.population).toBe(100);
+    expect(stack.totalShares).toEqual([.55, .45]);
+  });
+
+  it("does not fabricate an Other distribution for omitted values", () => {
+    expect(categoricalHistogramStack({ ...histogram(), count: 120 })).toEqual({
+      available: false, reason: "incomplete-values",
+    });
+  });
+
+  it("rejects populations that exceed the reported total", () => {
+    expect(categoricalHistogramStack({ ...histogram(), count: 99 })).toEqual({
+      available: false, reason: "invalid-counts",
+    });
+  });
+
+  it("requires exact bin counts in cached older reports", () => {
+    const legacy = histogram();
+    delete legacy.values[0]!.binCounts;
+    expect(categoricalHistogramStack(legacy)).toEqual({
+      available: false, reason: "missing-counts",
+    });
+  });
+
+  it.each([
+    ["missing bin", [90]],
+    ["negative bin", [-1, 91]],
+    ["fractional bin", [45.5, 44.5]],
+    ["wrong total", [45, 44]],
+  ])("rejects %s instead of drawing false weights", (_name, counts) => {
+    const invalid = histogram();
+    invalid.values[0]!.binCounts = counts as number[];
+    expect(categoricalHistogramStack(invalid)).toEqual({
+      available: false, reason: "invalid-counts",
+    });
   });
 });

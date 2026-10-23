@@ -1,4 +1,4 @@
-import type { CategoryLatency } from "../../lib/trace/span-tail-analysis.js";
+import type { CategoricalHistogram, CategoryLatency } from "../../lib/trace/span-tail-analysis.js";
 
 export interface HistogramRange {
   minMs: number | null;
@@ -59,18 +59,89 @@ export function histogramBrushRange(
   };
 }
 
-/**
- * New reports carry exact bin counts. The previous wire format contains their
- * unrounded ratio, so multiplication recovers counts in cached older reports.
- */
+/** Missing cached bin counts remain unavailable rather than reconstructed. */
 export function categoryBinCount(
   value: CategoryLatency & { binCounts?: readonly number[] },
   bin: number,
 ): number | null {
   const exact = value.binCounts?.[bin];
-  if (exact != null) return exact;
-  const share = value.shares[bin];
-  return share == null ? null : Math.round(share * value.count);
+  return exact != null && Number.isSafeInteger(exact) && exact >= 0 ? exact : null;
+}
+
+export type CategoricalStack =
+  | {
+    available: true;
+    population: number;
+    totalCounts: number[];
+    totalShares: number[];
+    layers: { lower: number[]; upper: number[] }[];
+    maximum: number;
+  }
+  | {
+    available: false;
+    reason: "missing-counts" | "incomplete-values" | "invalid-counts";
+  };
+
+/**
+ * Stack exact backend bin counts as shares of the complete recorded-value
+ * population. Missing property values are outside that population.
+ */
+export function categoricalHistogramStack(histogram: CategoricalHistogram): CategoricalStack {
+  const bins = histogram.binEdgesMs.length - 1;
+  if (!Number.isSafeInteger(histogram.count) || histogram.count <= 0 || bins < 1) {
+    return { available: false, reason: "invalid-counts" };
+  }
+  if (histogram.values.some(value => value.binCounts == null)) {
+    return { available: false, reason: "missing-counts" };
+  }
+  if (histogram.values.some(value =>
+    !Number.isSafeInteger(value.count) || value.count < 0
+    || value.binCounts!.length !== bins
+    || value.binCounts!.some(count => !Number.isSafeInteger(count) || count < 0)
+    || value.binCounts!.reduce((total, count) => total + count, 0) !== value.count
+  )) {
+    return { available: false, reason: "invalid-counts" };
+  }
+  const representedCount = histogram.values.reduce((total, value) => total + value.count, 0);
+  if (representedCount < histogram.count) {
+    // There are no bin counts for an omitted "Other" population.
+    return { available: false, reason: "incomplete-values" };
+  }
+  if (representedCount > histogram.count) {
+    return { available: false, reason: "invalid-counts" };
+  }
+  let cumulative = Array<number>(bins).fill(0);
+  const layers = histogram.values.map(value => {
+    const lower = cumulative.map(count => count / histogram.count);
+    cumulative = cumulative.map((count, bin) => count + value.binCounts![bin]!);
+    return { lower, upper: cumulative.map(count => count / histogram.count) };
+  });
+  const totalShares = cumulative.map(count => count / histogram.count);
+  return {
+    available: true,
+    population: histogram.count,
+    totalCounts: cumulative,
+    totalShares,
+    layers,
+    maximum: Math.max(...totalShares),
+  };
+}
+
+/** Close each stepped area along its own cumulative lower boundary. */
+export function histogramStackArea(
+  lower: readonly number[],
+  upper: readonly number[],
+  maximum: number,
+): string {
+  let path = `M0 ${1 - upper[0]! / maximum}`;
+  upper.forEach((share, bin) => {
+    path += `V${1 - share / maximum}H${bin + 1}`;
+  });
+  path += `V${1 - lower.at(-1)! / maximum}`;
+  for (let bin = lower.length - 1; bin >= 0; bin--) {
+    path += `V${1 - lower[bin]! / maximum}H${bin}`;
+  }
+  return `${path}Z`;
 }
 
 /** Keep same-position percentile labels distinguishable in narrow charts. */
