@@ -1,6 +1,6 @@
 # Span Explorer UI task list
 
-Status: follow-up in progress. The original eighteen tasks are integrated and verified. The user
+Status: follow-ups in progress. The original eighteen tasks are integrated and verified. The user
 authorized direct integration through subagents, coordination, QA, and demos;
 the feature remains on the shared branch for final review before main.
 Keep the task numbers stable.
@@ -17,6 +17,9 @@ The coordinator assigns batches that minimize conflicting edits.
 | Histograms | 13, 14, 17, 18 | property-histograms | `codex/span-ui-histograms` | Integrated; component and mobile QA passed |
 | Numeric | 1, 2, 6, 7, 10, 11 (rendering), 16; property controls integration | page-layout | `codex/span-ui-numeric` | Integrated; density colors, keyboard and native QA passed |
 | Default analysis | 19 | page-layout | `codex/span-ui-default-analysis` | Assigned; automatic initial and changed-selection loading |
+| True stacked distribution | 20 | property-histograms | `codex/span-ui-true-stacked` | Assigned; cumulative layers on one graph |
+| Tail evidence | 21, 24 (data) | backend-analysis | `codex/span-ui-tail-evidence` | Investigating metric with user discussion; point attributes assigned |
+| Property interaction | 22, 23, 24 (rendering) | page-layout | Pending task 19 integration | Queued; shared controls and point tooltips |
 
 Design guidance: start with why the user is here, minimize the explanation a
 visual needs, and make the initial view useful for deciding where to go deeper.
@@ -136,13 +139,41 @@ Coordinate tasks 13, 17, and 18
 because they affect the same histogram component. Task 16 requires user
 feedback when work starts.
 
-## Completion evidence
+## Follow-up feedback
 
 - [ ] **19. Open the analysis by default for the selected span.**
   Start the backend comparison automatically on initial selection and when
   the selected span or source changes. Repeated rendering of the same context
   must not issue duplicate requests or retry a cancelled or failed analysis.
   Preserve explicit cancellation and retry, and make initial loading visible.
+
+- [ ] **20. Stack categorical contributions on one graph.**
+  In stacked mode, draw cumulative layers whose sum is the total recorded
+  distribution. Weight each value by its exact population instead of summing
+  independently normalized curves. Preserve overlay mode, colors, markers,
+  exact readouts, and brushing.
+
+- [ ] **21. Make numeric ranking and tail association useful and consistent.**
+  Explain why ranking can differ from the overall-correlation badge. Inspect
+  actual recorded coverage and tail observations before proposing a metric
+  better suited to finding slow-tail leads. Discuss the proposal with the
+  user; do not reinstate the discarded pairs statistic or imply causation.
+
+- [ ] **22. Remove property controls with no meaningful action.**
+  A sole already-selected property name must not look like an inert button.
+  Multiple-property selection must visibly change the displayed distribution.
+
+- [ ] **23. Put value-scoping controls beside the relevant property.**
+  Make the selectable property values apparent near the graph. Retain a
+  visible way to return to all values even if the scoped property no longer
+  passes the distribution screen.
+
+- [ ] **24. Show the span's recorded key/value fields on point hover.**
+  Supply point metadata from the backend and show it on hover and keyboard
+  focus. Keep trace navigation discoverable and metadata/readouts bounded;
+  missing or truncated fields must be explicit.
+
+## Completion evidence
 
 The combined feature passes 1,670 Rust tests and the required stress run,
 2,764 UI tests, TypeScript checks, and the Vite/release builds. Focused numeric
