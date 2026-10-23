@@ -1,6 +1,7 @@
 //! `Dial9Allocator<A>` — a `GlobalAlloc` wrapper that feeds dial9's memory
 //! profiler.
 
+use super::profiler::{ACTIVE, MemoryProfilerInner};
 use std::alloc::{GlobalAlloc, Layout};
 
 /// Generic `GlobalAlloc` wrapper that feeds dial9's memory profiler.
@@ -41,10 +42,12 @@ use std::alloc::{GlobalAlloc, Layout};
 /// # Cost
 ///
 /// Until [`MemoryProfiler::install()`](super::MemoryProfiler::install) has
-/// been called, this is a zero-cost passthrough (~1 ns Acquire load +
-/// null check). After install, ~99.9% of allocations take the unsampled
-/// fast path (~5 ns). The remaining ~0.1% of sampled allocations pay
-/// ~1 µs for stack capture and event emission.
+/// been called, this checks the profiler state and forwards directly to the
+/// inner allocator. The profiling path's stack frame stays in a separate
+/// function. After install, allocations check a per-thread sampling counter;
+/// stack capture and event emission run separately only when a sample fires.
+/// Liveset tracking adds a lookup on each free. Costs depend on the allocator,
+/// allocation sizes, and configured sampling interval.
 #[derive(Debug)]
 pub struct Dial9Allocator<A = std::alloc::System>(A);
 
@@ -63,86 +66,124 @@ impl<A: GlobalAlloc> Dial9Allocator<A> {
     pub const fn new(inner: A) -> Self {
         Self(inner)
     }
-}
 
-// SAFETY: forwarding to the inner `GlobalAlloc` impl. The `unsafe` contract on
-// each method is exactly the same as the inner allocator's. The hook
-// invocations are allocation-free by construction — see
-// [`crate::memory_profiling::hook`] module docs and design §6.
-unsafe impl<A: GlobalAlloc> GlobalAlloc for Dial9Allocator<A> {
-    #[inline]
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+    // Keep enabled dispatch separate so inactive calls can tail-call the inner
+    // allocator. These helpers are hot after install; only actual samples are cold.
+    #[inline(never)]
+    unsafe fn alloc_profiled(&self, inner: &MemoryProfilerInner, layout: Layout) -> *mut u8 {
         // SAFETY: `layout` validity contract forwarded to the inner allocator.
         let ptr = unsafe { self.0.alloc(layout) };
-        // SAFETY: `on_alloc` is allocation-free (see hook module docs) — it
-        // performs no allocations, takes no locks, and only accesses lock-free
-        // data structures. `ptr` is non-null (checked below) and valid.
-        if !ptr.is_null()
-            && let Some(inner) = crate::memory_profiling::profiler::ACTIVE.get()
-        {
+        // SAFETY: the hook guards reentrant liveset operations (see hook module
+        // docs). `ptr` is non-null (checked below) and valid.
+        if !ptr.is_null() {
             crate::memory_profiling::hook::on_alloc(inner, ptr, layout.size());
         }
         ptr
     }
 
-    #[inline]
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `on_dealloc` is allocation-free (see hook module docs) — it
-        // performs no allocations, takes no locks, and only accesses lock-free
-        // data structures. `ptr` is valid per the `dealloc` contract.
-        if let Some(inner) = crate::memory_profiling::profiler::ACTIVE.get() {
-            crate::memory_profiling::hook::on_dealloc(inner, ptr, layout.size());
-        }
+    #[inline(never)]
+    unsafe fn dealloc_profiled(&self, inner: &MemoryProfilerInner, ptr: *mut u8, layout: Layout) {
+        // SAFETY: the hook guards reentrant liveset operations (see hook module
+        // docs). `ptr` is valid per the `dealloc` contract.
+        crate::memory_profiling::hook::on_dealloc(inner, ptr, layout.size());
         // SAFETY: `ptr`/`layout` validity contract forwarded to the inner
         // allocator.
         unsafe { self.0.dealloc(ptr, layout) };
     }
 
-    #[inline]
-    unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
-        let active = crate::memory_profiling::profiler::ACTIVE.get();
+    #[inline(never)]
+    unsafe fn realloc_profiled(
+        &self,
+        inner: &MemoryProfilerInner,
+        ptr: *mut u8,
+        old_layout: Layout,
+        new_size: usize,
+    ) -> *mut u8 {
         // The old block's liveset entry must come out BEFORE forwarding to
         // the inner allocator: `self.0.realloc` may release `ptr` internally,
         // after which another thread can be handed that address and overwrite
         // the entry. Resolving it afterwards would pop the new allocation's
         // metadata instead. See `hook::ReallocState`.
         //
-        // SAFETY: `on_realloc_before` is allocation-free (see hook module
-        // docs) — it performs no allocations and only accesses lock-free data
-        // structures. `ptr` is valid per the `realloc` contract.
-        let state =
-            active.map(|inner| crate::memory_profiling::hook::on_realloc_before(inner, ptr));
+        // SAFETY: the hook guards reentrant liveset operations (see hook module
+        // docs). `ptr` is valid per the `realloc` contract.
+        let state = crate::memory_profiling::hook::on_realloc_before(inner, ptr);
         // SAFETY: `ptr`/`old_layout`/`new_size` validity contract forwarded
         // to the inner allocator.
         let new_ptr = unsafe { self.0.realloc(ptr, old_layout, new_size) };
-        if let (Some(inner), Some(state)) = (active, state) {
-            // SAFETY: both hooks are allocation-free (see hook module docs).
-            if new_ptr.is_null() {
-                // Realloc failed: the old pointer is still live and must not
-                // be recorded as freed (design §3, "realloc handling").
-                crate::memory_profiling::hook::on_realloc_failed(inner, ptr, state);
-            } else {
-                crate::memory_profiling::hook::on_realloc_success(
-                    inner, ptr, state, new_ptr, new_size,
-                );
-            }
+        // SAFETY: both hooks preserve the reentrancy guard (see hook module docs).
+        if new_ptr.is_null() {
+            // Realloc failed: the old pointer is still live and must not
+            // be recorded as freed (design §3, "realloc handling").
+            crate::memory_profiling::hook::on_realloc_failed(inner, ptr, state);
+        } else {
+            crate::memory_profiling::hook::on_realloc_success(inner, ptr, state, new_ptr, new_size);
         }
         new_ptr
     }
 
-    #[inline]
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+    #[inline(never)]
+    unsafe fn alloc_zeroed_profiled(&self, inner: &MemoryProfilerInner, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded to the inner allocator.
         let ptr = unsafe { self.0.alloc_zeroed(layout) };
-        // SAFETY: `on_alloc` is allocation-free (see hook module docs) — it
-        // performs no allocations, takes no locks, and only accesses lock-free
-        // data structures. `ptr` is non-null (checked below) and valid.
-        if !ptr.is_null()
-            && let Some(inner) = crate::memory_profiling::profiler::ACTIVE.get()
-        {
+        // SAFETY: the hook guards reentrant liveset operations (see hook module
+        // docs). `ptr` is non-null (checked below) and valid.
+        if !ptr.is_null() {
             crate::memory_profiling::hook::on_alloc(inner, ptr, layout.size());
         }
         ptr
+    }
+}
+
+// SAFETY: forwarding to the inner `GlobalAlloc` impl. The `unsafe` contract on
+// each method is exactly the same as the inner allocator's. Hooks preserve
+// their reentrancy guards across liveset operations — see
+// [`crate::memory_profiling::hook`] module docs and design §6.
+unsafe impl<A: GlobalAlloc> GlobalAlloc for Dial9Allocator<A> {
+    #[inline]
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Sample profiler state at entry so the inactive path can tail-call the
+        // inner allocator without retaining its result for a later hook.
+        match ACTIVE.get() {
+            // SAFETY: valid layout; the helper preserves the hook contract.
+            Some(inner) => unsafe { self.alloc_profiled(inner, layout) },
+            // SAFETY: forwarded from the caller.
+            None => unsafe { self.0.alloc(layout) },
+        }
+    }
+
+    // Inlining this dispatch regressed the demo-trace decoder on x86_64.
+    #[inline(never)]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        match ACTIVE.get() {
+            // SAFETY: ptr/layout are valid; the hook runs before the inner free.
+            Some(inner) if inner.liveset.is_some() => unsafe {
+                self.dealloc_profiled(inner, ptr, layout)
+            },
+            // SAFETY: forwarded from the caller; frees need no hook without a liveset.
+            _ => unsafe { self.0.dealloc(ptr, layout) },
+        }
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+        match ACTIVE.get() {
+            // SAFETY: the helper removes liveset metadata before realloc and
+            // restores it on failure, while forwarding the caller's contract.
+            Some(inner) => unsafe { self.realloc_profiled(inner, ptr, old_layout, new_size) },
+            // SAFETY: forwarded from the caller.
+            None => unsafe { self.0.realloc(ptr, old_layout, new_size) },
+        }
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        match ACTIVE.get() {
+            // SAFETY: valid layout; the helper preserves the hook contract.
+            Some(inner) => unsafe { self.alloc_zeroed_profiled(inner, layout) },
+            // SAFETY: forwarded from the caller.
+            None => unsafe { self.0.alloc_zeroed(layout) },
+        }
     }
 }
 
