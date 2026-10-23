@@ -116,6 +116,9 @@ describe("Span Explorer investigation", () => {
     const rendered = text(latest());
     expect(rendered.indexOf("cache_hit")).toBeLessThan(rendered.indexOf("Numeric fields against elapsed time"));
     expect(rendered).not.toContain("tail-chart-tabs");
+    expect(rendered).toContain("Property histogram view");
+    expect(rendered).toContain("Displayed property");
+    expect(rendered).not.toContain("pairs");
     expect(classToggle).toHaveBeenLastCalledWith("tail-analysis-ready", true);
   });
 
@@ -125,7 +128,7 @@ describe("Span Explorer investigation", () => {
     click(latest(), "Analyse source traces")();
     await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
     expect(text(latest())).toContain('aria-label="Numeric fields"');
-    expect(text(latest())).not.toContain('aria-label="Properties"');
+    expect(text(latest())).not.toContain('tail-property-heading');
   });
 
   it("makes previous graphs inert while recomputing and clears them on failure", async () => {

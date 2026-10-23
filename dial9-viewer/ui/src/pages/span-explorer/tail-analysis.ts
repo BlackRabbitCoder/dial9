@@ -14,7 +14,7 @@ import type {
 } from "../../lib/trace/span-tail-analysis.js";
 import { buildApiUrl, type PageScope, type ViewState } from "./scope.js";
 import { fetchRawTraceBytes } from "./raw.js";
-import { renderCategoricalHistogram } from "./categorical-histograms.js";
+import { renderPropertyHistograms } from "./categorical-histograms.js";
 import "./tail-analysis.css";
 
 interface Context {
@@ -230,8 +230,6 @@ export class SpanTailAnalysis {
   private signal(signal: TailSignal, i: number) {
     const band = this.selection.minMs != null || this.selection.maxMs != null;
     const limited = Math.min(signal.typicalCount, signal.slowCount) < 20 || Math.min(signal.typicalCoverage, signal.slowCoverage) < 0.5;
-    const probability = signal.separation == null ? null : (Math.abs(signal.separation) + 1) / 2;
-    const score = probability == null ? "unavailable" : probability < 1 && probability > .999 ? ">99.9%" : percent(probability);
     return html`<article class="tail-field">
       <div class="tail-field-heading"><h4><span class="tail-rank">${i + 1}</span>${signal.key}</h4>
         <button class="tail-expand" aria-label="Enlarge ${signal.key} plot" title="Enlarge plot" @click=${() => this.expand(signal)}>⤢</button>
@@ -240,7 +238,6 @@ export class SpanTailAnalysis {
         <span><span class="tail-dot slow"></span>${band ? "Selected" : "Slow"} <strong>${value(signal.slow, signal.unit)}</strong></span></div>
       ${this.plot(signal)}
       <div class="tail-signal-stats">
-        <span title="How often a compared-span value is higher or lower than a typical-span value, with ties split equally. See Reading these charts.">${signal.separation == null ? "No comparison" : html`${signal.separation >= 0 ? "Higher" : "Lower"} in ${band ? "selection" : "slow"} <strong>${score}</strong> pairs`}</span>
         <span title="Spearman rank correlation: larger values and longer spans rising together. +1 rises together; 0 has no consistent monotonic trend; −1 moves in opposite directions. Based on up to 2,048 sampled observations.">Spearman <strong>${number(signal.correlation, 2)}</strong></span>
       </div>
       <div class="tail-signal-meta">
@@ -274,7 +271,6 @@ export class SpanTailAnalysis {
     const changes = r?.mixChanges ?? [];
     const expanded = r?.signals.find(s => s.key === this.expandedKey);
     const histograms = r?.histograms ?? [];
-    const histogram = histograms.find(h => h.key === this.categoryKey) ?? histograms[0];
     this.container.closest(".detail-panel")?.classList.toggle("tail-analysis-ready", r != null);
     render(html`<section class="span-tail-analysis" aria-busy=${this.busy}>
       <div class="tail-heading"><h3>How are slow spans different?</h3>
@@ -313,17 +309,18 @@ export class SpanTailAnalysis {
         ${changes.length && !this.selection.groupKey ? html`<div class="tail-mix"><strong>Mix shift</strong>
           ${changes.map(g => html`<span title=${g.key}>${g.value} ${percent(g.typical)} → ${percent(g.slow)}</span>`)}
           <span class="tail-muted">Compare the same group above.</span></div>` : nothing}
-        ${histogram ? html`<section class="tail-properties" aria-label="Properties"><div class="tail-chart-heading"><h4>Latency by property</h4>
-          ${histograms.length > 1 ? html`<select class="tail-category-select" aria-label="Categorical field" .value=${histogram.key}
-            @change=${(e: Event) => { this.categoryKey = (e.target as HTMLSelectElement).value; this.draw(); }}>
-            ${histograms.map(h => html`<option value=${h.key}>${h.key}</option>`)}
-          </select>` : html`<h4 class="tail-category-field-name">${histogram.key}</h4>`}
-        </div>${renderCategoricalHistogram(histogram)}</section>` : nothing}
+        ${renderPropertyHistograms(histograms, {
+          selectedKey: this.categoryKey,
+          mode: this.categoryMode,
+          selection: band ? { minMs: this.selection.minMs, maxMs: this.selection.maxMs } : null,
+          onSelectProperty: key => { this.categoryKey = key; this.draw(); },
+          onModeChange: mode => { this.categoryMode = mode; this.draw(); },
+          onSelectRange: (minMs, maxMs) => this.context?.onBand(minMs, maxMs),
+        })}
         <section class="tail-numeric" aria-label="Numeric fields"><div class="tail-chart-heading"><h4>Numeric fields against elapsed time</h4>
           <span class="tail-legend"><span class="tail-dot typical"></span>Other spans <span class="tail-dot slow"></span>${band ? "Selected" : "Slow"}</span>
           <details class="tail-chart-help"><summary>Reading these charts</summary><div id="tail-chart-guide">
             <p>Each dot is one span; click it to inspect the trace. X is total elapsed time in milliseconds. Y is the field value in its recorded unit. Orange dashed lines mark the labelled percentile cutoff, or the start and end of a custom selection. Axes are linear; all panels share the X scale. Up to 330 sampled points are drawn per field.</p>
-            <p><strong>Higher/lower</strong> is the fraction of ${band ? "selected" : "slow"}-versus-typical pairs in that direction, splitting ties equally. Near 50% means similar distributions; near 100% means strong separation. This score orders the fields, with low coverage and repeated latency placed last.</p>
             <p><strong>Spearman</strong> compares the ordering of field values and elapsed time: +1 rises together, 0 has no consistent monotonic trend, −1 moves in opposite directions. It uses up to 2,048 observations sampled across latency ranks. Near zero can still hide separate clusters.</p>
             <p><strong>Files agree</strong> checks whether the direction repeats in files with at least five recorded values in both groups. None of these measures proves causation or supplies a significance test.</p>
           </div></details>
