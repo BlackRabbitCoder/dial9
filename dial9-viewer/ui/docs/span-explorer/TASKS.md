@@ -80,6 +80,9 @@ Keep analysis in the backend and render its results in the frontend.
   slow cutoff. Derive density from the backend's loaded observations so the
   bounded dot sample does not misrepresent concentration. Give the density
   encoding a clear legend and preserve a way to inspect individual traces.
+  Color density blue outside the slow/selected range and orange inside it,
+  with brightness showing bin counts. Split cells visually at exact selection
+  boundaries; their counts still describe the entire bin.
 
 ## Coordination
 
