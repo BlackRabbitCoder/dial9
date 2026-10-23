@@ -23,6 +23,7 @@ interface Context {
   view: ViewState;
   headers: Record<string, string>;
   onClearBand: () => void;
+  onBand: (minMs: number | null, maxMs: number | null) => void;
 }
 const number = (n: number | null, digits = 2) =>
   n == null || !Number.isFinite(n) ? "unavailable" : n.toLocaleString(undefined, { maximumFractionDigits: digits });
@@ -51,8 +52,8 @@ export class SpanTailAnalysis {
   private status = "";
   private busy = false;
   private more = false;
-  private chartMode: "numeric" | "categorical" = "categorical";
   private categoryKey = "";
+  private categoryMode: "overlay" | "stacked" = "overlay";
   private expandedKey: string | null = null;
   private sourceCount = 0;
   private sourceUsed = 0;
@@ -73,8 +74,8 @@ export class SpanTailAnalysis {
       this.status = "";
       this.busy = false;
       this.more = false;
-      this.chartMode = "categorical";
       this.categoryKey = "";
+      this.categoryMode = "overlay";
       this.expandedKey = null;
       this.key = key;
       this.selection = { percentile: 99, groupKey: null, groupValue: null, minMs: null, maxMs: null };
@@ -109,8 +110,9 @@ export class SpanTailAnalysis {
     const request = new AbortController();
     this.request = request;
     const firstReport = this.report == null;
+    this.expandedKey = null;
     this.busy = true;
-    this.status = "The backend is computing this comparison…";
+    this.status = "Computing latency comparison…";
     this.draw();
     try {
       const url = new URL(buildApiUrl("comparison", context.scope, context.view, location.origin));
@@ -149,6 +151,8 @@ export class SpanTailAnalysis {
       if (firstReport) this.container?.scrollIntoView({ block: "start" });
     } catch (error) {
       if (generation !== this.generation) return;
+      // A failed request cannot leave a previous comparison under new labels.
+      this.report = null;
       this.status = error instanceof Error ? error.message : String(error);
       this.busy = false;
       this.draw();
@@ -271,15 +275,17 @@ export class SpanTailAnalysis {
     const expanded = r?.signals.find(s => s.key === this.expandedKey);
     const histograms = r?.histograms ?? [];
     const histogram = histograms.find(h => h.key === this.categoryKey) ?? histograms[0];
-    const categories = this.chartMode === "categorical" && histogram != null;
-    render(html`<section class="span-tail-analysis">
+    this.container.closest(".detail-panel")?.classList.toggle("tail-analysis-ready", r != null);
+    render(html`<section class="span-tail-analysis" aria-busy=${this.busy}>
       <div class="tail-heading"><h3>How are slow spans different?</h3>
         ${!r && !this.busy ? html`<button @click=${() => void this.load()}>Analyse source traces</button>` : r ? html`<span class="tail-source-count">${number(r.count, 0)} spans · ${this.sourceUsed}/${this.sourceCount} files</span>` : nothing}
       </div>
       ${!r ? html`<p class="tail-note">Compare the faster half with the slowest instances, then follow a lead into its trace.</p>` : nothing}
-      ${this.status ? html`<p class="tail-status" role="status">${this.status}
+      ${this.status ? html`<p class="tail-status ${this.busy ? "computing" : ""}" role="status">
+        ${this.busy ? html`<span class="tail-loading-spinner" aria-hidden="true"></span>` : nothing}${this.status}
         ${this.busy ? html`<button class="secondary" @click=${() => this.cancel()}>Cancel</button>` : nothing}</p>` : nothing}
       ${r ? html`
+        <div class="tail-results ${this.busy ? "recomputing" : ""}" ?inert=${this.busy} aria-hidden=${this.busy}>
         <div class="tail-controls">
           <label>Comparison group <select .value=${band ? "custom" : String(this.selection.percentile)} ?disabled=${this.busy}
             @change=${(e: Event) => {
@@ -297,7 +303,6 @@ export class SpanTailAnalysis {
             <option value="">All instances</option>
             ${r.groups.map(g => g.values.map(v => html`<option value=${JSON.stringify([g.key, v])}>${g.key} = ${v}</option>`))}
           </select></label>
-          <div class="tail-total"><span>Mean elapsed</span><strong>${ms(r.typicalElapsedMs)} <span>→</span> <b>${ms(r.slowElapsedMs)}</b></strong></div>
         </div>
         <div class="tail-cohorts">
           <span title="All boundary ties are included."><span class="tail-dot typical"></span><strong>Typical</strong> ≤ median ${ms(r.medianMs)} · ${number(r.typicalCount, 0)}</span>
@@ -305,19 +310,16 @@ export class SpanTailAnalysis {
         </div>
         ${this.sourceUsed < this.sourceCount || this.truncated || this.fieldsTruncated ? html`<p class="tail-warning">Partial sample · ${this.sourceUsed}/${this.sourceCount} files. ${this.truncated ? "One million span limit reached." : ""} ${this.fieldsTruncated ? "Field discovery limit reached." : ""}</p>` : nothing}
         ${r.slowCount < 20 ? html`<p class="tail-warning">Only ${r.slowCount} ${band ? "selected" : "slow"} spans · widen the group or time window before relying on these differences.</p>` : nothing}
-        ${!categories && changes.length && !this.selection.groupKey ? html`<div class="tail-mix"><strong>Mix shift</strong>
+        ${changes.length && !this.selection.groupKey ? html`<div class="tail-mix"><strong>Mix shift</strong>
           ${changes.map(g => html`<span title=${g.key}>${g.value} ${percent(g.typical)} → ${percent(g.slow)}</span>`)}
           <span class="tail-muted">Compare the same group above.</span></div>` : nothing}
-        ${histograms.length ? html`<nav class="tail-chart-tabs" aria-label="Field charts">
-          <button aria-pressed=${!categories} @click=${() => { this.chartMode = "numeric"; this.draw(); }}>Numeric fields (${r.signals.length})</button>
-          <button aria-pressed=${categories} @click=${() => { this.chartMode = "categorical"; this.draw(); }}>Categories (${histograms.length})</button>
-        </nav>` : nothing}
-        ${categories ? html`<div class="tail-chart-heading"><h4>Latency by</h4>
+        ${histogram ? html`<section class="tail-properties" aria-label="Properties"><div class="tail-chart-heading"><h4>Latency by property</h4>
           ${histograms.length > 1 ? html`<select class="tail-category-select" aria-label="Categorical field" .value=${histogram.key}
             @change=${(e: Event) => { this.categoryKey = (e.target as HTMLSelectElement).value; this.draw(); }}>
             ${histograms.map(h => html`<option value=${h.key}>${h.key}</option>`)}
           </select>` : html`<h4 class="tail-category-field-name">${histogram.key}</h4>`}
-        </div>${renderCategoricalHistogram(histogram)}` : html`<div class="tail-chart-heading"><h4>Fields against elapsed time</h4>
+        </div>${renderCategoricalHistogram(histogram)}</section>` : nothing}
+        <section class="tail-numeric" aria-label="Numeric fields"><div class="tail-chart-heading"><h4>Numeric fields against elapsed time</h4>
           <span class="tail-legend"><span class="tail-dot typical"></span>Other spans <span class="tail-dot slow"></span>${band ? "Selected" : "Slow"}</span>
           <details class="tail-chart-help"><summary>Reading these charts</summary><div id="tail-chart-guide">
             <p>Each dot is one span; click it to inspect the trace. X is total elapsed time in milliseconds. Y is the field value in its recorded unit. Orange dashed lines mark the labelled percentile cutoff, or the start and end of a custom selection. Axes are linear; all panels share the X scale. Up to 330 sampled points are drawn per field.</p>
@@ -328,7 +330,7 @@ export class SpanTailAnalysis {
         </div>
         <div class="tail-grid">${r.signals.length ? r.signals.slice(0, this.more ? undefined : 3).map((s, i) => this.signal(s, i)) : html`<p>No varying numeric fields recorded.</p>`}</div>
         ${r.signals.length > 3 ? html`<button class="secondary tail-more" @click=${() => { this.more = !this.more; this.draw(); }}>${this.more ? "Show fewer fields" : `Show all ${r.signals.length} fields`}</button>` : nothing}
-        `}
+        </section>
         <section class="tail-composition">
           <div class="tail-composition-heading"><h4>Time breakdown</h4><span class="tail-note">Estimated · average share per span</span><span class="tail-note tail-composition-mean-label">Mean elapsed</span></div>
           ${this.compositionRow("Typical", r.typicalComposition, r.typicalElapsedMs)}
@@ -344,8 +346,7 @@ export class SpanTailAnalysis {
           <p>Percentiles are recalculated within the chosen group and include threshold ties. A band overlapping the faster half creates overlapping cohorts. Missing values are excluded from means and comparisons. Catalog percentiles may use a different coverage or approximation.</p>
           <p>The backend analyses at most 24 files and one million matching spans, discovering up to 32 numeric fields or categorical keys. Missing or conflicting units are never guessed.</p>
         </details>
-        ${r.examples.length ? html`<div class="tail-examples"><h4>Inspect ${band ? "selected" : "slow"} examples</h4>
-          ${r.examples.map(row => html`<button class="secondary" @click=${() => this.jump(row)} title=${row.requestId ?? row.startNs}>${ms(row.elapsedMs)} ↗</button>`)}</div>` : nothing}
+        </div>
       ` : nothing}
       ${expanded ? html`<dialog class="tail-plot-dialog" @close=${() => { this.expandedKey = null; }}>
         <div class="tail-dialog-heading"><h3>${expanded.key}</h3><button @click=${(e: Event) => (e.target as HTMLElement).closest("dialog")?.close()}>Close</button></div>
@@ -353,5 +354,12 @@ export class SpanTailAnalysis {
         ${this.plot(expanded, true)}<p class="tail-note">Click a dot to inspect its trace · orange = ${band ? "selected" : "slow"} · linear axes</p>
       </dialog>` : nothing}
     </section>`, this.container);
+    const examplesMount = this.container.closest(".detail-panel")?.querySelector<HTMLElement>(".span-tail-examples-mount");
+    if (examplesMount) {
+      render(r ? html`<div class="tail-examples ${this.busy ? "recomputing" : ""}" ?inert=${this.busy} aria-hidden=${this.busy}>
+        <h4>${band ? "Selected" : "Slow"} examples</h4>
+        ${r.examples.map(row => html`<button class="secondary" @click=${() => this.jump(row)} title=${row.requestId ?? row.startNs}>${ms(row.elapsedMs)} ↗</button>`)}
+      </div>` : nothing, examplesMount);
+    }
   }
 }
