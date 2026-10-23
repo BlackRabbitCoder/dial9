@@ -4,6 +4,7 @@ import type { TailRecord, TailSignal, TailValueAxis } from "../../lib/trace/span
 import { formatHumanDuration } from "../../lib/trace/api_format.js";
 import { latencyToHistogramPosition } from "./categorical-histogram-scale.js";
 import { renderRecordedFields, tooltipPosition } from "./recorded-fields.js";
+import { observePopoverGeometry } from "./popover-geometry.js";
 
 export interface NumericPlotOptions {
   signals: readonly TailSignal[];
@@ -117,6 +118,7 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
   const tooltipFor = (element: Element) => element.closest(".tail-plot")!.querySelector<HTMLElement>(".tail-plot-tooltip")!;
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
   let tooltipTrigger: Element | null = null;
+  let disposeGeometry = () => {};
   const retainTooltip = () => { if (hideTimer != null) clearTimeout(hideTimer); hideTimer = null; };
   const hideTooltip = (event: Event) => { retainTooltip(); tooltipFor(event.currentTarget as Element).hidden = true; };
   const leaveTooltip = (event: Event) => {
@@ -246,8 +248,21 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
     <div class="tail-plot-tooltip" role="tooltip" hidden
       ${ref(element => {
         // Imperative details belong to this plotted report and its handlers.
+        disposeGeometry();
+        disposeGeometry = () => {};
         retainTooltip();
-        if (element) (element as HTMLElement).hidden = true;
+        if (!element) return;
+        const tooltip = element as HTMLElement;
+        tooltip.hidden = true;
+        const plot = element.closest(".tail-plot")!;
+        const targets = [plot, plot.querySelector("svg"), plot.closest(".tail-plot-dialog, .detail-panel")]
+          .filter((target): target is Element => target != null);
+        disposeGeometry = observePopoverGeometry(targets, () => {
+          if (tooltip.hidden) return;
+          retainTooltip();
+          if (tooltip.contains(document.activeElement)) (tooltipTrigger as HTMLElement | null)?.focus({ preventScroll: true });
+          tooltip.hidden = true;
+        });
       })}
       @pointerenter=${retainTooltip} @pointerleave=${leaveTooltip} @focusout=${blurTooltip}
       @keydown=${(event: KeyboardEvent) => {
