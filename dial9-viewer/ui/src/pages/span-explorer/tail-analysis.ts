@@ -370,7 +370,7 @@ export class SpanTailAnalysis {
             <p>The outlined dots are bounded trace samples and cannot show how dense the underlying data is. Reports from the current backend include exact cell counts and shared unit axes; no missing density or unit information is inferred here.</p>`)}>
           Point samples · density unavailable in cached result <span aria-hidden="true">ⓘ</span>
         </button>` : nothing}
-        <div class="tail-grid">${r.signals.length ? r.signals.slice(0, this.more ? undefined : 3).map((s, i) => this.signal(s, i)) : html`<p>No varying numeric fields recorded.</p>`}</div>
+        <div class="tail-grid">${r.signals.length ? r.signals.slice(0, this.more ? undefined : 3).map((s, i) => this.signal(s, i)) : html`<p>No distinct numeric fields to compare.</p>`}</div>
         ${r.signals.length > 3 ? html`<button class="secondary tail-more" @click=${() => { this.more = !this.more; this.draw(); }}>${this.more ? "Show fewer fields" : `Show all ${r.signals.length} fields`}</button>` : nothing}
         </section>
         <section class="tail-composition">
