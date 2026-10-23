@@ -1,6 +1,6 @@
 # Span Explorer UI task list
 
-Status: complete. All eighteen tasks are integrated and verified. The user
+Status: follow-up in progress. The original eighteen tasks are integrated and verified. The user
 authorized direct integration through subagents, coordination, QA, and demos;
 the feature remains on the shared branch for final review before main.
 Keep the task numbers stable.
@@ -16,6 +16,7 @@ The coordinator assigns batches that minimize conflicting edits.
 | Backend | 3, 11 (aggregation), 12 | backend-analysis | `codex/span-ui-backend` | Integrated; full Rust/stress and raw/aggregate QA passed |
 | Histograms | 13, 14, 17, 18 | property-histograms | `codex/span-ui-histograms` | Integrated; component and mobile QA passed |
 | Numeric | 1, 2, 6, 7, 10, 11 (rendering), 16; property controls integration | page-layout | `codex/span-ui-numeric` | Integrated; density colors, keyboard and native QA passed |
+| Default analysis | 19 | page-layout | `codex/span-ui-default-analysis` | Assigned; automatic initial and changed-selection loading |
 
 Design guidance: start with why the user is here, minimize the explanation a
 visual needs, and make the initial view useful for deciding where to go deeper.
@@ -136,6 +137,12 @@ because they affect the same histogram component. Task 16 requires user
 feedback when work starts.
 
 ## Completion evidence
+
+- [ ] **19. Open the analysis by default for the selected span.**
+  Start the backend comparison automatically on initial selection and when
+  the selected span or source changes. Repeated rendering of the same context
+  must not issue duplicate requests or retry a cancelled or failed analysis.
+  Preserve explicit cancellation and retry, and make initial loading visible.
 
 The combined feature passes 1,670 Rust tests and the required stress run,
 2,764 UI tests, TypeScript checks, and the Vite/release builds. Focused numeric
