@@ -20,7 +20,9 @@ fold, and Parquet reads, discovers numeric attributes and producer units,
 and identifies categorical attributes with up to twelve values. The browser
 only requests reports and renders summaries, density cells, and trace links. It compares
 the faster half with the selected slow percentile or histogram band. Choosing a
-categorical group recalculates the percentiles inside that group.
+categorical group recalculates the percentiles inside that group. Value-scoping
+controls sit beside their property graph; the active field/value and an
+**All instances** reset stay available if filtering removes that graph.
 Orange dashed plot lines label the percentile cutoff, or both endpoints of a
 brushed range. The comparison dropdown displays **Custom selection: X to Y**;
 choosing a percentile clears the brush and restores that percentile comparison.
@@ -60,8 +62,10 @@ definitions are available on demand; an excluded field can have no clear
 difference in this sample or insufficient observations. Group counts remain
 visible because a small sample's observed p99 is a weak basis for a conclusion.
 
-Numeric fields with fewer than twenty values in either group or under 50%
-coverage come after better-observed fields. Duration attributes that repeat
+Numeric fields with fewer than twenty recorded values in either group follow
+better-observed fields. Other fields are ranked by the conservative gap between
+typical and slow recorded-value distributions. Coverage warnings are separate
+from this ordering. Duration attributes that repeat
 total elapsed time and constant fields are omitted. The backend's ordering is
 descriptive, not a significance test.
 
@@ -75,14 +79,22 @@ recorded coverage. A near-duplicate can reappear when a custom selection exposes
 differences or lacks enough recorded coverage; a meaningful rare-tail difference
 must remain visible. Unknown units never imply an elapsed alias.
 
-Each card shows group means, qualitative correlation, and repetition across
-qualifying source files. Click a correlation or observation badge for its
-definition and recorded counts; Escape closes the explanation and returns focus.
+Each card shows group means, a qualitative tail-difference label, and repetition
+across qualifying source files. Click its difference badge for a table of
+recorded counts, coverage, means, medians, and p99s. The popup explains the CDF
+gap, sampling margin, and conservative lower bound used for ordering; labels
+are descriptive cutoffs, not significance claims. Whole-range Spearman
+correlation is a secondary expandable detail. Coverage warnings remain separate;
+Escape closes the explanation and returns focus.
 File repetition needs five observations in each cohort. Spearman compares up to
 2,048 evenly spaced observations across latency ranks; comparison means use
 every loaded recorded value. Drawing uses up to 330 trace-link dots in addition
 to the full-observation density grid. Hover or focus a dot to see its values and
-the trace action before opening it. A dot or slow-example button opens its
+the trace action before opening it. Point popovers preserve the original recorded
+key/value strings, including duplicate keys, in a bounded scroll region. Hover
+retention and keyboard focus let users read long records. Backend omissions are
+explicit; unavailable cached metadata is never inferred from the active field.
+A dot, popover action, or slow-example button opens its
 original trace focused on the selected span, preserving the credential contract.
 Older cached reports show an explicit sample-only warning and do not invent
 missing density or shared-unit metadata.

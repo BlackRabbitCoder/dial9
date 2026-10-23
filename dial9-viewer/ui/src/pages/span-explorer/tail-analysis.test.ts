@@ -256,6 +256,67 @@ describe("automatic selected-span analysis", () => {
 });
 
 describe("Span Explorer investigation", () => {
+  it("scopes the whole backend comparison beside its property and keeps reset when the graph disappears", async () => {
+    const full = report({ groups: [{ key: "cache_hit", values: ["true", "false"], typical: {}, slow: {} }] });
+    const fetch = vi.fn().mockImplementation((url: URL) => Promise.resolve(response(
+      url.searchParams.has("group_key") ? report({ histograms: [], groups: [] }) : full)));
+    vi.stubGlobal("fetch", fetch);
+    const { latest } = setup();
+    await vi.waitFor(() => expect(text(latest())).toContain("Scope spans by property value"));
+    expect(text(latest()).indexOf("Scope spans by property value")).toBeLessThan(text(latest()).indexOf("tail-category-chart"));
+    const change = bindings(latest(), "@change=").find(handler => typeof handler === "function"
+      && String(handler).includes("scopeTo")) as (event: unknown) => void;
+    change({ currentTarget: { value: JSON.stringify(["cache_hit", "false"]) } });
+    await vi.waitFor(() => expect(text(latest())).not.toContain("tail-category-chart"));
+    expect((fetch.mock.calls[1]![0] as URL).searchParams.get("group_key")).toBe("cache_hit");
+    expect((fetch.mock.calls[1]![0] as URL).searchParams.get("group_value")).toBe("false");
+    expect(text(latest())).toContain("cache_hit = false");
+    click(latest(), "All instances")();
+    await vi.waitFor(() => expect(text(latest())).toContain("tail-category-chart"));
+    expect((fetch.mock.calls[2]![0] as URL).searchParams.has("group_key")).toBe(false);
+  });
+
+  it("keeps the active scope reset usable after a filtered comparison fails", async () => {
+    const full = report({ groups: [{ key: "cache_hit", values: ["true", "false"], typical: {}, slow: {} }] });
+    const fetch = vi.fn().mockResolvedValueOnce(response(full))
+      .mockResolvedValueOnce(new Response("No matching spans", { status: 500 }))
+      .mockResolvedValueOnce(response(full));
+    vi.stubGlobal("fetch", fetch);
+    const { latest } = setup();
+    await vi.waitFor(() => expect(text(latest())).toContain("Scope spans by property value"));
+    const change = bindings(latest(), "@change=").find(handler => typeof handler === "function"
+      && String(handler).includes("scopeTo")) as (event: unknown) => void;
+    change({ currentTarget: { value: JSON.stringify(["cache_hit", "true"]) } });
+    await vi.waitFor(() => expect(text(latest())).toContain("Backend analysis failed (500)"));
+    expect(text(latest())).toContain("cache_hit = true");
+    click(latest(), "All instances")();
+    await vi.waitFor(() => expect(text(latest())).toContain("work_bytes"));
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect((fetch.mock.calls[2]![0] as URL).searchParams.has("group_key")).toBe(false);
+  });
+
+  it("opens a tail-value table and keeps whole-range correlation secondary", async () => {
+    const field = { ...report().signals[0]!, unit: "ns", correlation: 0, typical: 1e6, slow: 8e6,
+      tailDifference: { cdfGap: .8, samplingMargin: .1, lowerBound: .7, comparisons: 10, samplingBudget: .01,
+        typicalMedian: 1e6, slowMedian: 8e6, typicalP99: 2e6, slowP99: 12e6 } };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(report({ signals: [field] }))));
+    const { latest, showModal } = setup();
+    await vi.waitFor(() => expect(text(latest())).toContain("Strong difference in slow spans"));
+    expect(text(latest())).not.toContain("Not correlated");
+    const handler = bindings(latest(), "@click=").find(fn => typeof fn === "function"
+      && String(fn).includes("signalDetails")) as (event: unknown) => void;
+    handler({ currentTarget: { focus: vi.fn() } });
+    expect(showModal).toHaveBeenCalledOnce();
+    expect(text(latest())).toContain("tail-signal-table");
+    expect(text(latest())).toContain("Median");
+    expect(text(latest())).toContain("p99");
+    expect(text(latest())).toContain("12ms");
+    expect(text(latest())).toContain("70%");
+    expect(text(latest())).toContain("Not correlated");
+    expect(text(latest())).toContain("independent observations");
+    expect(text(latest())).not.toContain("pairs");
+  });
+
   it("shows properties and numeric results together without a chart tab", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(report())));
     const { latest, classToggle } = setup();
@@ -264,7 +325,7 @@ describe("Span Explorer investigation", () => {
     expect(rendered.indexOf("cache_hit")).toBeLessThan(rendered.indexOf("Numeric fields against elapsed time"));
     expect(rendered).not.toContain("tail-chart-tabs");
     expect(rendered).toContain("Property histogram view");
-    expect(rendered).toContain("Displayed property");
+    expect(rendered).not.toContain("Displayed property");
     expect(rendered).not.toContain("pairs");
     expect(classToggle).toHaveBeenLastCalledWith("tail-analysis-ready", true);
   });
@@ -291,18 +352,19 @@ describe("Span Explorer investigation", () => {
     expect(text(latest())).not.toContain("ElapsedAliasOnly");
   });
 
-  it("shows qualitative correlation and explains observation limits on click", async () => {
+  it("shows honest low-count tail evidence and explains coverage separately", async () => {
     const field = { ...report().signals[0]!, correlation: 1, typicalCount: 5, typicalCoverage: .1 };
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(report({ signals: [field] }))));
     const { latest, showModal } = setup();
-    await vi.waitFor(() => expect(text(latest())).toContain("Perfectly correlated"));
+    await vi.waitFor(() => expect(text(latest())).toContain("Too few values to compare"));
+    expect(text(latest())).not.toContain("Perfectly correlated");
     expect(text(latest())).not.toContain("Spearman");
-    const handler = bindings(latest(), "@click=").find(value => typeof value === "function" && String(value).includes("Limited observations")) as (event: unknown) => void;
+    const handler = bindings(latest(), "@click=").find(value => typeof value === "function" && String(value).includes("Limited coverage")) as (event: unknown) => void;
     const trigger = { focus: vi.fn() };
     handler({ currentTarget: trigger });
     expect(showModal).toHaveBeenCalledOnce();
     expect(text(latest())).toContain("Typical has 5 recorded values; at least 20 are required.");
-    expect(text(latest())).toContain("at least 50% coverage is required.");
+    expect(text(latest())).toContain("coverage warning threshold is 50%.");
     expect(trigger.focus).toHaveBeenCalled();
   });
 
