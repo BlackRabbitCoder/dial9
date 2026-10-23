@@ -18,9 +18,13 @@ const number = (n: number) => n !== 0 && Math.abs(n) < .001
 const duration = (ms: number) => formatHumanDuration(ms * 1e6);
 const axisNumber = (n: number) => n !== 0 && (Math.abs(n) < .001 || Math.abs(n) >= 1e5)
   ? n.toExponential(1).replace("e+", "e") : number(n);
-export const numericAxisTick = (n: number, unit: string | null) => unit === "bytes"
-  ? Math.abs(n) >= 1e6 ? `${number(n / 1e6)} MB` : Math.abs(n) >= 1e3 ? `${number(n / 1e3)} kB` : axisNumber(n)
-  : axisNumber(n);
+export function numericAxisTick(n: number, unit: string | null): string {
+  if (unit !== "bytes" || Math.abs(n) < 1e3 || Math.abs(n) >= 1e21) return axisNumber(n);
+  const prefixes = ["kB", "MB", "GB", "TB", "PB", "EB"];
+  const power = Math.min(prefixes.length, Math.floor(Math.log10(Math.abs(n)) / 3));
+  const amount = Number((n / 1000 ** power).toPrecision(3));
+  return `${amount} ${prefixes[power - 1]}`;
+}
 const fieldValue = (n: number, unit: string | null) => unit === "bytes" && Math.abs(n) >= 1e3
   ? numericAxisTick(n, unit) : `${number(n)}${unit ? ` ${unit}` : " (unit not recorded)"}`;
 

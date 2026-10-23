@@ -47,6 +47,10 @@ describe("backend numeric plot data", () => {
   it("keeps large declared-byte and unknown-unit labels inside the axis gutter", () => {
     expect(numericAxisTick(12e6, "bytes")).toBe("12 MB");
     expect(numericAxisTick(12e3, "bytes")).toBe("12 kB");
+    expect(numericAxisTick(12e9, "bytes")).toBe("12 GB");
+    expect(numericAxisTick(12e12, "bytes")).toBe("12 TB");
+    expect(numericAxisTick(18.446e18, "bytes")).toBe("18.4 EB");
+    expect(numericAxisTick(999.999e15, "bytes").length).toBeLessThanOrEqual(8);
     expect(numericAxisTick(12e6, null)).toBe("1.2e7");
     expect(numericAxisTick(-12e6, "count")).toBe("-1.2e7");
   });
