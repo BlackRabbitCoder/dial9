@@ -201,3 +201,18 @@ Clippy reports only the pre-existing background-symbolization warning.
 Automatic initial analysis additionally passes 16 native aggregate/raw checks,
 including unchanged selection, custom deep links, failure/retry, cancellation,
 span switching, and mobile. The current UI embedding build passes.
+
+## Code simplification
+
+The user authorized small simplification steps with code review at each step.
+Preserve the behavior and report contracts, validate each contribution, and
+integrate into the feature branch without opening a PR.
+
+| Step | Change | Owner | Branch | Status |
+| --- | --- | --- | --- | --- |
+| S1 | Use one request cancellation token | page-layout | `codex/span-simplify-ui` | Assigned; review before integration |
+| S2 | Keep report and source metadata together | page-layout | `codex/span-simplify-ui` | Awaiting S1 review |
+| S3 | Share consuming report finalization | backend-analysis | `codex/span-simplify-backend` | Candidate reviewed; not assigned |
+
+Point-details lifecycle ownership is a larger architecture candidate. Review
+its interface and interaction coverage separately before accepting a restructure.
