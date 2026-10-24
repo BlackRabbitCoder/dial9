@@ -32,8 +32,8 @@ function click(value: unknown, label: string): () => void {
     }
   } else if (isTemplate(value)) {
     for (let i = 0; i < value.values.length; i++) {
-      const hasLabel = value.strings[i + 1]?.includes(`>${label}</button>`)
-        || (value.strings[i + 1] === ">" && value.values[i + 1] === label && value.strings[i + 2]?.includes("</button>"));
+      const hasLabel = text({ strings: value.strings.slice(i + 1), values: value.values.slice(i + 1) })
+        .split("</button>")[0]?.includes(label);
       if (value.strings[i]?.endsWith("@click=") && hasLabel) {
         return value.values[i] as () => void;
       }
@@ -256,6 +256,39 @@ describe("automatic selected-span analysis", () => {
 });
 
 describe("Span Explorer investigation", () => {
+  it("switches report graphs, file coverage, and limit explanations together", async () => {
+    const cases = [
+      { key: "first_field", filesUsed: 1, filesMatched: 4, truncated: true, fieldsTruncated: false },
+      { key: "second_field", filesUsed: 7, filesMatched: 7, truncated: false, fieldsTruncated: true },
+      { key: "complete_field", filesUsed: 9, filesMatched: 9, truncated: false, fieldsTruncated: false },
+    ];
+    const fetch = vi.fn();
+    for (const { key, ...metadata } of cases) {
+      const body: TailResponse = { ...metadata, report: report({ signals: [{ ...report().signals[0]!, key }] }) };
+      fetch.mockResolvedValueOnce(new Response(JSON.stringify(body)));
+    }
+    vi.stubGlobal("fetch", fetch);
+    const { analysis, context, container, latest } = setup({ mount: false });
+    for (const [index, current] of cases.entries()) {
+      analysis.mount(container, { ...context, scope: { ...context.scope, dataDir: current.key } });
+      await vi.waitFor(() => expect(text(latest())).toContain(current.key));
+      expect(text(latest())).toContain(`${current.filesUsed}/${current.filesMatched} files`);
+      for (const previous of cases.slice(0, index)) expect(text(latest())).not.toContain(previous.key);
+      if (current.filesUsed < current.filesMatched || current.truncated || current.fieldsTruncated) {
+        (click(latest(), `Partial sample · ${current.filesUsed}/${current.filesMatched} files`) as (event: unknown) => void)(
+          { currentTarget: { focus: vi.fn() } });
+        const explanation = text(latest());
+        expect(explanation.includes("The one-million-span cap was reached.")).toBe(current.truncated);
+        expect(explanation.includes("A numeric or categorical field limit was reached.")).toBe(current.fieldsTruncated);
+        expect(explanation).toContain(`${current.filesUsed} of ${current.filesMatched}`);
+      } else {
+        expect(text(latest())).not.toContain("Partial sample");
+        expect(text(latest())).not.toContain("cap was reached");
+        expect(text(latest())).not.toContain("field limit was reached");
+      }
+    }
+  });
+
   it("scopes the whole backend comparison beside its property and keeps reset when the graph disappears", async () => {
     const full = report({ groups: [{ key: "cache_hit", values: ["true", "false"], typical: {}, slow: {} }] });
     const fetch = vi.fn().mockImplementation((url: URL) => Promise.resolve(response(
