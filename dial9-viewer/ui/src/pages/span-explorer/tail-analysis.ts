@@ -54,7 +54,6 @@ export class SpanTailAnalysis {
   private request: AbortController | null = null;
   private rawBytes: ArrayBuffer | null = null;
   private fieldsTruncated = false;
-  private generation = 0;
   private report: TailReport | null = null;
   private status = "";
   private busy = false;
@@ -79,7 +78,6 @@ export class SpanTailAnalysis {
       this.request?.abort();
       this.request = null;
       this.rawBytes = null;
-      this.generation++;
       this.report = null;
       this.status = "";
       this.busy = false;
@@ -113,7 +111,6 @@ export class SpanTailAnalysis {
   }
 
   private cancel(): void {
-    this.generation++;
     this.request?.abort();
     this.request = null;
     this.busy = false;
@@ -126,7 +123,6 @@ export class SpanTailAnalysis {
     const context = this.context;
     if (!context || !this.container) return;
     this.started = true;
-    const generation = ++this.generation;
     this.request?.abort();
     const request = new AbortController();
     this.request = request;
@@ -152,7 +148,7 @@ export class SpanTailAnalysis {
       if (context.scope.trace) {
         const rawBytes = this.rawBytes ?? await fetchRawTraceBytes(context.scope.trace, location.origin, context.headers,
           (url, init) => fetch(url, { ...init, signal: request.signal }));
-        if (generation !== this.generation) return;
+        if (request.signal.aborted) return;
         this.rawBytes = rawBytes;
         // A raw trace has its own complete scope. Its bytes are decoded by Rust.
         url.searchParams.delete("start_ns");
@@ -162,7 +158,7 @@ export class SpanTailAnalysis {
       const response = await fetch(url, options);
       if (!response.ok) throw new Error(`Backend analysis failed (${response.status}): ${await response.text()}`);
       const reply: TailResponse = await response.json();
-      if (generation !== this.generation) return;
+      if (request.signal.aborted) return;
       // Old cached reports may still include fields that repeat elapsed time.
       this.report = { ...reply.report, signals: reply.report.signals.filter(signal => !signal.duplicatesLatency) };
       this.sourceUsed = reply.filesUsed;
@@ -173,7 +169,7 @@ export class SpanTailAnalysis {
       this.status = "";
       this.draw();
     } catch (error) {
-      if (generation !== this.generation) return;
+      if (request.signal.aborted) return;
       // A failed request cannot leave a previous comparison under new labels.
       this.report = null;
       this.status = error instanceof Error ? error.message : String(error);
