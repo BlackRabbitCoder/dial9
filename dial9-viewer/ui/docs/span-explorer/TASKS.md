@@ -211,8 +211,8 @@ integrate into the feature branch without opening a PR.
 | Step | Change | Owner | Branch | Status |
 | --- | --- | --- | --- | --- |
 | S1 | Use one request cancellation token | page-layout | `codex/span-simplify-ui` | Integrated; coordinator and independent review passed; 22 lifecycle tests passed |
-| S2 | Keep report and source metadata together | page-layout | `codex/span-simplify-ui` | Assigned after S1 review |
-| S3 | Share consuming report finalization | backend-analysis | `codex/span-simplify-backend` | Assigned; review before integration |
+| S2 | Keep report and source metadata together | page-layout | `codex/span-simplify-ui` | Integrated; coordinator and independent review passed; 23 lifecycle tests passed |
+| S3 | Share consuming report finalization | backend-analysis | `codex/span-simplify-backend` | Coordinator and independent patch review passed; broad validation in progress |
 
 Point-details lifecycle ownership is a larger architecture candidate. Review
 its interface and interaction coverage separately before accepting a restructure.
