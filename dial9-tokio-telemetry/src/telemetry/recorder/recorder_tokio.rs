@@ -49,13 +49,18 @@
 //!
 //! Shut down in that order or the workers' last events never reach the trace.
 //! `#[dial9::main]` does it for you.
+//!
+//! An attached runtime stays registered until
+//! [`Dial9HandleTokioExt::detach_tokio_runtime`] or recorder teardown. A
+//! service that replaces runtimes while the recorder lives on should detach
+//! each one before dropping it.
 
 use super::runtime_context::{
     RuntimeContext, RuntimeContextRegistry, TokioRuntimesSource, WorkerIdCounter,
 };
 use super::{install_user_hooks, register_runtime_hooks};
 use crate::primitives::sync::{Arc, Mutex};
-use crate::telemetry::recorder::runtime_context::register_runtime_metrics;
+use crate::telemetry::recorder::runtime_context::register_attached_runtime;
 use crate::telemetry::task_dump_config::TaskDumpConfig;
 use dial9_core::buffer::BufferMode;
 use dial9_core::handle::{Dial9Handle, set_tl_handle};
@@ -360,8 +365,9 @@ pub trait Dial9HandleTokioExt: dial9_handle_tokio_ext_sealed::Sealed {
     /// installed. Attach a `current_thread` runtime on the thread that will
     /// drive it.
     ///
-    /// Attaching is permanent: contexts and metrics of attached runtimes stay
-    /// registered for the recorder's life, even after the runtime drops.
+    /// The runtime stays registered, even after it drops, until
+    /// [`detach_tokio_runtime`](Self::detach_tokio_runtime) or recorder
+    /// teardown.
     ///
     /// # Errors
     ///
@@ -464,6 +470,58 @@ pub trait Dial9HandleTokioExt: dial9_handle_tokio_ext_sealed::Sealed {
         builder: tokio::runtime::Builder,
         options: TokioAttachOptions,
     ) -> io::Result<tokio::runtime::LocalRuntime>;
+
+    /// Stop tracking `runtime` and release dial9's references to it.
+    ///
+    /// Returns `false` if this recorder tracks nothing for `runtime`: it was
+    /// never attached here, was attached with
+    /// [`tokio_instrumentation_enabled(false)`](TokioAttachOptions), is already
+    /// detached, the handle is [`Dial9Handle::disabled`], or the recorder has
+    /// shut down. A paused recorder still detaches. Idempotent.
+    ///
+    /// Without this, an attached runtime stays registered for the recorder's
+    /// life: its metrics keep a runtime `Handle`, which holds the runtime's
+    /// drivers (and their file descriptors) open after the runtime drops. Detach
+    /// before dropping a runtime the recorder outlives, e.g. on hot reload.
+    ///
+    /// Works for a [`Runtime`](tokio::runtime::Runtime) and a
+    /// [`LocalRuntime`](tokio::runtime::LocalRuntime) alike, via `.handle()`.
+    /// Detaching after the drop through a saved `Handle` clone also works, but
+    /// that clone keeps the drivers open until it drops too.
+    ///
+    /// With `--cfg tokio_unstable`, detach a `current_thread` runtime or
+    /// `LocalRuntime` on the thread that drives it. A detach from another
+    /// thread leaves the runtime's metrics cached on the driving thread,
+    /// keeping its drivers open until that thread drives another traced runtime
+    /// or exits.
+    ///
+    /// Tokio hooks cannot be removed from a built runtime. If it keeps running
+    /// after detach, dial9 stops recording its poll, park, spawn and terminate
+    /// events and its runtime-metrics samples, but until it drops these can
+    /// continue: wakes of `dial9::spawn` tasks, task dumps, CPU samples on its
+    /// threads and sched samples on its already-enrolled worker threads, and
+    /// events recorded through a `Dial9Handle` (custom events, the tracing
+    /// layer). Hooks passed via [`TokioHooks`](super::TokioHooks) keep firing.
+    ///
+    /// ```no_run
+    /// use dial9_core::buffer::MemoryBuffer;
+    /// use dial9_core::recorder::recorder;
+    /// use dial9_tokio_telemetry::telemetry::{Dial9HandleTokioExt, TokioAttachOptions};
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let recorder = recorder(MemoryBuffer::new(1 << 20)?).build();
+    /// let d9 = recorder.handle();
+    ///
+    /// let mut builder = tokio::runtime::Builder::new_multi_thread();
+    /// builder.enable_all();
+    /// let rt = d9.attach_tokio_runtime(builder, TokioAttachOptions::default())?;
+    /// // ... serve until reload ...
+    /// d9.detach_tokio_runtime(rt.handle());
+    /// drop(rt);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn detach_tokio_runtime(&self, runtime: &tokio::runtime::Handle) -> bool;
 }
 
 mod dial9_handle_tokio_ext_sealed {
@@ -488,6 +546,20 @@ impl Dial9HandleTokioExt for Dial9Handle {
         options: TokioAttachOptions,
     ) -> io::Result<tokio::runtime::LocalRuntime> {
         attach_built_runtime(self, builder, options, build_local_runtime)
+    }
+
+    fn detach_tokio_runtime(&self, runtime: &tokio::runtime::Handle) -> bool {
+        // `with_source`, not `tokio_attach_state`: detach must not install a
+        // source. The removed state drops on return, after the source lock.
+        let detached = self
+            .with_source(|source: &mut TokioRuntimesSource| source.detach_runtime(runtime.id()))
+            .flatten();
+        if let Some(detached) = &detached {
+            // A `current_thread` or `LocalRuntime` is usually detached on the
+            // thread that drives it.
+            detached.release_thread_cache();
+        }
+        detached.is_some()
     }
 }
 
@@ -536,7 +608,7 @@ where
     );
 
     let runtime = build(builder)?;
-    finalize_attached_runtime(handle, state, ctx, runtime_name, task_dump_config, &runtime);
+    finalize_attached_runtime(handle, ctx, runtime_name, task_dump_config, &runtime);
     Ok(runtime)
 }
 
@@ -592,7 +664,6 @@ impl AttachedTokioRuntime for tokio::runtime::LocalRuntime {
 
 fn finalize_attached_runtime(
     handle: &Dial9Handle,
-    state: TokioAttachState,
     ctx: Arc<RuntimeContext>,
     runtime_name: Option<String>,
     #[cfg_attr(not(feature = "taskdump"), allow(unused_variables))] task_dump_config: Option<
@@ -609,7 +680,13 @@ fn finalize_attached_runtime(
     // `WakeTraced` wrapper, which finds this context by the runtime id it
     // is running on.
     ctx.bind_runtime(rt_handle.id());
-    state.registry.lock().unwrap().push(ctx);
+    register_attached_runtime(
+        handle,
+        ctx,
+        rt_handle.id(),
+        runtime_name,
+        rt_handle.metrics(),
+    );
     // The current-thread driver does not fire `on_thread_start`, so without
     // this the tracing layer and `dial9::spawn` find no handle until the
     // first poll.
@@ -620,7 +697,6 @@ fn finalize_attached_runtime(
     if let Some(config) = task_dump_config {
         crate::task_dumped::set_taskdump_config(config);
     }
-    register_runtime_metrics(handle, runtime_name, rt_handle.metrics());
 }
 
 /// The context instrumenting the tokio runtime this thread is currently
@@ -644,7 +720,9 @@ pub(crate) fn current_runtime_ctx(handle: &Dial9Handle) -> Option<Arc<RuntimeCon
 /// What every runtime attached to a recorder shares, owned by its
 /// [`TokioRuntimesSource`].
 pub(crate) struct TokioAttachState {
-    /// The runtimes attached to this recorder.
+    /// The runtimes attached to this recorder. Read by `current_runtime_ctx`,
+    /// which only exists without `tokio_unstable`, and by tests.
+    #[cfg_attr(all(tokio_unstable, not(test)), allow(dead_code))]
     pub registry: RuntimeContextRegistry,
     /// Hands out this recorder's global worker-ID blocks.
     pub worker_ids: WorkerIdCounter,
