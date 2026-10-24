@@ -6,7 +6,6 @@ import {
 import type { SpanTypeStats } from "../../lib/trace/index.js";
 import type {
   TailRecord,
-  TailReport,
   TailSelection,
   TailSignal,
   TailResponse,
@@ -53,8 +52,7 @@ export class SpanTailAnalysis {
   private key = "";
   private request: AbortController | null = null;
   private rawBytes: ArrayBuffer | null = null;
-  private fieldsTruncated = false;
-  private report: TailReport | null = null;
+  private response: TailResponse | null = null;
   private status = "";
   private busy = false;
   // A failed or cancelled context stays stopped until an explicit retry.
@@ -64,9 +62,6 @@ export class SpanTailAnalysis {
   private categoryMode: "overlay" | "stacked" = "overlay";
   private expandedKey: string | null = null;
   private info: { title: string; body: TemplateResult; trigger: HTMLElement } | null = null;
-  private sourceCount = 0;
-  private sourceUsed = 0;
-  private truncated = false;
   private selection: TailSelection = { percentile: 99, groupKey: null, groupValue: null, minMs: null, maxMs: null };
 
   mount(container: HTMLElement | null, context: Context | null): void {
@@ -78,7 +73,7 @@ export class SpanTailAnalysis {
       this.request?.abort();
       this.request = null;
       this.rawBytes = null;
-      this.report = null;
+      this.response = null;
       this.status = "";
       this.busy = false;
       this.started = false;
@@ -99,7 +94,7 @@ export class SpanTailAnalysis {
       this.selection.minMs = minMs;
       this.selection.maxMs = maxMs;
     }
-    if (container && context && (!this.started || (bandChanged && (this.report != null || this.busy)))) {
+    if (container && context && (!this.started || (bandChanged && (this.response != null || this.busy)))) {
       if (!this.started) {
         const panel = container.closest<HTMLElement>(".detail-panel");
         if (panel) panel.scrollTop = 0;
@@ -114,7 +109,7 @@ export class SpanTailAnalysis {
     this.request?.abort();
     this.request = null;
     this.busy = false;
-    this.report = null;
+    this.response = null;
     this.status = "Analysis cancelled.";
     this.draw();
   }
@@ -160,18 +155,16 @@ export class SpanTailAnalysis {
       const reply: TailResponse = await response.json();
       if (request.signal.aborted) return;
       // Old cached reports may still include fields that repeat elapsed time.
-      this.report = { ...reply.report, signals: reply.report.signals.filter(signal => !signal.duplicatesLatency) };
-      this.sourceUsed = reply.filesUsed;
-      this.sourceCount = reply.filesMatched;
-      this.truncated = reply.truncated;
-      this.fieldsTruncated = reply.fieldsTruncated;
+      this.response = { ...reply, report: {
+        ...reply.report, signals: reply.report.signals.filter(signal => !signal.duplicatesLatency),
+      } };
       this.busy = false;
       this.status = "";
       this.draw();
     } catch (error) {
       if (request.signal.aborted) return;
       // A failed request cannot leave a previous comparison under new labels.
-      this.report = null;
+      this.response = null;
       this.status = error instanceof Error ? error.message : String(error);
       this.busy = false;
       this.draw();
@@ -179,7 +172,7 @@ export class SpanTailAnalysis {
   }
 
   private compare(): void {
-    if (this.report) void this.load();
+    if (this.response) void this.load();
   }
 
   private scopeTo(key: string | null, value: string | null): void {
@@ -192,7 +185,7 @@ export class SpanTailAnalysis {
   private propertyScope(selectedKey?: string) {
     const active = this.selection.groupKey != null && this.selection.groupValue != null;
     const encoded = active ? JSON.stringify([this.selection.groupKey, this.selection.groupValue]) : "";
-    const groups = [...(this.report?.groups ?? [])].sort((a, b) =>
+    const groups = [...(this.response?.report.groups ?? [])].sort((a, b) =>
       Number(b.key === selectedKey) - Number(a.key === selectedKey));
     const activeAvailable = groups.some(group => group.key === this.selection.groupKey
       && group.values.includes(this.selection.groupValue!));
@@ -296,8 +289,8 @@ export class SpanTailAnalysis {
 
   private plot(signal: TailSignal, large = false) {
     return renderNumericPlot(signal, {
-      signals: this.report?.signals ?? [],
-      boundaryMs: this.report!.boundaryMs,
+      signals: this.response?.report.signals ?? [],
+      boundaryMs: this.response!.report.boundaryMs,
       percentile: this.selection.percentile,
       minMs: this.selection.minMs,
       maxMs: this.selection.maxMs,
@@ -358,7 +351,8 @@ export class SpanTailAnalysis {
 
   private draw(): void {
     if (!this.container || !this.context) return;
-    const r = this.report;
+    const response = this.response;
+    const r = response?.report;
     const band = this.selection.minMs != null || this.selection.maxMs != null;
     const info = this.info;
     const expanded = r?.signals.find(s => s.key === this.expandedKey);
@@ -368,14 +362,14 @@ export class SpanTailAnalysis {
     this.container.closest(".detail-panel")?.classList.toggle("tail-analysis-ready", r != null || this.busy);
     render(html`<section class="span-tail-analysis" aria-busy=${this.busy}>
       <div class="tail-heading"><h3>How are slow spans different?</h3>
-        ${!r && !this.busy ? html`<button @click=${() => void this.load()}>Analyse source traces</button>` : r ? html`<span class="tail-source-count">${number(r.count, 0)} spans · ${this.sourceUsed}/${this.sourceCount} files</span>` : nothing}
+        ${!r && !this.busy ? html`<button @click=${() => void this.load()}>Analyse source traces</button>` : response ? html`<span class="tail-source-count">${number(response.report.count, 0)} spans · ${response.filesUsed}/${response.filesMatched} files</span>` : nothing}
       </div>
       ${!r ? html`<p class="tail-note">Compare the faster half with the slowest instances, then follow a lead into its trace.</p>` : nothing}
       ${this.status ? html`<p class="tail-status ${this.busy ? "computing" : ""}" role="status">
         ${this.busy ? html`<span class="tail-loading-spinner" aria-hidden="true"></span>` : nothing}${this.status}
         ${this.busy ? html`<button class="secondary" @click=${() => this.cancel()}>Cancel</button>` : nothing}</p>` : nothing}
       ${!r ? this.propertyScope() : nothing}
-      ${r ? html`
+      ${r && response ? html`
         <div class="tail-results ${this.busy ? "recomputing" : ""}" ?inert=${this.busy} aria-hidden=${this.busy}>
         <div class="tail-controls">
           <label>Comparison group <select .value=${band ? "custom" : String(this.selection.percentile)} ?disabled=${this.busy}
@@ -394,13 +388,13 @@ export class SpanTailAnalysis {
           <span title="All boundary ties are included."><span class="tail-dot typical"></span><strong>Typical</strong> ≤ median ${ms(r.medianMs)} · ${number(r.typicalCount, 0)}</span>
           <span><span class="tail-dot slow"></span><strong>${band ? "Selected" : `Slow p${this.selection.percentile}+`}</strong> ${band ? `${ms(r.boundaryMs)}–${this.selection.maxMs == null ? "∞" : ms(this.selection.maxMs)}` : `≥ ${ms(r.boundaryMs)}`} · ${number(r.slowCount, 0)}</span>
         </div>
-        ${this.sourceUsed < this.sourceCount || this.truncated || this.fieldsTruncated ? html`<button class="tail-warning tail-warning-button" type="button"
+        ${response.filesUsed < response.filesMatched || response.truncated || response.fieldsTruncated ? html`<button class="tail-warning tail-warning-button" type="button"
           @click=${(event: Event) => this.explain(event, "Partial source coverage", html`
-            <dl class="tail-info-values"><dt>Source files read</dt><dd>${this.sourceUsed} of ${this.sourceCount}</dd>
+            <dl class="tail-info-values"><dt>Source files read</dt><dd>${response.filesUsed} of ${response.filesMatched}</dd>
               <dt>Matching spans analysed</dt><dd>${number(r.count, 0)}</dd></dl>
-            <p>The backend reads at most 24 files and one million matching spans.${this.truncated ? " The one-million-span cap was reached." : ""}${this.fieldsTruncated ? " A numeric or categorical field limit was reached." : ""}</p>
+            <p>The backend reads at most 24 files and one million matching spans.${response.truncated ? " The one-million-span cap was reached." : ""}${response.fieldsTruncated ? " A numeric or categorical field limit was reached." : ""}</p>
             <p>These graphs describe the loaded scope. Unread files or unrecorded fields may contain different patterns.</p>`)}>
-          Partial sample · ${this.sourceUsed}/${this.sourceCount} files <span aria-hidden="true">ⓘ</span>
+          Partial sample · ${response.filesUsed}/${response.filesMatched} files <span aria-hidden="true">ⓘ</span>
         </button>` : nothing}
         ${r.slowCount < 20 ? html`<button class="tail-warning tail-warning-button" type="button" @click=${(event: Event) => this.explain(event, "Few comparison spans", html`
           <p>${number(r.slowCount, 0)} ${band ? "selected" : "slow"} spans are compared with ${number(r.typicalCount, 0)} typical spans. Each numeric field needs 20 recorded values in both groups for a tail-difference label.</p>
