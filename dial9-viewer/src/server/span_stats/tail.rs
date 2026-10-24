@@ -960,6 +960,23 @@ impl Collector {
                 .collect(),
         })
     }
+
+    fn finish(
+        self,
+        selection: &Selection,
+        files_used: usize,
+        files_matched: usize,
+    ) -> Result<TailResponse, String> {
+        let report = self.report(selection)?;
+        // Consuming the collector releases observations before metadata hydration.
+        Ok(TailResponse {
+            fields_truncated: self.fields_truncated || report.numeric_fields_omitted > 0,
+            truncated: self.truncated,
+            report,
+            files_used,
+            files_matched,
+        })
+    }
 }
 
 fn time_multiplier(unit: Option<&str>) -> Option<f64> {
@@ -1506,18 +1523,9 @@ pub(crate) async fn get_tail(
     let uid = work.1.uid;
     let mut work = tokio::task::spawn_blocking(move || {
         let (collector, selection, permit) = work;
-        collector.report(&selection).map(|report| {
-            let fields_truncated = collector.fields_truncated || report.numeric_fields_omitted > 0;
-            let metadata = MetadataHydrator::new(&report);
-            let response = TailResponse {
-                report,
-                files_used,
-                files_matched,
-                truncated: collector.truncated,
-                fields_truncated,
-            };
-            (response, metadata, permit)
-        })
+        let response = collector.finish(&selection, files_used, files_matched)?;
+        let metadata = MetadataHydrator::new(&response.report);
+        Ok::<_, String>((response, metadata, permit))
     })
     .await
     .map_err(internal)?
@@ -1639,11 +1647,10 @@ pub(crate) async fn post_tail(
             };
             collector.push(row, &selection, 0, "");
         }
-        let mut report = collector.report(&selection).map_err(anyhow::Error::msg)?;
-        let fields_truncated = collector.fields_truncated || report.numeric_fields_omitted > 0;
-        let truncated = collector.truncated;
-        drop(collector);
-        let mut metadata = MetadataHydrator::new(&report);
+        let mut response = collector
+            .finish(&selection, 1, 1)
+            .map_err(anyhow::Error::msg)?;
+        let mut metadata = MetadataHydrator::new(&response.report);
         let (_, _, _, spans) = decode::decode_samples(&trace, "raw-trace")?;
         for span in spans {
             if span.span_type_uid == selection.uid {
@@ -1656,14 +1663,8 @@ pub(crate) async fn post_tail(
                 )?;
             }
         }
-        metadata.finish(&mut report);
-        Ok::<_, anyhow::Error>(TailResponse {
-            report,
-            files_used: 1,
-            files_matched: 1,
-            truncated,
-            fields_truncated,
-        })
+        metadata.finish(&mut response.report);
+        Ok::<_, anyhow::Error>(response)
     })
     .await
     .map_err(internal)?
@@ -2540,8 +2541,11 @@ mod tests {
             row.attribute_units.clear();
             collector.push(row, &selection, 0, "");
         }
-        let report = collector.report(&selection).unwrap();
-        assert!(collector.fields_truncated);
+        let response = collector.finish(&selection, 2, 3).unwrap();
+        assert!(response.fields_truncated);
+        assert_eq!(response.files_used, 2);
+        assert_eq!(response.files_matched, 3);
+        let report = response.report;
         assert_eq!(report.signals.len(), MAX_FIELDS);
         assert_eq!(
             report.numeric_fields_omitted,
@@ -3025,8 +3029,8 @@ mod tests {
                 Ok(())
             });
         result.unwrap();
-        let mut folded = collector.report(&selection).unwrap();
-        let mut metadata = MetadataHydrator::new(&folded);
+        let mut folded = collector.finish(&selection, 1, 1).unwrap();
+        let mut metadata = MetadataHydrator::new(&folded.report);
         let (_, result) =
             SpansBatchReader::new(None, None, Some(uid), None).read(parquet, |input| {
                 if let SpanStatsInput::Row(row) = input
@@ -3043,7 +3047,11 @@ mod tests {
                 Ok(())
             });
         result.unwrap();
-        metadata.finish(&mut folded);
+        metadata.finish(&mut folded.report);
+        assert_eq!(response.files_used, folded.files_used);
+        assert_eq!(response.files_matched, folded.files_matched);
+        assert_eq!(response.truncated, folded.truncated);
+        assert_eq!(response.fields_truncated, folded.fields_truncated);
         assert_eq!(response.report.signals.len(), 1);
         assert_eq!(response.report.signals[0].key, "Work");
         assert!(
@@ -3067,15 +3075,15 @@ mod tests {
         assert_eq!(response.report.property_screen.similar_distributions, 1);
         assert_eq!(
             serde_json::to_value(response.report.signals).unwrap(),
-            serde_json::to_value(folded.signals).unwrap(),
+            serde_json::to_value(folded.report.signals).unwrap(),
         );
         assert_eq!(
             serde_json::to_value(response.report.histograms).unwrap(),
-            serde_json::to_value(folded.histograms).unwrap(),
+            serde_json::to_value(folded.report.histograms).unwrap(),
         );
         assert_eq!(
             serde_json::to_value(response.report.property_screen).unwrap(),
-            serde_json::to_value(folded.property_screen).unwrap(),
+            serde_json::to_value(folded.report.property_screen).unwrap(),
         );
     }
 
