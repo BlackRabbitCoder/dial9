@@ -213,6 +213,11 @@ integrate into the feature branch without opening a PR.
 | S1 | Use one request cancellation token | page-layout | `codex/span-simplify-ui` | Integrated; coordinator and independent review passed; 22 lifecycle tests passed |
 | S2 | Keep report and source metadata together | page-layout | `codex/span-simplify-ui` | Integrated; coordinator and independent review passed; 23 lifecycle tests passed |
 | S3 | Share consuming report finalization | backend-analysis | `codex/span-simplify-backend` | Integrated; coordinator and independent review passed; 87 focused checks, 1,682 Rust tests, stress, fmt, clippy, and release passed |
+| S4 | Own mounted numeric-plot details and release replaced report roots | details-minimal | `codex/span-simplify-details` | Assigned; review the implementation and mounted browser coverage before integration |
 
-Point-details lifecycle ownership is a larger architecture candidate. Review
-its interface and interaction coverage separately before accepting a restructure.
+The user delegated architecture choices to the coordinator. S4 consolidates
+hover retention, focus, positioning, and geometry cleanup behind one mounted
+details interface while preserving numeric plot rendering and report contracts.
+Clear the previous independent report render root when its host is replaced.
+Replace shallow helper tests with Vitest-driven browser interaction coverage
+using the existing Playwright dependency, and install Chromium in the UI CI job.
