@@ -14,6 +14,9 @@ export interface PageEls {
   filterBar: HTMLElement;
   loading: HTMLElement;
   error: HTMLElement;
+  catalogSelection: HTMLElement;
+  catalogSelectedName: HTMLElement;
+  btnToggleCatalog: HTMLButtonElement;
   catalogWrap: HTMLElement;
   catalog: HTMLTableElement;
   catalogBody: HTMLElement;
@@ -35,6 +38,9 @@ export function pageEls(): PageEls {
     filterBar: byId("filter-bar"),
     loading: byId("loading"),
     error: byId("error"),
+    catalogSelection: byId("catalog-selection"),
+    catalogSelectedName: byId("catalog-selected-name"),
+    btnToggleCatalog: byId<HTMLButtonElement>("btn-toggle-catalog"),
     catalogWrap: byId("catalog-wrap"),
     catalog: byId<HTMLTableElement>("catalog"),
     catalogBody: byId("catalog-body"),

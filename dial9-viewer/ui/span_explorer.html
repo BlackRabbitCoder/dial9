@@ -29,6 +29,11 @@
   .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 
   /* Catalog table */
+  .catalog-selection { flex-shrink: 0; display: flex; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid #333; background: #161b22; font-size: 0.82em; }
+  .catalog-selected-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .catalog-selection button { margin-left: auto; flex-shrink: 0; cursor: pointer; padding: 4px 10px; border: 1px solid #444; border-radius: 4px; background: #21262d; color: #a8c8ee; font: inherit; }
+  .catalog-selection button:hover { background: #28394d; border-color: #8bb7e8; }
+  .catalog-selection button:focus-visible { outline: 2px solid #8bb7e8; outline-offset: 2px; }
   .catalog-wrap { flex: 0 0 auto; max-height: 35vh; overflow-y: auto; border-bottom: 1px solid #333; }
   table { width: 100%; border-collapse: collapse; font-size: 0.82em; }
   th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid #21262d; white-space: nowrap; }
@@ -207,6 +212,11 @@
 <div class="main" id="main">
   <div class="loading" id="loading"><div class="spinner"></div>Loading span statistics…</div>
   <div class="error" id="error"></div>
+
+  <div class="catalog-selection" id="catalog-selection" style="display:none">
+    <span class="catalog-selected-name" id="catalog-selected-name"></span>
+    <button id="btn-toggle-catalog" aria-controls="catalog-wrap" aria-expanded="false">Change span</button>
+  </div>
 
   <div class="catalog-wrap" id="catalog-wrap" style="display:none">
     <table id="catalog">

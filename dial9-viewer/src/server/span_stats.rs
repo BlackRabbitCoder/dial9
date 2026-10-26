@@ -6,6 +6,7 @@
 //! Uses the same scope/resolve/fold pipeline as `/api/flamegraph`. Reads
 //! `spans/` part-files (written by the v5 fold) for each folded source file.
 mod spans_reader;
+pub(crate) mod tail;
 
 #[cfg(test)]
 use spans_reader::parse_map_column;
@@ -1070,6 +1071,7 @@ impl SpanStatsAccum {
             attributes,
             composition,
             details_complete,
+            ..
         } = row;
         // Attribute filters narrow the entire aggregate: a non-matching row
         // contributes to no counts, histograms, composition, or exemplars.
@@ -1289,6 +1291,11 @@ impl SpanStatsAccum {
             elapsed_ns,
             exemplar: Some(exemplar),
             attributes: span.attributes,
+            attribute_units: span.attribute_units,
+            observed_active_wall_ns: Some(to_i64(
+                "observed_active_wall_ns",
+                span.observed_active_wall_ns,
+            )?),
             composition: Some(composition),
             details_complete: Some(span.details_complete),
         })
@@ -1553,6 +1560,8 @@ mod tests {
             elapsed_ns: unknown_ns,
             exemplar: None,
             attributes: Vec::new(),
+            attribute_units: Vec::new(),
+            observed_active_wall_ns: None,
             composition: Some(RowComposition {
                 on_cpu_ns: 0,
                 blocked_ns: 0,
@@ -1620,6 +1629,7 @@ mod tests {
                     details_complete: *complete,
                     concurrent: false,
                     parent_span_uid: None,
+                    attribute_units: Vec::new(),
                     attributes: attrs.clone(),
                     on_cpu_ns_est: None,
                     blocked_ns_est: None,
@@ -1701,6 +1711,7 @@ mod tests {
             details_complete: true,
             concurrent: false,
             parent_span_uid: None,
+            attribute_units: Vec::new(),
             attributes: Vec::new(),
             on_cpu_ns_est: None,
             blocked_ns_est: None,
@@ -1819,6 +1830,7 @@ mod tests {
                     details_complete: true,
                     concurrent: false,
                     parent_span_uid: None,
+                    attribute_units: Vec::new(),
                     attributes: Vec::new(),
                     on_cpu_ns_est: None,
                     blocked_ns_est: None,
@@ -1894,6 +1906,7 @@ mod tests {
                     details_complete: true,
                     concurrent: false,
                     parent_span_uid: None,
+                    attribute_units: Vec::new(),
                     attributes: Vec::new(),
                     on_cpu_ns_est: None,
                     blocked_ns_est: None,
@@ -1981,6 +1994,7 @@ mod tests {
             details_complete: false,
             concurrent: false,
             parent_span_uid: None,
+            attribute_units: Vec::new(),
             attributes: vec![],
             on_cpu_ns_est: Some(on_cpu),
             blocked_ns_est: None,
@@ -2104,6 +2118,7 @@ mod tests {
                 details_complete: true,
                 concurrent: false,
                 parent_span_uid: None,
+                attribute_units: Vec::new(),
                 attributes: Vec::new(),
                 on_cpu_ns_est: None,
                 blocked_ns_est: None,
@@ -2685,6 +2700,7 @@ mod tests {
             details_complete: true,
             concurrent: false,
             parent_span_uid: None,
+            attribute_units: Vec::new(),
             attributes: vec![
                 ("http.method".to_string(), "GET".to_string()),
                 ("http.path".to_string(), "/api/users".to_string()),
@@ -2910,6 +2926,7 @@ mod tests {
             details_complete: true,
             concurrent: false,
             parent_span_uid: None,
+            attribute_units: Vec::new(),
             attributes: Vec::new(),
             on_cpu_ns_est: None,
             blocked_ns_est: None,

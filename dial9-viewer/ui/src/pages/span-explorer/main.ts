@@ -35,6 +35,7 @@ import {
   removeAttrFilter,
   shouldAdoptCatalogSnapshot,
   sourceScopeFromStored,
+  spanTypeLabel,
 } from "../../lib/trace/index.js";
 import type {
   AttrFilter,
@@ -54,6 +55,7 @@ import {
   type SortKey,
 } from "./catalog.js";
 import { renderDetail } from "./detail.js";
+import { SpanTailAnalysis } from "./tail-analysis.js";
 import { renderFilterBar } from "./filters.js";
 import {
   retainMatchedHistogramPair,
@@ -80,6 +82,7 @@ import {
 } from "./raw.js";
 
 const els = pageEls();
+const tailAnalysis = new SpanTailAnalysis();
 
 // URL params are read ONCE: the load scope is fixed for the page's lifetime.
 const params = new URLSearchParams(window.location.search);
@@ -99,6 +102,7 @@ els.btnCopyLink.style.display = isSourceShareable(scope.source) ? "" : "none";
 
 let spanTypes: SpanTypeStats[] = [];
 let selectedUid = params.get("span_type_uid");
+let catalogExpanded = false;
 let band: DurationBand = {
   min_ns:
     params.get("min_span_ns") != null
@@ -205,9 +209,13 @@ function statsBadge(): string {
   return badge;
 }
 
-function renderDetailNow(): void {
+function renderDetailNow(loading = false): void {
+  const selected = loading
+    ? undefined
+    : spanTypes.find(s => s.span_type_uid === selectedUid);
   renderDetail(els.detailPanel, {
-    spanType: spanTypes.find((s) => s.span_type_uid === selectedUid),
+    spanType: selected,
+    loading,
     band,
     coverage: lastCoverage,
     attrFilters,
@@ -238,10 +246,30 @@ function renderDetailNow(): void {
       renderDetailNow();
     },
   });
+  tailAnalysis.mount(els.detailPanel.querySelector(".span-tail-mount"), selected ? {
+    spanType: selected, scope, view: view(),
+    headers: Dial9Session.headers(Dial9Creds.headers()),
+    onClearBand: () => applyBand({ min_ns: null, max_ns: null }),
+    onBand: (minMs, maxMs) => applyBand({
+      min_ns: minMs == null ? null : Math.round(minMs * 1e6),
+      max_ns: maxMs == null ? null : Math.round(maxMs * 1e6),
+    }),
+  } : null);
 }
 
 function renderCatalogNow(): void {
   renderCatalog(els, spanTypes, sort, selectedUid, selectSpanType);
+  const selected = spanTypes.find(s => s.span_type_uid === selectedUid);
+  const expanded = !selected || catalogExpanded;
+  els.catalogSelection.style.display = selected ? "flex" : "none";
+  // The expanded catalog already contains the selected name in its row.
+  els.catalogSelectedName.textContent = selected
+    ? expanded ? "Choose a span type" : spanTypeLabel(selected)
+    : "";
+  els.catalogSelectedName.title = els.catalogSelectedName.textContent;
+  els.btnToggleCatalog.textContent = expanded ? "Hide span list" : `Change span · ${spanTypes.length}`;
+  els.btnToggleCatalog.setAttribute("aria-expanded", String(expanded));
+  els.catalogWrap.style.display = spanTypes.length && expanded ? "block" : "none";
 }
 
 function renderFilterBarNow(): void {
@@ -288,6 +316,7 @@ function selectSpanType(uid: string): void {
     stopStreaming();
   stopComparisonStreaming(true);
   selectedUid = uid;
+  catalogExpanded = false;
   band = { min_ns: null, max_ns: null };
   const needsRefresh =
     !rawMode && exemplarScopeByUid.get(uid) !== exemplarScopeKey(view());
@@ -296,6 +325,7 @@ function selectSpanType(uid: string): void {
   syncUrl();
   renderCatalogNow();
   renderDetailNow();
+  els.btnToggleCatalog.focus({ preventScroll: true });
   if (needsRefresh) startStreaming("exemplars");
   if (attrFilters.length > 0) startComparisonStreaming();
 }
@@ -371,9 +401,17 @@ function startStreaming(mode: StreamMode): void {
   updateStreamingUi();
   els.error.style.display = "none";
   if (mode === "replace") {
+    catalogExpanded = false;
+    spanTypes = [];
+    lastCoverage = null;
+    exemplarScopeByUid.clear();
     els.loading.classList.remove("hidden");
+    els.stats.textContent = "Loading span statistics…";
+    els.catalogSelection.style.display = "none";
     els.catalogWrap.style.display = "none";
-    els.detailPanel.className = "detail-panel empty";
+    // The new time scope has no authoritative detail yet. Retire its old
+    // analysis request and remove stale graph actions until a snapshot arrives.
+    renderDetailNow(true);
   }
 
   const token = ++streamToken;
@@ -489,6 +527,8 @@ function startStreaming(mode: StreamMode): void {
           (mode === "exemplars" && !exemplarSnapshotAdopted
             ? " · exemplar refresh incomplete"
             : " · refined");
+      } else if (mode === "replace") {
+        showError("No span statistics returned for this source.");
       }
       if (mode === "replace" || mode === "refine") {
         refreshComparisonAfterBaseline();
@@ -677,6 +717,9 @@ els.btnStop.addEventListener("click", () => {
   stopComparisonStreaming(false);
   if (stoppedComparison) comparisonError = "Comparison stopped.";
   if (stoppedMode !== "exemplars") exemplarRefreshPending = false;
+  if (stoppedMode === "replace" && spanTypes.length === 0) {
+    showError("Span statistics loading cancelled.");
+  }
   renderFilterBarNow();
   renderDetailNow();
   if (stoppedMode != null) els.stats.textContent = `${statsBadge()} · stopped`;
@@ -703,6 +746,14 @@ els.catalog.querySelector("thead")?.addEventListener("click", (e) => {
   if (!key) return;
   sort = nextSort(sort, key as SortKey);
   renderCatalogNow();
+});
+
+els.btnToggleCatalog.addEventListener("click", () => {
+  catalogExpanded = !catalogExpanded;
+  renderCatalogNow();
+  if (catalogExpanded) {
+    els.catalogBody.querySelector(".selected")?.scrollIntoView({ block: "nearest" });
+  }
 });
 
 // ── Boot ──
