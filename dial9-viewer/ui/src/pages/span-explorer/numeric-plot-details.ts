@@ -1,11 +1,12 @@
 import { html, nothing, render } from "lit-html";
 import { ref } from "lit-html/directives/ref.js";
 import type { TailRecord, TailSignal, TailValueAxis } from "../../lib/trace/span-tail-analysis.js";
-import { duration, fieldValue } from "./numeric-presentation.js";
+import { duration, fieldValue, number } from "./numeric-presentation.js";
 
 interface NumericPlotDetailsModel {
   signal: Pick<TailSignal, "key" | "points" | "density">;
   axis: TailValueAxis;
+  cellBounds: ((index: number) => { x: number; y: number; width: number; height: number }) | null;
   onJump: (record: TailRecord) => void;
 }
 
@@ -43,6 +44,16 @@ function recordedFields(record: TailRecord) {
       : omitted != null && omitted > 0 ? "All recorded fields omitted by response limits" : "No recorded fields included"}</small>`}
     ${omitted == null ? html`<small>Additional field count unavailable</small>`
       : omitted > 0 ? html`<small>${omitted} ${record.attributes.length ? "additional " : ""}recorded ${omitted === 1 ? "field" : "fields"} omitted · inspect the trace for more</small>` : nothing}`;
+}
+
+/** Keep narrow bin endpoints distinct when the normal display rounds them alike. */
+function interval(edges: readonly number[], bin: number, format: (value: number) => string, unit: string | null) {
+  const lower = edges[bin]!, upper = edges[bin + 1]!;
+  let start = format(lower), end = format(upper);
+  const raw = (value: number) => `${value}${unit ? ` ${unit}` : " (unit not recorded)"}`;
+  if (lower !== upper && start === end) { start = raw(lower); end = raw(upper); }
+  const closing = bin === edges.length - 2 ? "]" : ")";
+  return html`<span title=${`[${raw(lower)}, ${raw(upper)}${closing}`}>[${start}, ${end}${closing}</span>`;
 }
 
 function readGeometry(elements: readonly Element[]): string {
@@ -105,7 +116,7 @@ function mountDetails(tooltip: HTMLElement, model: NumericPlotDetailsModel): () 
     point.setAttribute("tabindex", point === entry ? "0" : "-1");
     point.setAttribute("aria-pressed", "false");
   });
-  type Inspection = { index: number | null; origin: Element; keyboard: boolean; nearby: boolean; unavailable?: string };
+  type Inspection = { index: number | null; cellIndex: number | null; origin: Element; keyboard: boolean; nearby: boolean; unavailable?: string };
   let current: Inspection | null = null;
   let placementGeometry = "";
   let pinned = false;
@@ -119,6 +130,10 @@ function mountDetails(tooltip: HTMLElement, model: NumericPlotDetailsModel): () 
     if (focusFrame != null) view.cancelAnimationFrame(focusFrame);
     focusFrame = null;
   };
+  const clearHighlights = () => {
+    svg.querySelectorAll("[data-inspected]").forEach(mark => mark.removeAttribute("data-inspected"));
+    points().forEach(point => point.setAttribute("aria-pressed", "false"));
+  };
   const hide = (restoreFocus = false) => {
     retain();
     cancelFocus();
@@ -127,7 +142,7 @@ function mountDetails(tooltip: HTMLElement, model: NumericPlotDetailsModel): () 
     pinned = false;
     tooltip.hidden = true;
     tooltip.dataset.pinned = "false";
-    points().forEach(point => point.setAttribute("aria-pressed", "false"));
+    clearHighlights();
     if (activeInspectors.get(doc) === owner) {
       activeInspectors.delete(doc);
       view.removeEventListener("keydown", escape);
@@ -180,17 +195,27 @@ function mountDetails(tooltip: HTMLElement, model: NumericPlotDetailsModel): () 
     }
     retain();
     cancelFocus();
-    const changed = current?.index !== inspection.index || current?.keyboard !== inspection.keyboard
+    const changed = current?.index !== inspection.index || current?.cellIndex !== inspection.cellIndex || current?.keyboard !== inspection.keyboard
       || current?.nearby !== inspection.nearby || current?.unavailable !== inspection.unavailable || pinned !== pin;
     current = inspection;
     pinned = pin && inspection.index != null;
     tooltip.dataset.pinned = String(pinned);
     if (changed) {
       const point = inspection.index == null ? null : signal.points[inspection.index];
+      const cell = inspection.cellIndex;
       render(html`<div class="tail-inspector-heading"><strong>Span details</strong>
           <span>${pinned ? "Pinned" : point ? "Click to pin" : "Unavailable"}</span></div>
-        ${point ? html`<strong>${duration(point[0])} elapsed</strong>
-          <span>${signal.key}: ${fieldValue(point[1] * axis.multiplier, axis.unit)}</span>
+        ${density && cell != null ? html`<div class="tail-density-context">
+          <strong>Density box · ${number(density.counts[cell]!)} spans</strong>
+          <span>Box X · Elapsed: ${interval(density.elapsedEdgesMs, cell % xBins, duration, "ms")}</span>
+          <span>Box Y · ${signal.key}: ${interval(density.valueEdges, Math.floor(cell / xBins),
+            value => fieldValue(value, axis.unit), axis.unit)}</span>
+        </div>` : html`<small class="tail-density-context">${density
+          ? "Sample outside returned density bounds" : "Density box unavailable in this cached report"}</small>`}
+        ${point ? html`<div class="tail-sample-coordinates">
+          <strong>Sample X · ${duration(point[0])} elapsed</strong>
+          <span>Sample Y · ${signal.key}: ${fieldValue(point[1] * axis.multiplier, axis.unit)}</span>
+          </div>
           ${inspection.nearby ? html`<small>Nearby retained span · no trace sample in this cell</small>` : nothing}
           <div class="tail-inspector-actions">
             <button type="button" class="tail-tooltip-trace" @click=${() => {
@@ -206,30 +231,51 @@ function mountDetails(tooltip: HTMLElement, model: NumericPlotDetailsModel): () 
           ${inspection.keyboard ? html`<small>Arrows choose samples · Enter pins · Tab inspects fields · Escape clears</small>` : nothing}`
           : html`<small>${inspection.unavailable}</small>`}`, tooltip);
     }
-    points().forEach(point => point.setAttribute("aria-pressed", String(pinned && Number(point.dataset.pointIndex) === inspection.index)));
+    clearHighlights();
+    if (inspection.index != null) {
+      const point = points()[inspection.index]!;
+      point.dataset.inspected = "true";
+      point.setAttribute("aria-pressed", String(pinned));
+      const ring = svg.querySelector<SVGCircleElement>(".tail-sample-highlight")!;
+      ring.setAttribute("cx", point.getAttribute("cx")!);
+      ring.setAttribute("cy", point.getAttribute("cy")!);
+      ring.setAttribute("r", String(Number(point.getAttribute("r")) + 2));
+      ring.dataset.pointIndex = String(inspection.index);
+      ring.dataset.inspected = "true";
+    }
+    if (inspection.cellIndex != null && model.cellBounds) {
+      const outline = svg.querySelector<SVGRectElement>(".tail-density-highlight")!;
+      Object.entries(model.cellBounds(inspection.cellIndex)).forEach(([key, value]) => outline.setAttribute(key, String(value)));
+      outline.dataset.cellIndex = String(inspection.cellIndex);
+      outline.dataset.inspected = "true";
+    }
     tooltip.setAttribute("role", "dialog");
     tooltip.setAttribute("aria-label", "Span details");
     tooltip.setAttribute("aria-live", inspection.keyboard ? "polite" : "off");
     tooltip.hidden = false;
     place();
   };
+  const cellForPoint = (index: number): number | null => {
+    if (!density) return null;
+    const bin = (value: number, edges: readonly number[]) => edges.slice(0, -1).findIndex((lower, index) =>
+      value >= lower && (value < edges[index + 1]! || index === edges.length - 2 && value <= edges[index + 1]!));
+    const [elapsed, raw] = signal.points[index]!;
+    const x = bin(elapsed, density.elapsedEdgesMs), y = bin(raw * axis.multiplier, density.valueEdges);
+    return x < 0 || y < 0 ? null : y * xBins + x;
+  };
   const showPoint = (element: SVGCircleElement, keyboard: boolean, pin = false) => {
     const index = Number(element.dataset.pointIndex);
-    if (signal.points[index]) show({ index, origin: element, keyboard, nearby: false }, pin);
+    if (signal.points[index]) show({ index, cellIndex: cellForPoint(index), origin: element, keyboard, nearby: false }, pin);
   };
   const showCell = (origin: Element, index: number, keyboard: boolean, pin = false, cursor?: { x: number; y: number }) => {
     if (!density) return;
     if (!density.counts[index] || !signal.points.length) {
-      show({ index: null, origin, keyboard, nearby: false, unavailable: density.counts[index]
+      show({ index: null, cellIndex: index, origin, keyboard, nearby: false, unavailable: density.counts[index]
         ? "No retained trace sample is available for this plot."
         : "No recorded spans in this cell." });
       return;
     }
-    const x = index % xBins, y = Math.floor(index / xBins);
-    const inside = (value: number, edges: readonly number[], bin: number) => value >= edges[bin]!
-      && (value < edges[bin + 1]! || bin === edges.length - 2 && value <= edges[bin + 1]!);
-    const candidates = signal.points.flatMap(([elapsed, raw], pointIndex) =>
-      inside(elapsed, density.elapsedEdgesMs, x) && inside(raw * axis.multiplier, density.valueEdges, y) ? [pointIndex] : []);
+    const candidates = signal.points.flatMap((_, pointIndex) => cellForPoint(pointIndex) === index ? [pointIndex] : []);
     const nearby = !candidates.length;
     const cell = svg.querySelector<SVGRectElement>(`.tail-density-cell[data-cell-index='${index}']`)!.getBoundingClientRect();
     const target = cursor ?? { x: cell.left + cell.width / 2, y: cell.top + cell.height / 2 };
@@ -240,7 +286,7 @@ function mountDetails(tooltip: HTMLElement, model: NumericPlotDetailsModel): () 
       const next = (mark.left + mark.width / 2 - target.x) ** 2 + (mark.top + mark.height / 2 - target.y) ** 2;
       if (next < distance) { nearest = pointIndex; distance = next; }
     }
-    show({ index: nearest, origin, keyboard, nearby }, pin);
+    show({ index: nearest, cellIndex: index, origin, keyboard, nearby }, pin);
   };
   const pointTarget = (event: Event) => event.target instanceof view.SVGCircleElement
     && event.target.matches(".tail-trace-point") ? event.target : null;

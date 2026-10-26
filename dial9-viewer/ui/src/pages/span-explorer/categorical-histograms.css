@@ -57,5 +57,4 @@
   .tail-category-tooltip-series { column-gap: 8px; }
   .tail-category-marker { max-width: 90px; font-size: 9px; }
   .tail-category-x { font-size: 9px; }
-  .tail-category-x > span:nth-child(2) { display: none; }
 }

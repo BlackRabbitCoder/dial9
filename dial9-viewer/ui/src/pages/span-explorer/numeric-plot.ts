@@ -41,8 +41,9 @@ function elapsedEdges(signal: TailSignal, options: NumericPlotOptions): readonly
   const times = options.signals.flatMap(s => s.points.map(([elapsed]) => elapsed)).filter(n => n > 0);
   const low = times.length ? 10 ** Math.floor(Math.log10(Math.min(...times))) : 1e-6;
   const maximum = Math.max(low, options.boundaryMs, options.maxMs ?? 0, ...times);
-  const high = Math.max(low * 10, 10 ** Math.ceil(Math.log10(maximum)));
-  return [0, ...Array.from({ length: 37 }, (_, i) => low * (high / low) ** (i / 36))];
+  if (maximum === low) return [0, maximum];
+  return [0, ...new Set(Array.from({ length: 37 }, (_, i) => i === 36
+    ? maximum : Math.min(maximum, low * (maximum / low) ** (i / 36))))];
 }
 
 /** Renders backend count cells and a distinct bounded sample of recorded spans. */
@@ -72,6 +73,28 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
     for (let exponent = tickStart; exponent <= tickEnd; exponent += tickStride) ticks.push(10 ** exponent);
     if (ticks.at(-1)! < edges.at(-1)!) ticks.push(edges.at(-1)!);
   }
+  // Exact maxima can sit beside a decade tick with the same rounded label.
+  // The first positive column can also sit beside zero.
+  const end = ticks.at(-1)!, endLabel = axisNumber(end);
+  let previous = ticks[0]!;
+  const visibleTicks = ticks.filter((elapsed, index) => {
+    if (index === 0 || index === ticks.length - 1) return true;
+    const label = axisNumber(elapsed), previousLabel = axisNumber(previous);
+    const previousWidth = previousLabel.length * (previous === ticks[0]! ? 6 : 3);
+    if (label === previousLabel || label === endLabel
+      || px(elapsed) - px(previous) < previousWidth + label.length * 3 + 8
+      || px(end) - px(elapsed) < endLabel.length * 6 + label.length * 3 + 8) return false;
+    previous = elapsed;
+    return true;
+  });
+  const cellBounds = (index: number) => {
+    const x = index % xBins, y = Math.floor(index / xBins);
+    return {
+      x: px(edges[x]!), y: py(density!.valueEdges[y + 1]!),
+      width: px(edges[x + 1]!) - px(edges[x]!),
+      height: (density!.valueEdges[y + 1]! - density!.valueEdges[y]!) / (axis.maximum - axis.minimum) * (bottom - top) + .1,
+    };
+  };
   const marker = (elapsed: number, label: string, y: number) => {
     if (elapsed < edges[0]! || elapsed > edges.at(-1)!) {
       return svg`<text class="tail-cutoff-label" x=${elapsed < edges[0]! ? left : right} y=${y}
@@ -89,21 +112,19 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
       ${[0, .5, 1].map(f => svg`<text x=${left - 6} y=${py(axis.minimum + f * (axis.maximum - axis.minimum)) + 4} text-anchor="end">${numericAxisTick(axis.minimum + f * (axis.maximum - axis.minimum), axis.unit)}</text>`)}
       ${density ? density.counts.map((count, index) => {
         if (!count) return nothing;
-        const x = index % xBins, y = Math.floor(index / xBins);
-        const cellY = py(density.valueEdges[y + 1]!);
-        const cellHeight = (density.valueEdges[y + 1]! - density.valueEdges[y]!) / (axis.maximum - axis.minimum) * (bottom - top) + .1;
-        return svg`<rect class="tail-density-cell" x=${px(edges[x]!)}
-          y=${cellY} width=${px(edges[x + 1]!) - px(edges[x]!)}
-          height=${cellHeight} fill=${densityColor(count, density.maxCount)}
+        const x = index % xBins, bounds = cellBounds(index);
+        return svg`<rect class="tail-density-cell" x=${bounds.x}
+          y=${bounds.y} width=${bounds.width}
+          height=${bounds.height} fill=${densityColor(count, density.maxCount)}
           data-count=${count} data-cell-index=${index}></rect>
           ${densityCellSegments(edges, x, options.boundaryMs, options.maxMs).filter(segment => segment.selected).map(segment => svg`
           <rect class="tail-density-selected" x=${px(histogramPositionToLatency(edges, segment.start))}
-          y=${cellY} width=${px(histogramPositionToLatency(edges, segment.end)) - px(histogramPositionToLatency(edges, segment.start))}
-          height=${cellHeight} fill=${densityColor(count, density.maxCount, true)}
+          y=${bounds.y} width=${px(histogramPositionToLatency(edges, segment.end)) - px(histogramPositionToLatency(edges, segment.start))}
+          height=${bounds.height} fill=${densityColor(count, density.maxCount, true)}
           data-cell-index=${index} pointer-events="none"></rect>`)}`;
       }) : nothing}
       ${[0, .5, 1].map(f => svg`<path d="M${left} ${py(axis.minimum + f * (axis.maximum - axis.minimum))}H${right}" stroke="#516475" stroke-opacity=".55" stroke-dasharray="2 3" pointer-events="none"></path>`)}
-      ${ticks.map((elapsed, i) => svg`<text x=${px(elapsed)} y=${bottom + 17} text-anchor=${i === 0 ? "start" : i === ticks.length - 1 ? "end" : "middle"}>${elapsed === 0 ? "0" : axisNumber(elapsed)}</text>`)}
+      ${visibleTicks.map((elapsed, i) => svg`<text x=${px(elapsed)} y=${bottom + 17} text-anchor=${i === 0 ? "start" : i === visibleTicks.length - 1 ? "end" : "middle"}>${elapsed === 0 ? "0" : axisNumber(elapsed)}</text>`)}
       <path d="M${left} ${top}V${bottom}H${right}" fill="none" stroke="#687584" pointer-events="none"></path>
       <text x=${left} y="13" class="tail-axis-unit">${axis.unit ?? "unit not recorded"}</text>
       ${marker(options.boundaryMs, band ? `Start: ${duration(options.boundaryMs)}` : `p${options.percentile}: ${duration(options.boundaryMs)}`, 27)}
@@ -115,11 +136,13 @@ export function renderNumericPlot(signal: TailSignal, options: NumericPlotOption
         aria-keyshortcuts="ArrowLeft ArrowRight Home End Enter Space Escape"
         aria-label="${duration(elapsed)} elapsed; ${signal.key} ${fieldValue(raw * axis.multiplier, axis.unit)}. Click to pin span details."
         data-point-index=${index}></circle>`)}
+      ${density ? svg`<rect class="tail-density-highlight" aria-hidden="true" pointer-events="none"></rect>` : nothing}
+      <circle class="tail-sample-highlight" aria-hidden="true" pointer-events="none"></circle>
       <text x=${(left + right) / 2} y=${height - 3} text-anchor="middle">Span elapsed (ms · ${elapsedScale} scale) →</text>
     </svg>
     <div class="tail-plot-tooltip" role="dialog" aria-label="Span details" hidden
       ${numericPlotDetails({
-        signal, axis,
+        signal, axis, cellBounds: density ? cellBounds : null,
         onJump: options.onJump,
       })}></div>
     <div class="tail-density-legend">${density ? html`

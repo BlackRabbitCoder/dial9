@@ -91,6 +91,341 @@ async function report() {
 }
 
 describe("mounted numeric plot details", () => {
+  it("shows enclosing density bounds and highlights the actual hovered sample without pinning", async () => {
+    await points().first().hover();
+    await visible();
+    const box = tooltip().locator(".tail-density-context");
+    expect(await box.count()).toBe(1);
+    expect(await box.textContent()).toContain("Density box · 500 spans");
+    expect(await box.textContent()).toContain("Box X · Elapsed: [1ms, 100ms]");
+    expect(await box.textContent()).toContain("Box Y · work_time: [0 ms, 6 ms)");
+    expect(await tooltip().locator(".tail-sample-coordinates").textContent()).toContain("Sample X · 1ms elapsed");
+    expect(await tooltip().locator(".tail-sample-coordinates").textContent()).toContain("Sample Y · work_time: 1 ms");
+    expect(await points().first().getAttribute("aria-pressed")).toBe("false");
+    expect(await points().first().getAttribute("data-inspected")).toBe("true");
+    const ring = page.locator("#plots .tail-sample-highlight[data-inspected='true']");
+    expect(await ring.count()).toBe(1);
+    expect(await ring.getAttribute("data-point-index")).toBe("0");
+    expect(await ring.evaluate(element => getComputedStyle(element).pointerEvents)).toBe("none");
+    const outline = page.locator("#plots .tail-density-highlight[data-inspected='true']");
+    expect(await outline.getAttribute("data-cell-index")).toBe("1");
+    expect(await outline.evaluate(element => getComputedStyle(element).pointerEvents)).toBe("none");
+    expect(await points().first().evaluate(element => getComputedStyle(element).stroke)).toBe("rgb(71, 197, 235)");
+    await page.keyboard.press("Escape");
+    await visible(false);
+    expect(await page.locator("#plots [data-inspected='true']").count()).toBe(0);
+  });
+
+  it("updates adjacent box context while keeping the same nearby retained sample", async () => {
+    await page.evaluate(() => window.numericPlotHarness.draw({ points: 1,
+      fields: { attributes: [["sample", "one retained record"]], attributesOmitted: 0 },
+    }));
+    await resources(1);
+    const cells = page.locator("#plots .tail-density-cell");
+    await cells.first().hover();
+    await visible();
+    expect(await tooltip().locator(".tail-density-context").count()).toBe(1);
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("9,000 spans");
+    expect(await tooltip().locator("dd").allTextContents()).toEqual(["one retained record"]);
+    expect(await tooltip().textContent()).toContain("Nearby retained span");
+    const initial = await tooltip().boundingBox();
+    const last = cells.last(), rect = await last.boundingBox();
+    await last.hover({ position: { x: rect!.width - 10, y: 10 } });
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("500 spans");
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("Box Y · work_time: [6 ms, 12 ms]");
+    expect(await tooltip().locator("dd").allTextContents()).toEqual(["one retained record"]);
+    expect(await tooltip().boundingBox()).toEqual(initial);
+    expect(await page.locator(".tail-density-highlight").getAttribute("data-cell-index")).toBe("3");
+    expect(await page.locator(".tail-sample-highlight").getAttribute("data-point-index")).toBe("0");
+    expect(Number(await page.locator(".tail-sample-highlight").getAttribute("cy"))).toBeGreaterThan(
+      Number(await page.locator(".tail-density-highlight").getAttribute("y"))
+        + Number(await page.locator(".tail-density-highlight").getAttribute("height")));
+  });
+
+  it("shows truthful empty-box context and outline without inventing a sample", async () => {
+    await page.locator("#plots .tail-scatter").focus();
+    await visible();
+    await page.keyboard.press("ArrowUp");
+    expect(await tooltip().locator(".tail-density-context").count()).toBe(1);
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("Density box · 0 spans");
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("Box X · Elapsed: [0ns, 1ms)");
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("Box Y · work_time: [6 ms, 12 ms]");
+    expect(await tooltip().textContent()).toContain("No recorded spans in this cell");
+    expect(await tooltip().locator(".tail-sample-coordinates, .tail-tooltip-trace").count()).toBe(0);
+    expect(await page.locator(".tail-density-highlight[data-inspected='true']").getAttribute("data-cell-index")).toBe("2");
+    expect(await page.locator(".tail-sample-highlight[data-inspected='true']").count()).toBe(0);
+    expect(await page.locator(".tail-trace-point[aria-pressed='true']").count()).toBe(0);
+  });
+
+  it.each(["log", "linear"] as const)("keeps exact maximum membership, distinct narrow bounds and readable endpoint ticks on %s", async elapsedScale => {
+    await page.evaluate(elapsedScale => {
+      const base = window.numericPlotHarness.reportResponse().report.signals[0]!;
+      const maximum = 100.000001, values = [0, 6, 6.000001], elapsed = [0, 100, maximum];
+      window.numericPlotHarness.draw({ elapsedScale, signal: {
+        valueAxis: { unit: "ms", multiplier: 1e-6, minimum: 0, maximum: values[2]! },
+        density: { elapsedEdgesMs: [0, 1, 100, maximum], valueEdges: [0, 6, values[2]!],
+          counts: [1, 2, 3, 4, 5, 6], count: 21, maxCount: 6 },
+        points: base.points.map(([, , record], index) => [elapsed[index]!, values[index]! * 1e6,
+          { ...record, elapsedMs: elapsed[index]! }]),
+      } });
+    }, elapsedScale);
+    await resources(1);
+    await points().first().focus();
+    await visible();
+    expect(await page.locator(".tail-density-highlight").getAttribute("data-cell-index")).toBe("0");
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("Box X · Elapsed: [0ns, 1ms)");
+    await page.keyboard.press("ArrowRight");
+    await expect.poll(() => page.locator(".tail-density-highlight").getAttribute("data-cell-index")).toBe("5");
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("Density box · 6 spans");
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("Box X · Elapsed: [100 ms, 100.000001 ms]");
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("Box Y · work_time: [6 ms, 6.000001 ms]");
+    expect(await tooltip().locator(".tail-density-context [title]").first().getAttribute("title"))
+      .toBe("[100 ms, 100.000001 ms]");
+    await page.keyboard.press("End");
+    await focused(".tail-trace-point[data-point-index='2']");
+    await expect.poll(() => page.locator(".tail-sample-highlight").getAttribute("data-point-index")).toBe("2");
+    expect(await page.locator(".tail-density-highlight").getAttribute("data-cell-index")).toBe("5");
+    expect(Number(await points().last().getAttribute("cx"))).toBeCloseTo(382, 9);
+    expect(await page.locator(".tail-density-legend").textContent()).toContain("21 recorded spans");
+    expect(await points().last().getAttribute("aria-pressed")).toBe("false");
+    const ticks = await page.locator(".tail-scatter text").evaluateAll(elements => elements
+      .filter(element => Number(element.getAttribute("y")) === 199)
+      .map(element => ({ text: element.textContent, left: element.getBoundingClientRect().left,
+        right: element.getBoundingClientRect().right })));
+    expect(ticks.filter(tick => tick.text === "100")).toHaveLength(1);
+    for (let index = 1; index < ticks.length; index++) expect(ticks[index]!.left).toBeGreaterThan(ticks[index - 1]!.right);
+    await page.keyboard.press("Enter");
+    await tooltip().locator(".tail-tooltip-trace").click();
+    expect(await page.evaluate(() => window.numericPlotHarness.jumps.at(-1)?.elapsedMs)).toBe(100.000001);
+  });
+
+  it.each([
+    { width: 1440, height: 1000, large: false },
+    { width: 1440, height: 1000, large: true },
+    { width: 390, height: 844, large: false },
+  ])("paints pointer-inert box and sample outlines at the actual $width viewport enlarged=$large", async ({ width, height, large }) => {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(large => window.numericPlotHarness.draw({ large }), large);
+    await resources(1);
+    await points().nth(1).hover();
+    await visible();
+    const outline = page.locator(".tail-density-highlight");
+    const cell = page.locator(".tail-density-cell[data-cell-index='3']");
+    for (const attribute of ["x", "y", "width", "height"]) {
+      expect(await outline.getAttribute(attribute)).toBe(await cell.getAttribute(attribute));
+    }
+    const paintedBox = await outline.boundingBox(), densityBox = await cell.boundingBox();
+    expect(paintedBox!.x).toBeCloseTo(densityBox!.x - .7, 3);
+    expect(paintedBox!.y).toBeCloseTo(densityBox!.y - .7, 3);
+    expect(paintedBox!.width).toBeCloseTo(densityBox!.width + 1.4, 3);
+    expect(paintedBox!.height).toBeCloseTo(densityBox!.height + 1.4, 3);
+    const point = points().nth(1), ring = page.locator(".tail-sample-highlight");
+    expect(await ring.getAttribute("cx")).toBe(await point.getAttribute("cx"));
+    expect(await ring.getAttribute("cy")).toBe(await point.getAttribute("cy"));
+    expect(Number(await ring.getAttribute("r"))).toBeGreaterThan(Number(await point.getAttribute("r")));
+    const painted = await point.evaluate(element => {
+      const point = element as SVGCircleElement, root = point.ownerSVGElement!;
+      const at = root.createSVGPoint();
+      at.x = Number(point.getAttribute("cx")); at.y = Number(point.getAttribute("cy"));
+      const screen = at.matrixTransform(root.getScreenCTM()!);
+      return document.elementFromPoint(screen.x, screen.y)?.getAttribute("data-point-index");
+    });
+    expect(painted).toBe("1");
+    await point.click();
+    expect(await point.getAttribute("aria-pressed")).toBe("true");
+    const pinned = await tooltip().textContent();
+    await points().last().hover();
+    expect(await tooltip().textContent()).toBe(pinned);
+    expect(await outline.getAttribute("data-cell-index")).toBe("3");
+    expect(await ring.getAttribute("data-point-index")).toBe("1");
+    await tooltip().getByRole("button", { name: "Unpin span details" }).click();
+    await visible(false);
+    expect(await page.locator("[data-inspected='true']").count()).toBe(0);
+    await points().last().hover();
+    await visible();
+    expect(await ring.getAttribute("data-point-index")).toBe("2");
+    // Teardown must be isolated from a fresh preview of newly exposed marks.
+    await page.mouse.move(width - 4, height - 4);
+    const cleared = await page.evaluate(() => {
+      window.numericPlotHarness.draw({ points: 1 });
+      return { hidden: document.querySelector<HTMLElement>(".tail-plot-tooltip")!.hidden,
+        inspected: document.querySelectorAll("[data-inspected='true']").length };
+    });
+    expect(cleared).toEqual({ hidden: true, inspected: 0 });
+    await resources(1);
+    await visible(false);
+    expect(await page.locator("[data-inspected='true']").count()).toBe(0);
+    await points().first().hover();
+    await visible();
+    await page.evaluate(() => window.numericPlotHarness.clear());
+    await resources(0);
+    expect(await page.locator("[data-inspected='true']").count()).toBe(0);
+  });
+
+  it("clears old highlights before a stationary pointer previews only the replacement model", async () => {
+    await page.evaluate(() => {
+      const base = window.numericPlotHarness.reportResponse().report.signals[0]!;
+      window.numericPlotHarness.draw({ fields: { attributes: [["sample", "old model"]], attributesOmitted: 0 },
+        signal: { points: base.points.map(([elapsed, value, record], index) => [
+          index === 2 ? 90 : elapsed, value, { ...record, elapsedMs: index === 2 ? 90 : elapsed,
+            attributes: [["sample", "old model"]], attributesOmitted: 0 },
+        ]) } });
+    });
+    await resources(1);
+    await points().last().hover();
+    await visible();
+    expect(await tooltip().locator("dd").allTextContents()).toEqual(["old model"]);
+    expect(await page.locator(".tail-sample-highlight").getAttribute("data-point-index")).toBe("2");
+    const cleared = await page.evaluate(() => {
+      window.numericPlotHarness.draw({ points: 1,
+        fields: { attributes: [["sample", "replacement model"]], attributesOmitted: 0 } });
+      return { hidden: document.querySelector<HTMLElement>(".tail-plot-tooltip")!.hidden,
+        inspected: document.querySelectorAll("[data-inspected='true']").length };
+    });
+    expect(cleared).toEqual({ hidden: true, inspected: 0 });
+    await resources(1);
+    // Removing the old mark exposes a populated cell under the native pointer.
+    await visible();
+    expect(await tooltip().locator("dd").allTextContents()).toEqual(["replacement model"]);
+    expect(await tooltip().textContent()).not.toContain("old model");
+    expect(await tooltip().locator(".tail-sample-coordinates").textContent()).toContain("1ms elapsed");
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("Density box · 500 spans");
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("Box Y · work_time: [6 ms, 12 ms]");
+    expect(await tooltip().textContent()).toContain("Nearby retained span");
+    expect(await points().count()).toBe(1);
+    expect(await points().first().getAttribute("data-inspected")).toBe("true");
+    expect(await points().first().getAttribute("aria-pressed")).toBe("false");
+    expect(await page.locator(".tail-sample-highlight[data-inspected='true']").getAttribute("data-point-index")).toBe("0");
+    expect(await page.locator(".tail-density-highlight[data-inspected='true']").getAttribute("data-cell-index")).toBe("3");
+    expect(await page.locator("[data-inspected='true']").count()).toBe(3);
+  });
+
+  it.each(["log", "linear"] as const)("ends legacy sample-only %s plots at retained samples or visible selection without padded decades", async elapsedScale => {
+    await page.evaluate(elapsedScale => {
+      const base = window.numericPlotHarness.reportResponse().report.signals[0]!;
+      window.numericPlotHarness.draw({ oldReport: true, elapsedScale, minMs: 0, signal: {
+        points: base.points.map(([, value, record]) => [100, value, { ...record, elapsedMs: 100 }]),
+      } });
+    }, elapsedScale);
+    await resources(1);
+    expect(await points().evaluateAll(elements => elements.map(element => Number(element.getAttribute("cx")))))
+      .toEqual([382, 382, 382]);
+    await points().first().focus();
+    await visible();
+    expect(await tooltip().locator(".tail-density-context").textContent()).toBe("Density box unavailable in this cached report");
+    expect(await page.locator(".tail-density-highlight").count()).toBe(0);
+    expect(await page.locator(".tail-sample-highlight[data-inspected='true']").count()).toBe(1);
+    expect(await tooltip().locator(".tail-density-context").textContent()).not.toContain("spans");
+    await page.evaluate(elapsedScale => {
+      const base = window.numericPlotHarness.reportResponse().report.signals[0]!;
+      window.numericPlotHarness.draw({ oldReport: true, elapsedScale, minMs: 0, signal: {
+        points: base.points.map(([, value, record], index) => [index === 2 ? 100.00000000000001 : 100,
+          value, { ...record, elapsedMs: index === 2 ? 100.00000000000001 : 100 }]),
+      } });
+    }, elapsedScale);
+    await resources(1);
+    const closeCoordinates = await points().evaluateAll(elements => elements.map(element => Number(element.getAttribute("cx"))));
+    expect(closeCoordinates.every(Number.isFinite)).toBe(true);
+    expect(closeCoordinates[2]).toBeCloseTo(382, 9);
+    await page.evaluate(elapsedScale => {
+      const base = window.numericPlotHarness.reportResponse().report.signals[0]!;
+      window.numericPlotHarness.draw({ oldReport: true, elapsedScale, maxMs: 150, signal: {
+        points: base.points.map(([, value, record]) => [100, value, { ...record, elapsedMs: 100 }]),
+      } });
+    }, elapsedScale);
+    await resources(1);
+    const end = await page.locator(".tail-boundary path").last().getAttribute("d");
+    expect(Number(end!.match(/^M([^ ]+)/)![1])).toBeCloseTo(382, 9);
+    expect(Number(await points().first().getAttribute("cx"))).toBeLessThan(382);
+    await page.evaluate(elapsedScale => {
+      const base = window.numericPlotHarness.reportResponse().report.signals[0]!;
+      window.numericPlotHarness.draw({ oldReport: true, elapsedScale, minMs: 0, signal: {
+        points: base.points.map(([, value, record]) => [0, value, { ...record, elapsedMs: 0 }]),
+      } });
+    }, elapsedScale);
+    await resources(1);
+    expect(await points().evaluateAll(elements => elements.map(element => Number(element.getAttribute("cx")))))
+      .toEqual([58, 58, 58]);
+  });
+
+  it.each(["log", "linear"] as const)("separates ticks at a full-data maximum just above a decade on %s", async elapsedScale => {
+    await page.evaluate(elapsedScale => {
+      const base = window.numericPlotHarness.reportResponse().report.signals[0]!, maximum = 100.000001;
+      const edges = [0, ...Array.from({ length: 37 }, (_, index) => maximum ** (index / 36))];
+      window.numericPlotHarness.draw({ elapsedScale, signal: {
+        density: { elapsedEdgesMs: edges, valueEdges: [0, 12], counts: Array(37).fill(1),
+          count: 37, maxCount: 1 },
+        points: base.points.map(([elapsed, value, record], index) => [
+          index === 2 ? maximum : elapsed, value, { ...record, elapsedMs: index === 2 ? maximum : elapsed },
+        ]),
+      } });
+    }, elapsedScale);
+    await resources(1);
+    const ticks = await page.locator(".tail-scatter text").evaluateAll(elements => elements
+      .filter(element => Number(element.getAttribute("y")) === 199)
+      .map(element => ({ text: element.textContent, x: Number(element.getAttribute("x")),
+        left: element.getBoundingClientRect().left, right: element.getBoundingClientRect().right })));
+    expect(ticks.at(-1)!.x).toBeCloseTo(382, 9);
+    expect(ticks.filter(tick => tick.text === "100")).toHaveLength(1);
+    expect(ticks.at(-1)!.left).toBeGreaterThan(ticks.at(-2)!.right);
+    expect(await page.locator(".tail-density-cell").count()).toBe(37);
+    expect(Number(await points().last().getAttribute("cx"))).toBeCloseTo(382, 9);
+    await points().last().focus();
+    await visible();
+    expect(await page.locator(".tail-density-highlight").getAttribute("data-cell-index")).toBe("36");
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("100ms]");
+  });
+
+  it.each([390, 1440].flatMap(width => ["log", "linear"].flatMap(elapsedScale => [
+    { width, elapsedScale: elapsedScale as "log" | "linear", low: .1, maximum: 145 },
+    { width, elapsedScale: elapsedScale as "log" | "linear", low: 100, maximum: 101 },
+  ])))("keeps numeric endpoint and interior labels apart at $width with $elapsedScale range $low–$maximum", async options => {
+    const { width, elapsedScale, low, maximum } = options;
+    const boundary = Math.sqrt(low * maximum);
+    await page.setViewportSize({ width, height: 844 });
+    await page.evaluate(({ elapsedScale, low, maximum, boundary }) => {
+      const base = window.numericPlotHarness.reportResponse().report.signals[0]!;
+      const elapsed = [low, boundary, maximum];
+      window.numericPlotHarness.draw({ elapsedScale, minMs: boundary, maxMs: maximum, signal: {
+        density: { elapsedEdgesMs: [0, ...Array.from({ length: 37 }, (_, index) =>
+          index === 36 ? maximum : low * (maximum / low) ** (index / 36))],
+          valueEdges: [0, 12], counts: Array(37).fill(1), count: 37, maxCount: 1 },
+        points: base.points.map(([, value, record], index) => [
+          elapsed[index]!, value, { ...record, elapsedMs: elapsed[index]! },
+        ]),
+      } });
+    }, { elapsedScale, low, maximum, boundary });
+    await resources(1);
+    const ticks = await page.locator(".tail-scatter text").evaluateAll(elements => elements
+      .filter(element => Number(element.getAttribute("y")) === 199)
+      .map(element => ({ text: element.textContent, x: Number(element.getAttribute("x")),
+        left: element.getBoundingClientRect().left, right: element.getBoundingClientRect().right })));
+    expect(ticks[0]!.text).toBe("0");
+    expect(ticks[0]!.x).toBe(58);
+    expect(ticks.at(-1)!.text).toBe(String(maximum));
+    expect(ticks.at(-1)!.x).toBe(382);
+    for (let index = 1; index < ticks.length; index++) expect(ticks[index]!.left).toBeGreaterThan(ticks[index - 1]!.right);
+    const positions = [low, boundary, maximum].map((elapsed, index) => 58 + 324 * (elapsedScale === "linear"
+      ? elapsed / maximum : [1 / 37, 19 / 37, 1][index]!));
+    const centers = await points().evaluateAll(elements => elements.map(element => Number(element.getAttribute("cx"))));
+    centers.forEach((position, index) => expect(position).toBeCloseTo(positions[index]!, 8));
+    expect(await page.locator(".tail-density-cell").count()).toBe(37);
+    expect(await page.locator(".tail-density-cell").evaluateAll(elements => elements.map(element =>
+      Number(element.getAttribute("data-count"))))).toEqual(Array(37).fill(1));
+    expect(await page.locator(".tail-density-legend").textContent()).toContain("37 recorded spans");
+    const boundaries = await page.locator(".tail-boundary path").evaluateAll(elements => elements
+      .map(element => Number(element.getAttribute("d")!.match(/^M([^ ]+)/)![1])));
+    expect(boundaries[0]).toBeCloseTo(positions[1]!, 8);
+    expect(boundaries[1]).toBe(382);
+    await points().last().focus();
+    await visible();
+    expect(await page.locator(".tail-density-highlight").getAttribute("data-cell-index")).toBe("36");
+    expect(await page.locator(".tail-sample-highlight").getAttribute("data-point-index")).toBe("2");
+    expect(await tooltip().locator(".tail-density-context [title]").first().getAttribute("title"))
+      .toMatch(new RegExp(`, ${maximum} ms\\]$`));
+    expect(await tooltip().locator(".tail-sample-coordinates").textContent()).toContain(`${maximum}ms elapsed`);
+  });
+
   it.each(["page", "panel"])("keeps stationary hover after native scrolling a clipped report in the %s", async scroller => {
     await page.evaluate(scroller => {
       const reports = document.querySelector<HTMLElement>("#reports")!;
@@ -170,7 +505,8 @@ describe("mounted numeric plot details", () => {
     await page.clock.runFor(200);
     await visible();
     expect(await points().first().getAttribute("stroke")).toBe("hsl(194 80% 60%)");
-    expect(await points().first().evaluate(element => getComputedStyle(element).stroke)).toBe("rgb(255, 255, 255)");
+    expect(await points().first().evaluate(element => getComputedStyle(element).stroke)).toBe("rgb(71, 197, 235)");
+    expect(await page.locator(".tail-sample-highlight[data-inspected='true']").evaluate(element => getComputedStyle(element).stroke)).toBe("rgb(255, 255, 255)");
     await points().last().hover();
     expect(await tooltip().locator("dd").allTextContents()).toEqual(["first"]);
     await points().last().click();
@@ -703,6 +1039,9 @@ describe("mounted numeric plot details", () => {
     await page.locator(".tail-scatter").focus();
     await visible();
     expect(await tooltip().textContent()).toContain("No retained trace sample is available");
+    expect(await tooltip().locator(".tail-density-context").textContent()).toContain("Density box · 9,000 spans");
+    expect(await page.locator(".tail-density-highlight[data-inspected='true']").getAttribute("data-cell-index")).toBe("0");
+    expect(await page.locator(".tail-sample-highlight[data-inspected='true']").count()).toBe(0);
     expect(await tooltip().locator(".tail-tooltip-trace, .tail-recorded-fields").count()).toBe(0);
     expect(await tooltip().getAttribute("role")).toBe("dialog");
   });

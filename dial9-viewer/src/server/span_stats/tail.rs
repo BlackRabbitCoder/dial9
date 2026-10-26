@@ -998,22 +998,38 @@ fn time_multiplier(unit: Option<&str>) -> Option<f64> {
 
 /// Shared logarithmic elapsed bins include zero and the maximum observation.
 fn elapsed_bin_edges(rows: &[&Observation]) -> Vec<f64> {
-    let positive_min = rows
+    let Some(minimum) = rows
         .iter()
         .map(|r| r.example.elapsed_ms)
         .filter(|n| *n > 0.0)
-        .min_by(f64::total_cmp);
-    // A nanosecond is the trace's smallest measurable elapsed duration.
-    let low = positive_min.map_or(1e-6, |n| 10.0_f64.powf(n.log10().floor()));
-    let maximum = rows.last().map_or(0.0, |r| r.example.elapsed_ms);
-    let high = 10.0_f64
-        .powf(maximum.max(low).log10().ceil())
-        .max(low * 10.0);
-    let mut edges = vec![0.0];
+        .min_by(f64::total_cmp)
+    else {
+        // A nanosecond is the trace's smallest measurable elapsed duration.
+        return vec![0.0, 1e-6];
+    };
+    // Callers sort the full scoped population, including missing field values.
+    let maximum = rows
+        .last()
+        .expect("a positive observation requires nonempty rows")
+        .example
+        .elapsed_ms;
+    let rounded_low = 10.0_f64.powf(minimum.log10().floor());
+    let low = if rounded_low > 0.0 {
+        rounded_low.min(minimum)
+    } else {
+        minimum
+    };
+    let log_low = low.ln();
+    let log_span = maximum.ln() - log_low;
+    let mut edges = vec![0.0, low];
     edges.extend(
-        (0..=HISTOGRAM_LOG_BINS)
-            .map(|i| low * (high / low).powf(i as f64 / HISTOGRAM_LOG_BINS as f64)),
+        (1..HISTOGRAM_LOG_BINS)
+            .map(|i| (log_low + log_span * (i as f64 / HISTOGRAM_LOG_BINS as f64)).exp())
+            .filter(|edge| *edge > low && *edge < maximum),
     );
+    // Keep the observed endpoint exact despite floating-point interpolation.
+    edges.push(maximum);
+    edges.dedup();
     edges
 }
 
@@ -2205,6 +2221,8 @@ mod tests {
     #[rstest]
     #[case(0)]
     #[case(1)]
+    #[case(100_000_000)]
+    #[case(100_000_001)]
     #[case(i64::MAX)]
     fn categorical_bins_remain_finite_and_ordered_for_constant_or_extreme_latency(
         #[case] elapsed_ns: i64,
@@ -2218,6 +2236,12 @@ mod tests {
         }
         let histograms = unfiltered_histograms(&collector, &selection);
         let histogram = &histograms[0];
+        let maximum = if elapsed_ns == 0 {
+            1e-6
+        } else {
+            elapsed_ns as f64 / 1e6
+        };
+        assert_eq!(histogram.bin_edges_ms.last(), Some(&maximum));
         assert!(
             histogram
                 .bin_edges_ms
@@ -2229,6 +2253,36 @@ mod tests {
                 .values
                 .iter()
                 .all(|v| v.shares.iter().sum::<f64>() == 1.0)
+        );
+        assert!(
+            histogram
+                .values
+                .iter()
+                .all(|v| v.bin_counts.last() == Some(&v.count))
+        );
+    }
+
+    #[rstest]
+    #[case(vec![100.0, 100.000001])]
+    #[case(vec![f64::from_bits(1), f64::from_bits(2)])]
+    #[case(vec![1e-300, 1e300])]
+    fn elapsed_bins_end_at_the_exact_maximum_without_degenerate_edges(
+        #[case] latencies_ms: Vec<f64>,
+    ) {
+        let selection = params("").selection().unwrap();
+        let mut collector = Collector::default();
+        for (index, elapsed_ms) in latencies_ms.into_iter().enumerate() {
+            collector.push(row(index as i64), &selection, 0, "");
+            collector.rows.last_mut().unwrap().example.elapsed_ms = elapsed_ms;
+        }
+        let rows: Vec<_> = collector.rows.iter().collect();
+        let edges = elapsed_bin_edges(&rows);
+        assert_eq!(edges.first(), Some(&0.0));
+        assert_eq!(edges.last(), Some(&rows.last().unwrap().example.elapsed_ms));
+        assert!(
+            edges
+                .windows(2)
+                .all(|w| w[0].is_finite() && w[1].is_finite() && w[1] > w[0])
         );
     }
 
@@ -2336,6 +2390,79 @@ mod tests {
                 .unwrap()
                 >= &100.0
         );
+    }
+
+    #[rstest]
+    #[case("", 6, 1_000_000_001)]
+    #[case("group_key=Mode&group_value=a", 5, 100_000_001)]
+    #[case("min_span_ns=50000000&max_span_ns=50000000", 6, 1_000_000_001)]
+    #[case(
+        "group_key=Mode&group_value=a&min_span_ns=50000000&max_span_ns=50000000",
+        5,
+        100_000_001
+    )]
+    fn numeric_elapsed_bins_cover_every_scoped_observation(
+        #[case] query: &str,
+        #[case] expected_count: usize,
+        #[case] maximum_ns: i64,
+    ) {
+        let selection = params(query).selection().unwrap();
+        let mut collector = Collector::default();
+        for (index, elapsed_ns) in [
+            0,
+            1_000_000,
+            50_000_000,
+            100_000_000,
+            100_000_001,
+            1_000_000_001,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut row = row(0);
+            row.elapsed_ns = elapsed_ns;
+            row.attributes = vec![
+                ("Mode".into(), if index < 5 { "a" } else { "b" }.into()),
+                ("StepMs".into(), ((index + 1) as f64 / 100.0).to_string()),
+            ];
+            row.attribute_units = vec![("StepMs".into(), "ms".into())];
+            if index < 4 {
+                row.attributes
+                    .push(("StepNs".into(), ((index + 1) * 7_000).to_string()));
+                row.attribute_units.push(("StepNs".into(), "ns".into()));
+            } else {
+                // The full elapsed range must survive missing fields/exemplars.
+                row.exemplar = None;
+            }
+            collector.push(row, &selection, 0, "");
+        }
+        let report = collector.report(&selection).unwrap();
+        assert_eq!(report.count, expected_count);
+        assert_eq!(report.signals.len(), 2);
+        let edges = &report.signals[0].density.as_ref().unwrap().elapsed_edges_ms;
+        assert_eq!(edges.last(), Some(&(maximum_ns as f64 / 1e6)));
+        let axis = &report.signals[0].value_axis;
+        for signal in &report.signals {
+            let density = signal.density.as_ref().unwrap();
+            assert_eq!(&density.elapsed_edges_ms, edges);
+            assert_eq!(density.counts.iter().sum::<usize>(), density.count);
+            assert_eq!(
+                density.count,
+                if signal.key == "StepNs" {
+                    4
+                } else {
+                    expected_count
+                }
+            );
+            assert_eq!(signal.value_axis.minimum, axis.minimum);
+            assert_eq!(signal.value_axis.maximum, axis.maximum);
+            assert_eq!(signal.value_axis.unit.as_deref(), Some("ms"));
+            if signal.key == "StepMs" {
+                let x_bins = density.elapsed_edges_ms.len() - 1;
+                let y = bin_index(&density.value_edges, expected_count as f64 / 100.0);
+                assert_eq!(density.counts[y * x_bins + x_bins - 1], 1);
+            }
+        }
     }
 
     #[test]

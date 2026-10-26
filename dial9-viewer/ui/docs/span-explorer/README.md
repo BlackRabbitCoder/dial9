@@ -44,7 +44,9 @@ The view starts with:
   Blue marks other spans and orange marks slow or selected spans, including
   exact color splits where cutoffs cross a cell. Brightness uses the same count
   scale for both hues; density counts cover whole cells even at color splits.
-  Elapsed time uses a shared logarithmic axis with a zero-inclusive first bin.
+  Elapsed time uses shared backend bins with a zero-inclusive first bin and
+  an endpoint at the full scoped population's exact observed maximum.
+  A zero-only population uses a one-nanosecond display width.
   **Elapsed axis** switches numeric plots to a linear axis; the same choice
   applies to compact and enlarged plots.
   The backend shares value limits across identical units and normalizes declared
@@ -98,10 +100,13 @@ File repetition needs five observations in each cohort. Spearman compares up to
 medians, and p99s use every loaded recorded value in their original units.
 Drawing uses up to 330 recorded-span dots alongside the full-observation
 density grid. Hover or keyboard focus shows one actual retained span and its
-original key/value strings, including duplicate keys. Moving within or between
-cells updates the span; an unsampled cell explicitly labels its nearby retained
-span, and unavailable samples remain explicit. No metadata is inferred from
-the active field.
+original key/value strings, including duplicate keys. **Box X/Y** gives the
+originating density box's elapsed and field bounds, units, and full span count;
+**Sample X/Y** gives the shown span's own coordinates. White outlines connect
+the box and actual sample to these details without changing their cohort colors.
+Moving within or between cells updates the span and box context; an unsampled
+cell explicitly labels its nearby retained span, and unavailable samples remain
+explicit. No metadata is inferred from the active field.
 
 Click a dot or populated cell, or press Enter or Space, to pin the details.
 Only one inspector is active at a time. Pinning preserves its original values
@@ -112,7 +117,8 @@ scroll access. Closing an enlarged plot or replacing the report releases its
 inspector. **Open trace** is the explicit navigation action and preserves the
 source and credential contract.
 Older cached reports show an explicit sample-only warning and do not invent
-missing density or shared-unit metadata.
+missing density or shared-unit metadata. Their elapsed axis ends at the largest
+retained sample or visible selection bound, rather than an inferred full-data maximum.
 
 Recomputation blurs and disables previous results. Failure and cancellation
 clear stale comparisons; replacing the source retires its previous detail.

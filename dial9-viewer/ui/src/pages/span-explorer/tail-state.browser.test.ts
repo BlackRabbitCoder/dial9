@@ -458,3 +458,86 @@ describe("Span Explorer selected-span layout", () => {
     expect(requests).toHaveLength(1);
   });
 });
+
+
+describe("Categorical exact elapsed endpoints", () => {
+  it.each([
+    { width: 390, lower: .1, maximum: 145, label: "145ms" },
+    { width: 320, lower: .1, maximum: 145, label: "145ms" },
+    { width: 1440, lower: .1, maximum: 145, label: "145ms" },
+    { width: 390, lower: .1, maximum: 100.000001, label: "100ms" },
+    { width: 1440, lower: .1, maximum: 100.000001, label: "100ms" },
+    { width: 390, lower: 100, maximum: 101, label: "101ms" },
+    { width: 390, lower: 100, maximum: 100.000001, label: "100ms" },
+    { width: 390, lower: 100, maximum: 100, label: "100ms" },
+    { width: 390, lower: 0, maximum: .000001, label: "1ns" },
+    { width: 320, lower: 130000, maximum: 1e9, label: "11d 13h 46m" },
+  ])("keeps zero and exact $maximum ms endpoint labels distinct at $width px", async ({ width, lower, maximum, label }) => {
+    await page.setViewportSize({ width, height: 844 });
+    const body = structuredClone(reply);
+    const histogram = body.report.histograms![0]!;
+    histogram.binEdgesMs = lower === 0 || lower === maximum ? [0, maximum]
+      : [0, ...Array.from({ length: 36 }, (_, index) =>
+        index === 35 ? maximum : lower * (maximum / lower) ** (index / 35))];
+    const bins = histogram.binEdgesMs.length - 1;
+    for (const value of histogram.values) {
+      const count = Math.floor(value.count / bins);
+      value.binCounts = Array.from({ length: bins }, (_, index) =>
+        index === bins - 1 ? value.count - count * (bins - 1) : count);
+      value.shares = value.binCounts.map(count => count / value.count);
+      value.medianMs = lower;
+      value.p99Ms = lower === 0 ? 0 : Math.max(lower, Math.min(maximum, value.p99Ms));
+    }
+    histogram.maxShare = Math.max(...histogram.values.flatMap(value => value.shares));
+    body.report.histograms = [histogram];
+    await page.route("**/api/span-tail?**", route => {
+      requests.push(new URL(route.request().url()));
+      return route.fulfill({ json: body });
+    });
+    await open();
+    const chart = page.locator(".tail-category-chart");
+    const labels = await chart.locator(".tail-category-x > span").evaluateAll(elements =>
+      elements.filter(element => element.checkVisibility()).map(element => {
+        const rect = element.getBoundingClientRect();
+        return { text: element.textContent, left: rect.left, right: rect.right };
+      }));
+    expect(labels[0]!.text).toBe("0");
+    expect(labels.at(-1)!.text).toBe(label);
+    expect(labels).toHaveLength(new Set(labels.map(value => value.text)).size);
+    for (let index = 1; index < labels.length; index++) {
+      expect(labels[index]!.left - labels[index - 1]!.right,
+        `${labels[index - 1]!.text} and ${labels[index]!.text} need distinct label space`).toBeGreaterThanOrEqual(4);
+    }
+    expect(await chart.locator(".tail-category-x .last").evaluate(element => element.style.left)).toBe("100%");
+    const plot = chart.locator("svg");
+    expect(await plot.getAttribute("viewBox")).toBe(`0 0 ${bins} 1`);
+    const markers = await chart.locator(".tail-category-percentile").evaluateAll(elements =>
+      elements.map(element => [element.getAttribute("x1"), element.getAttribute("x2"), element.textContent]));
+    const finalCount = histogram.values.reduce((total, value) => total + value.binCounts![bins - 1]!, 0);
+    await plot.focus();
+    await page.keyboard.press("End");
+    expect((await chart.locator(".tail-category-tooltip-range").textContent())!.replace(/\s+/g, "")).toContain(`${label.replace(/\s+/g, "")}inclusive`);
+    expect(await chart.locator(".tail-category-tooltip-total strong").textContent()).toBe(`${finalCount.toLocaleString()} spans`);
+    await page.getByRole("button", { name: "Overlay", exact: true }).click();
+    expect(await plot.getAttribute("aria-label")).toContain("overlaid elapsed-time distributions");
+    expect(await plot.getAttribute("viewBox")).toBe(`0 0 ${bins} 1`);
+    expect(await chart.locator(".tail-category-percentile").evaluateAll(elements =>
+      elements.map(element => [element.getAttribute("x1"), element.getAttribute("x2"), element.textContent]))).toEqual(markers);
+    await plot.focus();
+    await page.keyboard.press("End");
+    expect(await chart.locator(".tail-category-tooltip-series strong").allTextContents()).toEqual(
+      histogram.values.map(value => `${value.binCounts![bins - 1]!.toLocaleString()} spans`));
+    await page.keyboard.press("Enter");
+    if (bins === 1) {
+      // Selecting the complete population preserves the existing unbounded scope.
+      expect(requests).toHaveLength(1);
+      expect(new URL(page.url()).searchParams.has("min_span_ns")).toBe(false);
+      expect(new URL(page.url()).searchParams.has("max_span_ns")).toBe(false);
+    } else {
+      await expect.poll(() => requests.length).toBe(2);
+      expect(requests[1]!.searchParams.get("min_span_ns")).toBe(
+        Math.round(histogram.binEdgesMs[bins - 1]! * 1e6).toString());
+      expect(requests[1]!.searchParams.has("max_span_ns")).toBe(false);
+    }
+  });
+});

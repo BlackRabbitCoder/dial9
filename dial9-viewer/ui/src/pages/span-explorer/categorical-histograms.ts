@@ -68,7 +68,21 @@ function ticksForHistogram(edges: readonly number[]) {
     ticks.push({ position: latencyToHistogramPosition(edges, latency), label: duration(latency) });
   }
   if (ticks.at(-1)!.position < bins) ticks.push({ position: bins, label: duration(upper) });
-  return ticks;
+  // Keep zero and the observed maximum, with room for labels on narrow plots.
+  const endpoint = ticks.at(-1)!;
+  const spaced = [ticks[0]!];
+  for (const tick of ticks.slice(1, -1)) {
+    const previous = spaced.at(-1)!;
+    // At 10px, allow 6px per character on a conservative 200px mobile canvas.
+    // Zero extends right, the endpoint extends left, interior ticks are centered.
+    const previousGap = (previous.label.length * (spaced.length === 1 ? 6 : 3)
+      + tick.label.length * 3 + 8) / 200;
+    const endpointGap = (tick.label.length * 3 + endpoint.label.length * 6 + 8) / 200;
+    if ((tick.position - previous.position) / bins >= Math.max(.25, previousGap)
+      && (endpoint.position - tick.position) / bins >= Math.max(.25, endpointGap)) spaced.push(tick);
+  }
+  spaced.push(endpoint);
+  return spaced;
 }
 
 function binReadout(histogram: CategoricalHistogram, series: readonly Series[], bin: number, stack: AvailableStack | null) {

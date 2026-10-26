@@ -70,8 +70,9 @@
 .tail-scatter .tail-cutoff-label { fill: #f6ae65; font-size: 10px; paint-order: stroke; stroke: #17212d; stroke-width: 3px; stroke-linejoin: round; }
 .tail-boundary { pointer-events: none; }
 .tail-scatter circle { cursor: pointer; }
-.tail-scatter circle:hover, .tail-scatter circle:focus { stroke: #fff; stroke-width: 2px; outline: none; }
-.tail-scatter circle[aria-pressed="true"] { stroke: #fff; stroke-width: 2.4px; }
+.tail-scatter .tail-trace-point:focus-visible { outline: 1px solid #fff; outline-offset: 2px; }
+.tail-density-highlight, .tail-sample-highlight { display: none; fill: none; stroke: #fff; stroke-width: 1.4px; vector-effect: non-scaling-stroke; pointer-events: none; }
+.tail-density-highlight[data-inspected="true"], .tail-sample-highlight[data-inspected="true"] { display: block; }
 .tail-scatter:focus-visible { outline: 2px solid #8bb7e8; outline-offset: 2px; }
 .tail-plot { position: relative; }
 .tail-plot-tooltip { position: fixed; z-index: 9; display: flex; flex-direction: column; gap: 4px; box-sizing: border-box; padding: 9px 11px; border: 1px solid #8bb7e8; border-radius: 5px; background: #0f1928f5; box-shadow: 0 5px 16px #0009; color: #e6edf5; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; overflow: auto; overscroll-behavior: contain; user-select: text; }
@@ -79,6 +80,8 @@
 .tail-plot-tooltip > * { flex-shrink: 0; }
 .tail-inspector-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .tail-inspector-heading > span { color: #a8c8ee; font-size: 10px; }
+.tail-density-context { display: grid; gap: 2px; padding-bottom: 4px; border-bottom: 1px solid #344354; font-size: 10px; }
+.tail-sample-coordinates { display: grid; gap: 2px; }
 .tail-inspector-actions { display: flex; align-items: center; gap: 8px; }
 .tail-inspector-actions .tail-tooltip-trace { flex: 1; text-align: left; }
 .tail-inspector-pin { flex-shrink: 0; padding: 3px 7px; border: 1px solid #6e87a6; border-radius: 4px; background: #28394d; color: #e6edf5; font: inherit; cursor: pointer; }
@@ -92,7 +95,6 @@
 .tail-recorded-fields dl { display: grid; grid-template-columns: minmax(65px, 1fr) minmax(90px, 1.5fr); gap: 4px 10px; margin: 3px 0; }
 .tail-recorded-fields dt { color: #9bb2c9; }
 .tail-recorded-fields dd { margin: 0; white-space: pre-wrap; color: #e6edf5; }
-.tail-density-cell:hover { stroke: #ccefff; stroke-width: .8px; }
 .tail-density-legend { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 5px 8px; color: #a4b0bd; font-size: 10px; }
 .tail-density-key { display: inline-flex; align-items: center; gap: 5px; }
 .tail-density-key i { display: inline-block; width: 42px; height: 12px; border-radius: 2px; background-size: 100% 50%; background-position: top, bottom; background-repeat: no-repeat; }
