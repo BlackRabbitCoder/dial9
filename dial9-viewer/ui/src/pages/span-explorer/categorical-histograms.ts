@@ -267,7 +267,7 @@ export function renderCategoricalHistogram(
   options: CategoricalHistogramOptions = {},
 ) {
   const series = histogram.values.map((value, i) => ({ value, color: propertyValueColor(i) }));
-  const overlay = (options.mode ?? "overlay") === "overlay";
+  const overlay = (options.mode ?? "stacked") === "overlay";
   const stack = overlay ? null : categoricalHistogramStack(histogram);
   const availableStack = stack?.available ? stack : null;
   return html`<section class="tail-category-chart ${overlay ? "overlay" : "stacked"}">
@@ -294,7 +294,7 @@ export function renderPropertyHistograms(
 ) {
   const histogram = histograms.find(h => h.key === options.selectedKey) ?? histograms[0];
   if (!histogram) return nothing;
-  const mode = options.mode ?? "overlay";
+  const mode = options.mode ?? "stacked";
   return html`<section class="tail-properties">
     <div class="tail-property-heading"><h4>${histograms.length === 1 ? histogram.key : "Properties"}</h4>
       <div class="tail-histogram-modes" role="group" aria-label="Property histogram view">

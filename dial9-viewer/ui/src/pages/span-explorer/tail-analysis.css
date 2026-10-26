@@ -16,10 +16,6 @@
 .span-recorded-instances { margin-top: 12px; }
 .span-recorded-instances > summary { color: #a8c8ee; cursor: pointer; font-size: 12px; }
 .span-recorded-instances > summary:focus-visible { outline: 2px solid #8bb7e8; outline-offset: 2px; }
-.span-tail-examples-mount { --tail-muted: #a4b0bd; }
-.span-tail-examples-mount button { font: inherit; font-size: 12px; cursor: pointer; padding: 5px 9px; border-radius: 5px; border: 1px solid #5b6d82; background: #28394d; color: #e6edf5; }
-.span-tail-examples-mount button:hover { background: #36506e; border-color: #8bb7e8; }
-.span-tail-examples-mount button:focus-visible { outline: 2px solid #8bb7e8; outline-offset: 2px; }
 .span-tail-analysis h3 { margin: 0; font-size: 18px; color: #f4f7fc; }
 .span-tail-analysis h4 { margin: 0; font-size: 14px; color: #f4f7fc; }
 .span-tail-analysis p { margin: 8px 0; }
@@ -67,7 +63,7 @@
 .tail-field-means { display: flex; gap: 24px; margin: 9px 0 3px; color: var(--tail-muted); font-size: 11px; }
 .tail-field-means strong { display: block; color: #cbd7e4; font-size: 16px; font-weight: 500; font-variant-numeric: tabular-nums; }
 .tail-field-means span:last-child strong { color: #f6ae65; font-weight: 600; }
-.tail-scatter { width: 100%; max-height: calc(100vh - 160px); display: block; margin: 5px 0 8px; }
+.tail-scatter { width: 100%; max-height: max(80px, calc(100vh - 240px)); display: block; margin: 5px 0 8px; }
 .tail-empty-plot { min-height: 170px; display: grid; place-items: center; color: var(--tail-muted); font-size: 12px; }
 .tail-scatter text { fill: #aabccd; font-size: 11px; }
 .tail-scatter .tail-axis-unit { fill: #7f95ae; font-size: 10px; }
@@ -75,11 +71,18 @@
 .tail-boundary { pointer-events: none; }
 .tail-scatter circle { cursor: pointer; }
 .tail-scatter circle:hover, .tail-scatter circle:focus { stroke: #fff; stroke-width: 2px; outline: none; }
+.tail-scatter circle[aria-pressed="true"] { stroke: #fff; stroke-width: 2.4px; }
 .tail-scatter:focus-visible { outline: 2px solid #8bb7e8; outline-offset: 2px; }
 .tail-plot { position: relative; }
-.tail-plot-tooltip { position: fixed; z-index: 9; display: flex; flex-direction: column; gap: 4px; box-sizing: border-box; padding: 9px 11px; border: 1px solid #8bb7e8; border-radius: 5px; background: #0f1928f5; box-shadow: 0 5px 16px #0009; color: #e6edf5; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; overflow: auto; overscroll-behavior: contain; }
+.tail-plot-tooltip { position: fixed; z-index: 9; display: flex; flex-direction: column; gap: 4px; box-sizing: border-box; padding: 9px 11px; border: 1px solid #8bb7e8; border-radius: 5px; background: #0f1928f5; box-shadow: 0 5px 16px #0009; color: #e6edf5; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; overflow: auto; overscroll-behavior: contain; user-select: text; }
 .tail-plot-tooltip[hidden] { display: none; }
 .tail-plot-tooltip > * { flex-shrink: 0; }
+.tail-inspector-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.tail-inspector-heading > span { color: #a8c8ee; font-size: 10px; }
+.tail-inspector-actions { display: flex; align-items: center; gap: 8px; }
+.tail-inspector-actions .tail-tooltip-trace { flex: 1; text-align: left; }
+.tail-inspector-pin { flex-shrink: 0; padding: 3px 7px; border: 1px solid #6e87a6; border-radius: 4px; background: #28394d; color: #e6edf5; font: inherit; cursor: pointer; }
+.tail-inspector-pin:focus-visible { outline: 2px solid #8bb7e8; outline-offset: 2px; }
 .tail-plot-tooltip b { color: #a8c8ee; }
 .tail-plot-tooltip small { color: #a4b0bd; font-size: 10px; }
 .span-tail-analysis .tail-tooltip-trace { flex-shrink: 0; padding: 3px 0; text-align: left; color: #a8c8ee; background: none; border: 0; font-size: 11px; }
@@ -136,9 +139,7 @@
 .tail-composition-swatch { width: 8px; height: 8px; border-radius: 2px; }
 .tail-method { margin-top: 12px; font-size: 12px; color: var(--tail-muted); }
 .tail-method p { max-width: 950px; }
-.tail-examples { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; }
-.tail-examples h4 { margin-right: 4px; font-size: 12px; }
-.tail-plot-dialog { margin: auto; width: min(900px, calc(100vw - 24px)); max-height: calc(100vh - 32px); overflow-y: auto; padding: 20px; border: 1px solid #6e87a6; border-radius: 10px; background: #17212d; color: #e6edf5; }
+.tail-plot-dialog { margin: auto; box-sizing: border-box; width: min(900px, calc(100vw - 24px)); max-height: max(120px, calc(100vh - 180px)); overflow-y: auto; padding: 20px; border: 1px solid #6e87a6; border-radius: 10px; background: #17212d; color: #e6edf5; }
 .tail-plot-dialog::backdrop { background: #050b14bb; }
 .tail-plot-dialog .tail-scatter { margin: 12px 0; }
 .tail-plot-dialog .tail-field-means { font-size: 12px; }
@@ -158,6 +159,10 @@
 .tail-signal-table th:first-child { text-align: left; }
 .tail-signal-table thead th { color: #9bb2c9; font-weight: 500; }
 .tail-spearman-details { margin-top: 12px; }
+@media (max-height: 500px) {
+  /* Leave an outside strip for span inspection; field controls scroll natively. */
+  .tail-field { max-height: max(120px, calc(100vh - 180px)); overflow: auto; overscroll-behavior: contain; }
+}
 @media (max-width: 1050px) {
   .tail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

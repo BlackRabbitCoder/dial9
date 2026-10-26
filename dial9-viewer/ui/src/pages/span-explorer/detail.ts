@@ -44,6 +44,9 @@ export interface HistogramComparisonModel {
 /** Everything the panel renders from. */
 export interface DetailModel {
   spanType: SpanTypeStats | undefined;
+  catalogExpanded: boolean;
+  spanTypeCount: number;
+  onToggleCatalog: () => void;
   /** A replacement catalog is loading, so the previous detail is retired. */
   loading?: boolean;
   band: DurationBand;
@@ -113,6 +116,10 @@ function headerTemplate(
           : fmtNs(st.max_ns)
       }</span
     >
+    <button id="btn-toggle-catalog" class="change-span" type="button"
+      aria-controls="catalog-wrap" aria-expanded=${m.catalogExpanded} @click=${m.onToggleCatalog}>
+      ${m.catalogExpanded ? "Hide span list" : `Change span · ${m.spanTypeCount}`}
+    </button>
   </div>`;
 }
 
@@ -308,7 +315,6 @@ export function renderDetail(detailPanel: HTMLElement, m: DetailModel): void {
         <div class="span-trace-heading"><h3>Inspect traces</h3>
           ${flamegraphLinksTemplate(m)}
         </div>
-        <div class="span-tail-examples-mount"></div>
         <details class="span-recorded-instances">
           <summary>Browse recorded instances${hasBand ? " in selected band" : ""}</summary>
           ${exemplarsTemplate(exemplars, tableCtx, hasBand, m.exemplarRefreshPending)}

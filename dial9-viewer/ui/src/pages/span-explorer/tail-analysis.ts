@@ -11,7 +11,7 @@ import type {
   TailResponse,
   TailComposition,
 } from "../../lib/trace/span-tail-analysis.js";
-import { buildApiUrl, type PageScope, type ViewState } from "./scope.js";
+import { buildApiUrl, type PageScope, type TailViewState, type ViewState } from "./scope.js";
 import { fetchRawTraceBytes } from "./raw.js";
 import { renderPropertyHistograms } from "./categorical-histograms.js";
 import { correlationLabel } from "./correlation-label.js";
@@ -25,9 +25,11 @@ interface Context {
   spanType: SpanTypeStats;
   scope: PageScope;
   view: ViewState;
+  analysis: TailViewState;
   headers: Record<string, string>;
   onClearBand: () => void;
   onBand: (minMs: number | null, maxMs: number | null) => void;
+  onAnalysisChange: (next: TailViewState, clearBand?: boolean) => void;
 }
 const number = (n: number | null, digits = 2) =>
   n == null || !Number.isFinite(n) ? "unavailable"
@@ -50,6 +52,7 @@ export class SpanTailAnalysis {
   private container: HTMLElement | null = null;
   private context: Context | null = null;
   private key = "";
+  private requestKey = "";
   private request: AbortController | null = null;
   private rawBytes: ArrayBuffer | null = null;
   private response: TailResponse | null = null;
@@ -57,18 +60,30 @@ export class SpanTailAnalysis {
   private busy = false;
   // A failed or cancelled context stays stopped until an explicit retry.
   private started = false;
-  private more = false;
-  private categoryKey = "";
-  private categoryMode: "overlay" | "stacked" = "overlay";
   private expandedKey: string | null = null;
   private info: { title: string; body: TemplateResult; trigger: HTMLElement } | null = null;
-  private selection: TailSelection = { percentile: 99, groupKey: null, groupValue: null, minMs: null, maxMs: null };
+  private get analysis(): TailViewState { return this.context!.analysis; }
+  private get selection(): TailSelection {
+    const context = this.context!;
+    return {
+      percentile: context.analysis.percentile,
+      groupKey: context.analysis.groupKey,
+      groupValue: context.analysis.groupValue,
+      minMs: context.view.bandMinNs == null ? null : context.view.bandMinNs / 1e6,
+      maxMs: context.view.bandMaxNs == null ? null : context.view.bandMaxNs / 1e6,
+    };
+  }
 
   mount(container: HTMLElement | null, context: Context | null): void {
     const key = context ? JSON.stringify([
       context.spanType.span_type_uid, context.scope,
       context.view.startNs, context.view.endNs, context.view.attrFilters, context.view.maxFiles,
     ]) : "";
+    const requestKey = context ? JSON.stringify([
+      key, context.analysis.percentile, context.analysis.groupKey, context.analysis.groupValue,
+      context.view.bandMinNs, context.view.bandMaxNs,
+    ]) : "";
+    const requestChanged = requestKey !== this.requestKey;
     if (key !== this.key) {
       this.request?.abort();
       this.request = null;
@@ -77,26 +92,16 @@ export class SpanTailAnalysis {
       this.status = "";
       this.busy = false;
       this.started = false;
-      this.more = false;
-      this.categoryKey = "";
-      this.categoryMode = "overlay";
       this.expandedKey = null;
       this.info = null;
       this.key = key;
-      this.selection = { percentile: 99, groupKey: null, groupValue: null, minMs: null, maxMs: null };
     }
     // This independently rendered root can already be detached by renderDetail.
     if (this.container && (this.container !== container || !context)) render(nothing, this.container);
     this.container = container;
     this.context = context;
-    const minMs = context?.view.bandMinNs == null ? null : context.view.bandMinNs / 1e6;
-    const maxMs = context?.view.bandMaxNs == null ? null : context.view.bandMaxNs / 1e6;
-    const bandChanged = minMs !== this.selection.minMs || maxMs !== this.selection.maxMs;
-    if (bandChanged) {
-      this.selection.minMs = minMs;
-      this.selection.maxMs = maxMs;
-    }
-    if (container && context && (!this.started || (bandChanged && (this.response != null || this.busy)))) {
+    this.requestKey = requestKey;
+    if (container && context && (!this.started || requestChanged)) {
       if (!this.started) {
         const panel = container.closest<HTMLElement>(".detail-panel");
         if (panel) panel.scrollTop = 0;
@@ -153,7 +158,12 @@ export class SpanTailAnalysis {
         options = { method: "POST", headers: { "content-type": "application/octet-stream" }, body: rawBytes, signal: request.signal };
       }
       const response = await fetch(url, options);
-      if (!response.ok) throw new Error(`Backend analysis failed (${response.status}): ${await response.text()}`);
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(response.status === 503
+          ? `Analysis service unavailable (503): ${detail}. Retry when the viewer backend is available.`
+          : `Backend analysis failed (${response.status}): ${detail}`);
+      }
       const reply: TailResponse = await response.json();
       if (request.signal.aborted) return;
       // Old cached reports may still include fields that repeat elapsed time.
@@ -173,15 +183,9 @@ export class SpanTailAnalysis {
     }
   }
 
-  private compare(): void {
-    if (this.response) void this.load();
-  }
-
   private scopeTo(key: string | null, value: string | null): void {
     if (key === this.selection.groupKey && value === this.selection.groupValue) return;
-    this.selection.groupKey = key;
-    this.selection.groupValue = value;
-    void this.load();
+    this.context?.onAnalysisChange({ ...this.analysis, groupKey: key, groupValue: value });
   }
 
   private propertyScope(selectedKey?: string) {
@@ -296,6 +300,7 @@ export class SpanTailAnalysis {
       percentile: this.selection.percentile,
       minMs: this.selection.minMs,
       maxMs: this.selection.maxMs,
+      elapsedScale: this.analysis.elapsedScale,
       large,
       onJump: row => this.jump(row),
     });
@@ -359,7 +364,7 @@ export class SpanTailAnalysis {
     const info = this.info;
     const expanded = r?.signals.find(s => s.key === this.expandedKey);
     const histograms = r?.histograms ?? [];
-    const histogram = histograms.find(h => h.key === this.categoryKey) ?? histograms[0];
+    const histogram = histograms.find(h => h.key === this.analysis.property) ?? histograms[0];
     const group = r?.groups.find(g => g.key === histogram?.key);
     this.container.closest(".detail-panel")?.classList.toggle("tail-analysis-ready", r != null || this.busy);
     render(html`<section class="span-tail-analysis" aria-busy=${this.busy}>
@@ -378,9 +383,9 @@ export class SpanTailAnalysis {
             @change=${(e: Event) => {
               const selected = (e.target as HTMLSelectElement).value;
               if (selected === "custom") return;
-              this.selection.percentile = Number(selected);
-              if (band) this.context?.onClearBand();
-              else this.compare();
+              this.context?.onAnalysisChange({
+                ...this.analysis, percentile: Number(selected) as TailViewState["percentile"],
+              }, band);
             }}>
             ${band ? html`<option value="custom">Custom selection: ${ms(this.selection.minMs ?? 0)} to ${this.selection.maxMs == null ? "∞" : ms(this.selection.maxMs)}</option>` : nothing}
             <option value="95">p95+ · slowest 5%</option><option value="99">p99+ · slowest 1%</option><option value="99.9">p99.9+ · slowest 0.1%</option>
@@ -405,11 +410,11 @@ export class SpanTailAnalysis {
         </button>` : nothing}
         ${!histogram ? this.propertyScope() : nothing}
         ${renderPropertyHistograms(histograms, {
-          selectedKey: this.categoryKey,
-          mode: this.categoryMode,
+          selectedKey: this.analysis.property ?? "",
+          mode: this.analysis.mode,
           selection: band ? { minMs: this.selection.minMs, maxMs: this.selection.maxMs } : null,
-          onSelectProperty: key => { this.categoryKey = key; this.draw(); },
-          onModeChange: mode => { this.categoryMode = mode; this.draw(); },
+          onSelectProperty: property => this.context?.onAnalysisChange({ ...this.analysis, property }),
+          onModeChange: mode => this.context?.onAnalysisChange({ ...this.analysis, mode }),
           onSelectRange: (minMs, maxMs) => this.context?.onBand(minMs, maxMs),
           controls: this.propertyScope(histogram?.key),
         })}
@@ -425,10 +430,16 @@ export class SpanTailAnalysis {
         </div></details>` : nothing}
         ${group ? renderPropertyCohorts(group, r, band, histogram?.values.map(value => value.value)) : nothing}
         <section class="tail-numeric" aria-label="Numeric fields"><div class="tail-chart-heading"><h4>Numeric fields against elapsed time</h4>
+          <label>Elapsed axis <select aria-label="Elapsed axis" .value=${this.analysis.elapsedScale}
+            @change=${(event: Event) => this.context?.onAnalysisChange({
+              ...this.analysis, elapsedScale: (event.currentTarget as HTMLSelectElement).value as TailViewState["elapsedScale"],
+            })}>
+            <option value="log">Logarithmic</option><option value="linear">Linear</option>
+          </select></label>
           <span class="tail-legend"><span class="tail-dot typical"></span>Other spans <span class="tail-dot slow"></span>${band ? "Selected" : "Slow"}</span>
           <details class="tail-chart-help"><summary>Reading these charts</summary><div id="tail-chart-guide">
-            <p>Blue marks other spans; orange marks ${band ? "the selection" : "slow spans"}. Brighter cells contain more observations. Colors split at the cutoff; counts cover whole cells. Hover or focus the plot and use arrow keys for counts. Outlined dots are trace samples; hover or focus one before opening its trace.</p>
-            <p>X uses logarithmic elapsed time with a zero-inclusive first bin. Y is linear in the displayed unit. The backend shares limits across fields with the same unit and converts declared time units to milliseconds. Unknown units stay separate. Orange dashed lines mark the labelled slow cutoff or selection endpoints.</p>
+            <p>Blue marks other spans; orange marks ${band ? "the selection" : "slow spans"}. Brighter cells contain more observations. Colors split at the cutoff; counts cover whole cells. Focus the plot and use arrow keys to inspect retained spans. Outlined dots are recorded span samples; hover to inspect one, or click to pin its details and open its trace explicitly.</p>
+            <p>X uses ${this.analysis.elapsedScale === "log" ? "logarithmic elapsed time with a zero-inclusive first bin" : "linear elapsed time"}. Y is linear in the displayed unit. The backend shares limits across fields with the same unit and converts declared time units to milliseconds. Unknown units stay separate. Orange dashed lines mark the labelled slow cutoff or selection endpoints.</p>
             <p>Fields are ordered by conservative differences between Typical and ${band ? "Selected" : "Slow"} recorded value distributions. Groups below 20 values follow; coverage is separate. Click a difference badge for means, medians, p99s, sampling margins, and the overall recorded trend. These are associations, not causes.</p>
           </div></details>
         </div>
@@ -438,8 +449,10 @@ export class SpanTailAnalysis {
             <p>The outlined dots are bounded trace samples and cannot show how dense the underlying data is. Reports from the current backend include exact cell counts and shared unit axes; no missing density or unit information is inferred here.</p>`)}>
           Point samples · density unavailable in cached result <span aria-hidden="true">ⓘ</span>
         </button>` : nothing}
-        <div class="tail-grid">${r.signals.length ? r.signals.slice(0, this.more ? undefined : 3).map((s, i) => this.signal(s, i)) : html`<p>No distinct numeric fields to compare.</p>`}</div>
-        ${r.signals.length > 3 ? html`<button class="secondary tail-more" @click=${() => { this.more = !this.more; this.draw(); }}>${this.more ? "Show fewer fields" : `Show all ${r.signals.length} fields`}</button>` : nothing}
+        <div class="tail-grid">${r.signals.length ? r.signals.slice(0, this.analysis.allFields ? undefined : 3).map((s, i) => this.signal(s, i)) : html`<p>No distinct numeric fields to compare.</p>`}</div>
+        ${r.signals.length > 3 ? html`<button class="secondary tail-more" @click=${() =>
+          this.context?.onAnalysisChange({ ...this.analysis, allFields: !this.analysis.allFields })
+        }>${this.analysis.allFields ? "Show fewer fields" : `Show all ${r.signals.length} fields`}</button>` : nothing}
         </section>
         <section class="tail-composition">
           <div class="tail-composition-heading"><h4>Time breakdown</h4><span class="tail-note">Estimated · average share per span</span><span class="tail-note tail-composition-mean-label">Mean elapsed</span></div>
@@ -461,7 +474,7 @@ export class SpanTailAnalysis {
       ${expanded ? html`<dialog class="tail-plot-dialog" @close=${() => { this.expandedKey = null; }}>
         <div class="tail-dialog-heading"><h3>${expanded.key}</h3><button @click=${(e: Event) => (e.target as HTMLElement).closest("dialog")?.close()}>Close</button></div>
         <div class="tail-field-means"><span>Typical <strong>${value(expanded.typical, expanded.unit)}</strong></span><span>${band ? "Selected" : "Slow"} <strong>${value(expanded.slow, expanded.unit)}</strong></span></div>
-        ${this.plot(expanded, true)}<p class="tail-note">Click a dot to inspect its trace · orange = ${band ? "selected" : "slow"} · logarithmic elapsed axis</p>
+        ${this.plot(expanded, true)}<p class="tail-note">Click a dot to pin span details · orange = ${band ? "selected" : "slow"} · ${this.analysis.elapsedScale === "log" ? "logarithmic" : "linear"} elapsed axis</p>
       </dialog>` : nothing}
       ${info ? html`<dialog class="tail-info-dialog" aria-labelledby="tail-info-title" @close=${() => {
         if (this.info !== info) return;
@@ -474,12 +487,5 @@ export class SpanTailAnalysis {
         ${info.body}
       </dialog>` : nothing}
     </section>`, this.container);
-    const examplesMount = this.container.closest(".detail-panel")?.querySelector<HTMLElement>(".span-tail-examples-mount");
-    if (examplesMount) {
-      render(r ? html`<div class="tail-examples ${this.busy ? "recomputing" : ""}" ?inert=${this.busy} aria-hidden=${this.busy}>
-        <h4>${band ? "Selected" : "Slow"} examples</h4>
-        ${r.examples.map(row => html`<button class="secondary" @click=${() => this.jump(row)} title=${row.requestId ?? row.startNs}>${ms(row.elapsedMs)} ↗</button>`)}
-      </div>` : nothing, examplesMount);
-    }
   }
 }

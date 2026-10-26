@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "lit-html";
 import { SpanTailAnalysis } from "./tail-analysis.js";
-import { readScope } from "./scope.js";
+import { readScope, readTailView } from "./scope.js";
 import type { SpanTypeStats } from "../../lib/trace/index.js";
 import type { TailReport, TailResponse } from "../../lib/trace/span-tail-analysis.js";
 
@@ -95,7 +95,13 @@ function setup({ mount = true } = {}) {
     spanType: { span_type_uid: "request-uid", name: "request" } as SpanTypeStats,
     scope: readScope(new URLSearchParams("api=1&data_dir=demo")),
     view: { startNs: null, endNs: null, selectedUid: "request-uid", bandMinNs: null, bandMaxNs: null, attrFilters: [], maxFiles: null },
+    analysis: readTailView(new URLSearchParams()),
     headers: {}, onClearBand: vi.fn(), onBand: vi.fn(),
+    onAnalysisChange: (next, clearBand) => {
+      context.analysis = next;
+      if (clearBand) context.view = { ...context.view, bandMinNs: null, bandMaxNs: null };
+      analysis.mount(container, context);
+    },
   };
   const analysis = new SpanTailAnalysis();
   const latest = () => vi.mocked(render).mock.calls.filter(c => c[1] === container).at(-1)?.[0];
@@ -204,7 +210,7 @@ describe("automatic selected-span analysis", () => {
       .mockResolvedValueOnce(response(report()));
     vi.stubGlobal("fetch", fetch);
     const { analysis, context, container, latest, classToggle } = setup();
-    await vi.waitFor(() => expect(text(latest())).toContain("Backend analysis failed (503)"));
+    await vi.waitFor(() => expect(text(latest())).toContain("Analysis service unavailable (503)"));
     analysis.mount(container, { ...context });
     analysis.mount(container, context);
     expect(fetch).toHaveBeenCalledOnce();

@@ -1,14 +1,16 @@
 import { html, nothing, render } from "lit-html";
 import { ref } from "lit-html/directives/ref.js";
 import type { TailRecord, TailSignal, TailValueAxis } from "../../lib/trace/span-tail-analysis.js";
-import { densityCellSegments, duration, fieldValue, number } from "./numeric-presentation.js";
+import { duration, fieldValue } from "./numeric-presentation.js";
 
 interface NumericPlotDetailsModel {
   signal: Pick<TailSignal, "key" | "points" | "density">;
   axis: TailValueAxis;
-  interval: { lowerMs: number; upperMs: number | null };
   onJump: (record: TailRecord) => void;
 }
+
+// One active surface per document; owners release it on hide or disposal.
+const activeInspectors = new WeakMap<Document, { pinned: () => boolean; close: () => void }>();
 
 /** Own details for one plotted report. Marks identify their point/cell indices. */
 export function numericPlotDetails(model: NumericPlotDetailsModel) {
@@ -43,24 +45,30 @@ function recordedFields(record: TailRecord) {
       : omitted > 0 ? html`<small>${omitted} ${record.attributes.length ? "additional " : ""}recorded ${omitted === 1 ? "field" : "fields"} omitted · inspect the trace for more</small>` : nothing}`;
 }
 
-/** Dismiss placements when their viewport or anchor geometry becomes stale. */
-function observeGeometry(elements: readonly Element[], onChange: () => void): () => void {
+function readGeometry(elements: readonly Element[]): string {
   const view = elements[0]?.ownerDocument.defaultView;
-  if (!view) return () => {};
-  const geometry = () => elements.map(element => {
+  const viewport = view?.visualViewport;
+  return elements.map(element => {
     const { left, top, width, height } = element.getBoundingClientRect();
     return `${left},${top},${width},${height}`;
-  }).join(";");
-  let previous = geometry();
+  }).join(";") + `;${view?.innerWidth},${view?.innerHeight},${view?.scrollX},${view?.scrollY}`
+    + `;${viewport?.width},${viewport?.height},${viewport?.offsetLeft},${viewport?.offsetTop},${viewport?.scale}`;
+}
+
+/** Dismiss placements when their viewport or anchor geometry becomes stale. */
+function observeGeometry(elements: readonly Element[], onChange: (geometry: string) => void): () => void {
+  const view = elements[0]?.ownerDocument.defaultView;
+  if (!view) return () => {};
+  let previous = readGeometry(elements);
   let active = true;
-  const viewportChanged = () => { if (active) { previous = geometry(); onChange(); } };
+  const viewportChanged = () => { if (active) { previous = readGeometry(elements); onChange(previous); } };
   const observer = typeof view.ResizeObserver === "function" ? new view.ResizeObserver(() => {
     if (!active) return;
-    const next = geometry();
+    const next = readGeometry(elements);
     // ResizeObserver also sends an initial notification, before any change.
     if (next === previous) return;
     previous = next;
-    onChange();
+    onChange(next);
   }) : null;
   elements.forEach(element => observer?.observe(element));
   view.addEventListener("resize", viewportChanged);
@@ -78,22 +86,34 @@ function observeGeometry(elements: readonly Element[], onChange: () => void): ()
 function mountDetails(tooltip: HTMLElement, model: NumericPlotDetailsModel): () => void {
   const plot = tooltip.parentElement;
   const svg = plot?.querySelector<SVGSVGElement>(".tail-scatter");
-  const view = tooltip.ownerDocument.defaultView;
+  const doc = tooltip.ownerDocument;
+  const view = doc.defaultView;
   if (!plot || !svg || !view) return () => {};
-  const { signal, axis, interval, onJump } = model;
+  const anchor = plot.closest(".tail-field, .tail-plot-dialog") ?? plot;
+  const dialog = plot.closest<HTMLDialogElement>(".tail-plot-dialog");
+  const targets = [plot, svg, anchor, plot.closest(".detail-panel")]
+    .filter((target): target is Element => target != null);
+  const { signal, axis, onJump } = model;
   const density = signal.density;
   const xBins = density ? density.elapsedEdgesMs.length - 1 : 0;
   const yBins = density ? density.valueEdges.length - 1 : 0;
   const points = () => svg.querySelectorAll<SVGCircleElement>(".tail-trace-point");
   // Lit may reuse circles whose tabindex was changed by the previous report.
-  const entry = Array.from(points()).find(point => point === tooltip.ownerDocument.activeElement)
+  const entry = Array.from(points()).find(point => point === doc.activeElement)
     ?? svg.querySelector<SVGCircleElement>(".tail-trace-point[tabindex='0']") ?? points()[0];
-  points().forEach(point => point.setAttribute("tabindex", point === entry ? "0" : "-1"));
-  let trigger: Element | null = null;
+  points().forEach(point => {
+    point.setAttribute("tabindex", point === entry ? "0" : "-1");
+    point.setAttribute("aria-pressed", "false");
+  });
+  type Inspection = { index: number | null; origin: Element; keyboard: boolean; nearby: boolean; unavailable?: string };
+  let current: Inspection | null = null;
+  let placementGeometry = "";
+  let pinned = false;
   let hideTimer: number | null = null;
   let focusFrame: number | null = null;
   let restoringFocus = false;
   let keyboardCell = density ? Math.max(0, density.counts.indexOf(density.maxCount)) : 0;
+  const owner = { pinned: () => pinned, close: () => hide(tooltip.contains(doc.activeElement)) };
   const retain = () => { if (hideTimer != null) view.clearTimeout(hideTimer); hideTimer = null; };
   const cancelFocus = () => {
     if (focusFrame != null) view.cancelAnimationFrame(focusFrame);
@@ -102,123 +122,187 @@ function mountDetails(tooltip: HTMLElement, model: NumericPlotDetailsModel): () 
   const hide = (restoreFocus = false) => {
     retain();
     cancelFocus();
+    const origin = current?.origin;
+    current = null;
+    pinned = false;
+    tooltip.hidden = true;
+    tooltip.dataset.pinned = "false";
+    points().forEach(point => point.setAttribute("aria-pressed", "false"));
+    if (activeInspectors.get(doc) === owner) {
+      activeInspectors.delete(doc);
+      view.removeEventListener("keydown", escape);
+    }
+    const trigger = origin?.matches(".tail-density-cell") ? svg : origin;
     if (restoreFocus && trigger?.isConnected) {
       restoringFocus = true;
       (trigger as HTMLElement).focus({ preventScroll: true });
       restoringFocus = false;
     }
-    tooltip.hidden = true;
+  };
+  const escape = (event: KeyboardEvent) => {
+    if (event.key === "Escape" && activeInspectors.get(doc) === owner) {
+      hide(true);
+      event.preventDefault();
+      event.stopPropagation();
+    }
   };
   const leave = () => {
-    retain();
+    if (pinned || hideTimer != null) return;
     hideTimer = view.setTimeout(() => {
       hideTimer = null;
-      const focused = tooltip.ownerDocument.activeElement;
-      if (!tooltip.contains(focused) && focused !== trigger) hide();
+      const focused = doc.activeElement;
+      if (!tooltip.contains(focused) && focused !== current?.origin) hide();
     }, 180);
   };
-  const show = (element: Element, content: unknown, keyboard: boolean, interactive = false) => {
-    retain();
-    cancelFocus();
-    trigger = element;
-    render(content, tooltip);
-    tooltip.hidden = false;
-    const svgRect = svg.getBoundingClientRect();
-    const above = Math.max(0, Math.min(view.innerHeight - 16, svgRect.top - 16));
-    const below = Math.max(0, Math.min(view.innerHeight - 16, view.innerHeight - svgRect.bottom - 16));
+  const place = () => {
+    const anchorRect = anchor.getBoundingClientRect();
+    const above = Math.max(0, Math.min(view.innerHeight - 16, anchorRect.top - 16));
+    const below = Math.max(0, Math.min(view.innerHeight - 16, view.innerHeight - anchorRect.bottom - 16));
     const useAbove = above >= 160 || above >= below;
     const width = Math.min(330, view.innerWidth - 16);
     const height = Math.min(280, useAbove ? above : below);
-    /** Keep a bounded inspector outside the SVG, independent of sample or content. */
+    /** Keep the field/dialog controls clear, independent of sample or content. */
     tooltip.style.width = `${width}px`;
     tooltip.style.height = `${height}px`;
-    tooltip.style.left = `${Math.max(8, Math.min(svgRect.left, view.innerWidth - 8 - width))}px`;
+    tooltip.style.left = `${Math.max(8, Math.min(anchorRect.left, view.innerWidth - 8 - width))}px`;
     tooltip.style.top = `${useAbove
-      ? Math.max(8, Math.min(svgRect.top - 8 - height, view.innerHeight - 8 - height))
-      : Math.max(8, svgRect.bottom + 8)}px`;
-    tooltip.setAttribute("role", interactive ? "dialog" : "tooltip");
-    tooltip.setAttribute("aria-label", interactive ? "Recorded span details" : "Density cell count");
-    tooltip.setAttribute("aria-live", keyboard ? "polite" : "off");
+      ? Math.max(8, Math.min(anchorRect.top - 8 - height, view.innerHeight - 8 - height))
+      : Math.max(8, anchorRect.bottom + 8)}px`;
+    placementGeometry = readGeometry(targets);
   };
-  const showPoint = (element: SVGCircleElement, keyboard: boolean) => {
-    const point = signal.points[Number(element.dataset.pointIndex)];
-    if (!point) return;
-    const [elapsed, raw, row] = point;
-    show(element, html`<strong>${duration(elapsed)} elapsed</strong>
-      <span>${signal.key}: ${fieldValue(raw * axis.multiplier, axis.unit)}</span>
-      <button type="button" class="tail-tooltip-trace" @click=${() => onJump(row)}>Open trace focused on this span ↗</button>
-      ${recordedFields(row)}
-      ${keyboard ? html`<small>Left/right choose samples · Enter opens the trace · Tab inspects fields</small>` : nothing}`,
-    keyboard, true);
+  const show = (inspection: Inspection, pin = false) => {
+    const active = activeInspectors.get(doc);
+    if (active !== owner && active?.pinned() && !pin) return;
+    if (active !== owner) {
+      active?.close();
+      activeInspectors.set(doc, owner);
+      view.addEventListener("keydown", escape);
+    }
+    retain();
+    cancelFocus();
+    const changed = current?.index !== inspection.index || current?.keyboard !== inspection.keyboard
+      || current?.nearby !== inspection.nearby || current?.unavailable !== inspection.unavailable || pinned !== pin;
+    current = inspection;
+    pinned = pin && inspection.index != null;
+    tooltip.dataset.pinned = String(pinned);
+    if (changed) {
+      const point = inspection.index == null ? null : signal.points[inspection.index];
+      render(html`<div class="tail-inspector-heading"><strong>Span details</strong>
+          <span>${pinned ? "Pinned" : point ? "Click to pin" : "Unavailable"}</span></div>
+        ${point ? html`<strong>${duration(point[0])} elapsed</strong>
+          <span>${signal.key}: ${fieldValue(point[1] * axis.multiplier, axis.unit)}</span>
+          ${inspection.nearby ? html`<small>Nearby retained span · no trace sample in this cell</small>` : nothing}
+          <div class="tail-inspector-actions">
+            <button type="button" class="tail-tooltip-trace" @click=${() => {
+              if (current?.index === inspection.index) onJump(point[2]);
+            }}>Open trace focused on this span ↗</button>
+            <button type="button" class="tail-inspector-pin" aria-label=${pinned ? "Unpin span details" : "Pin span details"}
+              aria-pressed=${String(pinned)} @click=${() => {
+                if (pinned) hide(true);
+                else if (current) show(current, true);
+              }}>${pinned ? "Unpin" : "Pin"}</button>
+          </div>
+          ${recordedFields(point[2])}
+          ${inspection.keyboard ? html`<small>Arrows choose samples · Enter pins · Tab inspects fields · Escape clears</small>` : nothing}`
+          : html`<small>${inspection.unavailable}</small>`}`, tooltip);
+    }
+    points().forEach(point => point.setAttribute("aria-pressed", String(pinned && Number(point.dataset.pointIndex) === inspection.index)));
+    tooltip.setAttribute("role", "dialog");
+    tooltip.setAttribute("aria-label", "Span details");
+    tooltip.setAttribute("aria-live", inspection.keyboard ? "polite" : "off");
+    tooltip.hidden = false;
+    place();
   };
-  const showCell = (element: Element, index: number, keyboard: boolean) => {
+  const showPoint = (element: SVGCircleElement, keyboard: boolean, pin = false) => {
+    const index = Number(element.dataset.pointIndex);
+    if (signal.points[index]) show({ index, origin: element, keyboard, nearby: false }, pin);
+  };
+  const showCell = (origin: Element, index: number, keyboard: boolean, pin = false, cursor?: { x: number; y: number }) => {
     if (!density) return;
+    if (!density.counts[index] || !signal.points.length) {
+      show({ index: null, origin, keyboard, nearby: false, unavailable: density.counts[index]
+        ? "No retained trace sample is available for this plot."
+        : "No recorded spans in this cell." });
+      return;
+    }
     const x = index % xBins, y = Math.floor(index / xBins);
-    const count = density.counts[index];
-    if (count == null) return;
-    const edges = density.elapsedEdgesMs;
-    const split = densityCellSegments(edges, x, interval.lowerMs, interval.upperMs).length > 1;
-    show(element, html`<strong>${number(count)} ${count === 1 ? "span" : "spans"} in whole cell</strong>
-      <span>${duration(edges[x]!)}–${duration(edges[x + 1]!)} elapsed</span>
-      <span>${signal.key}: ${fieldValue(density.valueEdges[y]!, axis.unit)}–${fieldValue(density.valueEdges[y + 1]!, axis.unit)}</span>
-      <small>${split ? "Colors split at the cutoff; the count covers both parts. " : ""}Upper bounds ${x === xBins - 1 && y === yBins - 1 ? "included" : "excluded except final bins"}</small>`,
-    keyboard);
+    const inside = (value: number, edges: readonly number[], bin: number) => value >= edges[bin]!
+      && (value < edges[bin + 1]! || bin === edges.length - 2 && value <= edges[bin + 1]!);
+    const candidates = signal.points.flatMap(([elapsed, raw], pointIndex) =>
+      inside(elapsed, density.elapsedEdgesMs, x) && inside(raw * axis.multiplier, density.valueEdges, y) ? [pointIndex] : []);
+    const nearby = !candidates.length;
+    const cell = svg.querySelector<SVGRectElement>(`.tail-density-cell[data-cell-index='${index}']`)!.getBoundingClientRect();
+    const target = cursor ?? { x: cell.left + cell.width / 2, y: cell.top + cell.height / 2 };
+    const marks = points();
+    let nearest = 0, distance = Infinity;
+    for (const pointIndex of nearby ? signal.points.map((_, i) => i) : candidates) {
+      const mark = marks[pointIndex]!.getBoundingClientRect();
+      const next = (mark.left + mark.width / 2 - target.x) ** 2 + (mark.top + mark.height / 2 - target.y) ** 2;
+      if (next < distance) { nearest = pointIndex; distance = next; }
+    }
+    show({ index: nearest, origin, keyboard, nearby }, pin);
   };
   const pointTarget = (event: Event) => event.target instanceof view.SVGCircleElement
     && event.target.matches(".tail-trace-point") ? event.target : null;
-  const enter = (event: Event) => {
-    const point = pointTarget(event);
+  const cellTarget = (event: Event) => event.target instanceof view.Element
+    && event.target.matches(".tail-density-cell") ? event.target : null;
+  const preview = (event: Event) => {
+    if (pinned) return;
+    const point = pointTarget(event), cell = cellTarget(event);
     if (point) showPoint(point, false);
-    else if (event.target instanceof view.Element && event.target.matches(".tail-density-cell")) {
-      // Crossing the grid on the way to the inspector keeps the sampled span.
-      if (!tooltip.hidden && trigger?.matches(".tail-trace-point")) retain();
-      else showCell(event.target, Number(event.target.getAttribute("data-cell-index")), false);
-    } else if (event.target === svg || event.target === tooltip) retain();
+    else if (cell) {
+      const pointer = event as PointerEvent;
+      showCell(cell, Number(cell.getAttribute("data-cell-index")), false, false, { x: pointer.clientX, y: pointer.clientY });
+    } else if (event.target === tooltip || tooltip.contains(event.target as Node)) retain();
+    else if (event.type === "pointermove" && svg.contains(event.target as Node)) leave();
   };
   const pointerLeave = (event: Event) => {
     if (event.target === svg || event.target === tooltip) leave();
   };
   const focus = (event: Event) => {
     const point = pointTarget(event);
-    if (point) {
-      points().forEach(other => other.setAttribute("tabindex", other === point ? "0" : "-1"));
+    if (point) points().forEach(other => other.setAttribute("tabindex", other === point ? "0" : "-1"));
+    if (restoringFocus || !point && event.target !== svg) return;
+    if (pinned) {
+      if (point) showPoint(point, true, true);
+      return;
     }
-    if (!restoringFocus && (point || event.target === svg)) {
-      hide();
-      const element = point ?? svg;
-      // Native focus may scroll a clipped mark; place details after that scroll.
-      focusFrame = view.requestAnimationFrame(() => {
-        focusFrame = null;
-        if (!element.isConnected || tooltip.ownerDocument.activeElement !== element) return;
-        if (point) showPoint(point, true);
-        else showCell(svg, keyboardCell, true);
-      });
-    }
+    hide();
+    const element = point ?? svg;
+    // Native focus may scroll a clipped mark; place details after that scroll.
+    focusFrame = view.requestAnimationFrame(() => {
+      focusFrame = null;
+      if (!element.isConnected || doc.activeElement !== element) return;
+      if (point) showPoint(point, true);
+      else showCell(svg, keyboardCell, true);
+    });
   };
   const blur = (event: Event) => {
     cancelFocus();
-    if ((pointTarget(event) || event.target === svg || tooltip.contains(event.target as Node))
+    if (!pinned && (pointTarget(event) || event.target === svg || tooltip.contains(event.target as Node))
       && !tooltip.contains((event as FocusEvent).relatedTarget as Node | null)) hide();
   };
   const click = (event: Event) => {
-    const point = pointTarget(event);
-    const row = point && signal.points[Number(point.dataset.pointIndex)]?.[2];
-    if (row) onJump(row);
+    const point = pointTarget(event), cell = cellTarget(event);
+    if (point) showPoint(point, false, true);
+    else if (cell) showCell(cell, Number(cell.getAttribute("data-cell-index")), false, true,
+      { x: (event as MouseEvent).clientX, y: (event as MouseEvent).clientY });
   };
   const keydown = (event: Event) => {
     const key = (event as KeyboardEvent).key;
-    if (tooltip.contains(event.target as Node)) {
-      if (key === "Escape") { hide(true); event.preventDefault(); event.stopPropagation(); }
+    if (key === "Escape" && !tooltip.hidden) {
+      hide(tooltip.contains(event.target as Node));
+      event.preventDefault();
+      event.stopPropagation();
       return;
     }
+    if (tooltip.contains(event.target as Node)) return;
     const point = pointTarget(event);
     if (point) {
       const index = Number(point.dataset.pointIndex);
       if (key === "Escape") { hide(); return; }
-      if (key === "Enter") {
-        const row = signal.points[index]?.[2];
-        if (row) onJump(row);
-      } else {
+      if (key === "Enter" || key === " ") showPoint(point, true, true);
+      else {
         // One Tab entry per plot; arrow keys move through the bounded trace sample.
         const next = key === "Home" ? 0 : key === "End" ? signal.points.length - 1
           : key === "ArrowLeft" ? Math.max(0, index - 1)
@@ -228,37 +312,43 @@ function mountDetails(tooltip: HTMLElement, model: NumericPlotDetailsModel): () 
       }
       event.preventDefault();
     } else if (event.target === svg && density) {
-      let x = keyboardCell % xBins, y = Math.floor(keyboardCell / xBins);
-      if (key === "ArrowLeft") x = Math.max(0, x - 1);
-      else if (key === "ArrowRight") x = Math.min(xBins - 1, x + 1);
-      else if (key === "ArrowUp") y = Math.min(yBins - 1, y + 1);
-      else if (key === "ArrowDown") y = Math.max(0, y - 1);
-      else if (key === "Escape") { hide(); return; }
-      else return;
-      keyboardCell = y * xBins + x;
-      showCell(svg, keyboardCell, true);
+      if (key === "Escape") { hide(); return; }
+      if (key === "Enter" || key === " ") showCell(svg, keyboardCell, true, true);
+      else {
+        let x = keyboardCell % xBins, y = Math.floor(keyboardCell / xBins);
+        if (key === "ArrowLeft") x = Math.max(0, x - 1);
+        else if (key === "ArrowRight") x = Math.min(xBins - 1, x + 1);
+        else if (key === "ArrowUp") y = Math.min(yBins - 1, y + 1);
+        else if (key === "ArrowDown") y = Math.max(0, y - 1);
+        else return;
+        keyboardCell = y * xBins + x;
+        showCell(svg, keyboardCell, true, pinned);
+      }
       event.preventDefault();
     }
   };
-  const listeners = { pointerenter: enter, pointerleave: pointerLeave, focus, blur, click, keydown };
+  const listeners = { pointerenter: preview, pointermove: preview, pointerleave: pointerLeave, focus, blur, click, keydown };
   Object.entries(listeners).forEach(([type, listener]) => plot.addEventListener(type, listener, true));
-  const targets = [plot, svg, plot.closest(".tail-plot-dialog, .detail-panel")]
-    .filter((target): target is Element => target != null);
-  const dismiss = () => {
-    if (!tooltip.hidden) hide(tooltip.contains(tooltip.ownerDocument.activeElement));
+  const geometryChanged = (geometry = readGeometry(targets)) => {
+    // Native scrolling may notify after pointer entry already placed this preview.
+    if (!tooltip.hidden && geometry !== placementGeometry) {
+      if (pinned) place();
+      else hide(tooltip.contains(doc.activeElement));
+    }
   };
   const scroll = (event: Event) => {
-    if (!(event.target instanceof view.Node && tooltip.contains(event.target))) dismiss();
+    if (!(event.target instanceof view.Node && tooltip.contains(event.target))) geometryChanged();
   };
-  const disposeGeometry = observeGeometry(targets, dismiss);
+  const closeDialog = () => hide();
+  dialog?.addEventListener("close", closeDialog);
+  const disposeGeometry = observeGeometry(targets, geometryChanged);
   view.addEventListener("scroll", scroll, true);
   return () => {
-    retain();
     disposeGeometry();
+    dialog?.removeEventListener("close", closeDialog);
     view.removeEventListener("scroll", scroll, true);
     Object.entries(listeners).forEach(([type, listener]) => plot.removeEventListener(type, listener, true));
-    hide(tooltip.contains(tooltip.ownerDocument.activeElement));
+    hide(tooltip.contains(doc.activeElement));
     render(nothing, tooltip);
-    trigger = null;
   };
 }

@@ -7,8 +7,8 @@ the current source, exact span-type ID, time window, and attribute filters.
 There are no service-specific fields, operation names, or datasets in the
 native feature.
 
-Selecting a span type collapses the catalog to a compact selected-span bar.
-**Change span** reopens the list; choosing another type collapses it again.
+Selecting a span type collapses the catalog. **Change span**, beside the single
+selected-span heading, reopens the list; choosing another type collapses it again.
 
 It supports aggregate S3 scopes and single raw traces. The Rust backend
 computes the entire analysis through `GET /api/span-tail` (aggregate scope)
@@ -28,8 +28,8 @@ The view starts with:
 
 - Explicit comparison-group definitions, counts, and source-file coverage.
 - Categorical latency distributions when a varying categorical field is present.
-  Values overlay in distinct colors by default; **Stacked** shows cumulative
-  layers on one graph with a white total curve.
+  **Stacked** is the initial view: distinct colors form cumulative
+  layers on one graph with a white total curve. **Overlay** remains selectable.
   Each value shows its count and p99. Shared logarithmic bins and Y scales make
   the shapes comparable. Overlay heights are percentages within each value;
   stacked layers use exact bin counts divided by the full recorded population,
@@ -43,8 +43,10 @@ The view starts with:
   every loaded recorded value; outlined dots are trace-linked samples.
   Blue marks other spans and orange marks slow or selected spans, including
   exact color splits where cutoffs cross a cell. Brightness uses the same count
-  scale for both hues; split-cell tooltips retain the whole cell's count.
+  scale for both hues; density counts cover whole cells even at color splits.
   Elapsed time uses a shared logarithmic axis with a zero-inclusive first bin.
+  **Elapsed axis** switches numeric plots to a linear axis; the same choice
+  applies to compact and enlarged plots.
   The backend shares value limits across identical units and normalizes declared
   time units to milliseconds. Unknown units remain separate. Additional fields
   and enlarged plots are available on demand.
@@ -94,20 +96,21 @@ Escape closes the explanation and returns focus.
 File repetition needs five observations in each cohort. Spearman compares up to
 2,048 evenly spaced observations across latency ranks; comparison means,
 medians, and p99s use every loaded recorded value in their original units.
-Drawing uses up to 330 trace-link dots in addition
-to the full-observation density grid. Hover or focus a dot to see its values and
-the trace action before opening it. Point popovers preserve the original recorded
-key/value strings, including duplicate keys, in a bounded scroll region. Hover
-retention and keyboard focus let users read long records. Backend omissions are
-explicit; unavailable cached metadata is never inferred from the active field.
-The inspector docks outside the graph at a position independent of the hovered
-point or table height. Crossing density cells on the way to the inspector
-retains the selected span. Keyboard entry places it after native focus scrolling,
-while arrow keys preserve the viewport. Scrolling the page or changing the
-viewport or plot dismisses an obsolete inspector; its own fields remain scrollable.
-Dismissal returns focus to the dot when the inspector contained focus.
-A dot, popover action, or slow-example button opens its
-original trace focused on the selected span, preserving the credential contract.
+Drawing uses up to 330 recorded-span dots alongside the full-observation
+density grid. Hover or keyboard focus shows one actual retained span and its
+original key/value strings, including duplicate keys. Moving within or between
+cells updates the span; an unsampled cell explicitly labels its nearby retained
+span, and unavailable samples remain explicit. No metadata is inferred from
+the active field.
+
+Click a dot or populated cell, or press Enter or Space, to pin the details.
+Only one inspector is active at a time. Pinning preserves its original values
+for reading, text selection and copying while the page scrolls or resizes;
+**Unpin** or Escape clears it. The inspector docks outside the field or enlarged
+dialog, keeping that field's controls accessible. Short windows retain bounded
+scroll access. Closing an enlarged plot or replacing the report releases its
+inspector. **Open trace** is the explicit navigation action and preserves the
+source and credential contract.
 Older cached reports show an explicit sample-only warning and do not invent
 missing density or shared-unit metadata.
 
@@ -119,6 +122,13 @@ top of the detail panel, while analysis completion preserves the scroll position
 The paired comparison replaces the catalog's single time bar once analysis is
 available. Flamegraph links and recorded-instance browsing share one trace
 inspection section beneath the charts.
+
+The shareable URL preserves property/value scope, percentile or duration band,
+displayed property, stacked/overlay mode, numeric elapsed scale and the expanded
+field list. Refresh and Back/Forward restore those controls and their analysis;
+display-only changes do not request another report. **All instances** clears
+the grouped scope. See [the URL contract](../../URL_CONTRACT.md) for the parameter
+names and defaults.
 
 ## Run locally
 

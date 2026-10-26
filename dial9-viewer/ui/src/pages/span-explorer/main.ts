@@ -35,7 +35,7 @@ import {
   removeAttrFilter,
   shouldAdoptCatalogSnapshot,
   sourceScopeFromStored,
-  spanTypeLabel,
+  toUrlSourceScope,
 } from "../../lib/trace/index.js";
 import type {
   AttrFilter,
@@ -67,6 +67,8 @@ import {
   exemplarScopeKey,
   isAggregateMode,
   readScope,
+  readTailView,
+  type TailViewState,
   type ViewState,
 } from "./scope.js";
 import {
@@ -102,6 +104,7 @@ els.btnCopyLink.style.display = isSourceShareable(scope.source) ? "" : "none";
 
 let spanTypes: SpanTypeStats[] = [];
 let selectedUid = params.get("span_type_uid");
+let analysisView = readTailView(params);
 let catalogExpanded = false;
 let band: DurationBand = {
   min_ns:
@@ -193,11 +196,72 @@ function linkState(): SpanExplorerState | null {
 function syncUrl(): void {
   // Keep the pathname explicit: a bare "?qs" would resolve against <base href="/">
   // and rewrite this page's path to "/".
-  history.replaceState(
-    null,
-    "",
-    `${window.location.pathname}?${buildBrowserQuery(scope, view())}`,
-  );
+  const next = `${window.location.pathname}?${buildBrowserQuery(
+    scope, view(), analysisView, new URLSearchParams(window.location.search),
+  )}${window.location.hash}`;
+  if (next !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
+    history.pushState(null, "", next);
+  }
+}
+
+function changeAnalysisView(next: TailViewState, clearBand = false): void {
+  analysisView = next;
+  if (clearBand) applyBand({ min_ns: null, max_ns: null });
+  else {
+    syncUrl();
+    renderDetailNow();
+  }
+}
+
+function restoreUrl(): void {
+  const next = new URLSearchParams(window.location.search);
+  // The load source is fixed for this document. A different source needs a
+  // fresh boot, including restoration of its tab-scoped credentials.
+  const nextScope = readScope(next, scope.source);
+  if (JSON.stringify({ ...nextScope, source: toUrlSourceScope(nextScope.source) }) !==
+      JSON.stringify({ ...scope, source: toUrlSourceScope(scope.source) })) {
+    stopStreaming();
+    stopComparisonStreaming(true);
+    tailAnalysis.mount(null, null);
+    window.location.reload();
+    return;
+  }
+  const previous = view();
+  selectedUid = next.get("span_type_uid");
+  analysisView = readTailView(next);
+  band = {
+    min_ns: next.has("min_span_ns") ? Number(next.get("min_span_ns")) : null,
+    max_ns: next.has("max_span_ns") ? Number(next.get("max_span_ns")) : null,
+  };
+  attrFilters = parseAttrFilterParams(next.getAll("attr"));
+  maxFiles = next.has("max_files") ? Number(next.get("max_files")) : null;
+  els.fStart.value = next.has("start_ns") ? nsToPickerUtc(next.get("start_ns")) : "";
+  els.fEnd.value = next.has("end_ns") ? nsToPickerUtc(next.get("end_ns")) : "";
+  const current = view();
+  if (previous.startNs !== current.startNs || previous.endNs !== current.endNs ||
+      previous.maxFiles !== current.maxFiles) {
+    if (!rawMode) startStreaming("replace");
+    else renderDetailNow();
+    return;
+  }
+  const changedSpan = previous.selectedUid !== selectedUid;
+  const changedSelection = changedSpan ||
+    previous.bandMinNs !== band.min_ns || previous.bandMaxNs !== band.max_ns;
+  const changedFilters = JSON.stringify(previous.attrFilters) !== JSON.stringify(attrFilters);
+  if (changedSelection) {
+    if (activeStreamMode === "exemplars" || activeStreamMode === "refine") stopStreaming();
+    if (changedSpan) stopComparisonStreaming(true);
+    catalogExpanded = false;
+  }
+  const refreshExamples = changedSelection && selectedUid != null && !rawMode &&
+    exemplarScopeByUid.get(selectedUid) !== exemplarScopeKey(current);
+  if (refreshExamples) invalidateSelectedExemplarData();
+  if (changedSelection) exemplarRefreshPending = refreshExamples;
+  renderCatalogNow();
+  renderFilterBarNow();
+  if (changedSpan || changedFilters) startComparisonStreaming();
+  else renderDetailNow();
+  if (refreshExamples) startStreaming("exemplars");
 }
 
 // ── Rendering ──
@@ -215,6 +279,9 @@ function renderDetailNow(loading = false): void {
     : spanTypes.find(s => s.span_type_uid === selectedUid);
   renderDetail(els.detailPanel, {
     spanType: selected,
+    catalogExpanded,
+    spanTypeCount: spanTypes.length,
+    onToggleCatalog: toggleCatalog,
     loading,
     band,
     coverage: lastCoverage,
@@ -247,13 +314,14 @@ function renderDetailNow(loading = false): void {
     },
   });
   tailAnalysis.mount(els.detailPanel.querySelector(".span-tail-mount"), selected ? {
-    spanType: selected, scope, view: view(),
+    spanType: selected, scope, view: view(), analysis: analysisView,
     headers: Dial9Session.headers(Dial9Creds.headers()),
     onClearBand: () => applyBand({ min_ns: null, max_ns: null }),
     onBand: (minMs, maxMs) => applyBand({
       min_ns: minMs == null ? null : Math.round(minMs * 1e6),
       max_ns: maxMs == null ? null : Math.round(maxMs * 1e6),
     }),
+    onAnalysisChange: changeAnalysisView,
   } : null);
 }
 
@@ -261,14 +329,6 @@ function renderCatalogNow(): void {
   renderCatalog(els, spanTypes, sort, selectedUid, selectSpanType);
   const selected = spanTypes.find(s => s.span_type_uid === selectedUid);
   const expanded = !selected || catalogExpanded;
-  els.catalogSelection.style.display = selected ? "flex" : "none";
-  // The expanded catalog already contains the selected name in its row.
-  els.catalogSelectedName.textContent = selected
-    ? expanded ? "Choose a span type" : spanTypeLabel(selected)
-    : "";
-  els.catalogSelectedName.title = els.catalogSelectedName.textContent;
-  els.btnToggleCatalog.textContent = expanded ? "Hide span list" : `Change span · ${spanTypes.length}`;
-  els.btnToggleCatalog.setAttribute("aria-expanded", String(expanded));
   els.catalogWrap.style.display = spanTypes.length && expanded ? "block" : "none";
 }
 
@@ -315,6 +375,9 @@ function selectSpanType(uid: string): void {
   if (activeStreamMode === "exemplars" || activeStreamMode === "refine")
     stopStreaming();
   stopComparisonStreaming(true);
+  if (uid !== selectedUid) {
+    analysisView = { ...analysisView, groupKey: null, groupValue: null, property: null };
+  }
   selectedUid = uid;
   catalogExpanded = false;
   band = { min_ns: null, max_ns: null };
@@ -325,7 +388,7 @@ function selectSpanType(uid: string): void {
   syncUrl();
   renderCatalogNow();
   renderDetailNow();
-  els.btnToggleCatalog.focus({ preventScroll: true });
+  els.detailPanel.querySelector<HTMLButtonElement>(".change-span")?.focus({ preventScroll: true });
   if (needsRefresh) startStreaming("exemplars");
   if (attrFilters.length > 0) startComparisonStreaming();
 }
@@ -407,7 +470,6 @@ function startStreaming(mode: StreamMode): void {
     exemplarScopeByUid.clear();
     els.loading.classList.remove("hidden");
     els.stats.textContent = "Loading span statistics…";
-    els.catalogSelection.style.display = "none";
     els.catalogWrap.style.display = "none";
     // The new time scope has no authoritative detail yet. Retire its old
     // analysis request and remove stale graph actions until a snapshot arrives.
@@ -695,6 +757,8 @@ function refreshComparisonAfterBaseline(): void {
 
 // ── Event handlers ──
 
+window.addEventListener("popstate", restoreUrl);
+
 els.btnApply.addEventListener("click", () => {
   maxFiles = null;
   syncUrl();
@@ -726,8 +790,7 @@ els.btnStop.addEventListener("click", () => {
 });
 
 els.btnCopyLink.addEventListener("click", async () => {
-  const url =
-    window.location.origin + window.location.pathname + window.location.search;
+  const url = window.location.href;
   const orig = els.btnCopyLink.textContent;
   try {
     await navigator.clipboard.writeText(url);
@@ -748,13 +811,14 @@ els.catalog.querySelector("thead")?.addEventListener("click", (e) => {
   renderCatalogNow();
 });
 
-els.btnToggleCatalog.addEventListener("click", () => {
+function toggleCatalog(): void {
   catalogExpanded = !catalogExpanded;
   renderCatalogNow();
+  renderDetailNow();
   if (catalogExpanded) {
     els.catalogBody.querySelector(".selected")?.scrollIntoView({ block: "nearest" });
   }
-});
+}
 
 // ── Boot ──
 

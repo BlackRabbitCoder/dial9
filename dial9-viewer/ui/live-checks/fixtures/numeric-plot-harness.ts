@@ -1,7 +1,7 @@
 import { html, nothing, render, type RootPart } from "lit-html";
 import { renderNumericPlot } from "../../src/pages/span-explorer/numeric-plot.js";
 import { SpanTailAnalysis } from "../../src/pages/span-explorer/tail-analysis.js";
-import { readScope } from "../../src/pages/span-explorer/scope.js";
+import { readScope, readTailView } from "../../src/pages/span-explorer/scope.js";
 import type { SpanTypeStats } from "../../src/lib/trace/index.js";
 import type { TailRecord, TailResponse, TailSignal } from "../../src/lib/trace/span-tail-analysis.js";
 import "../../src/pages/span-explorer/tail-analysis.css";
@@ -12,6 +12,9 @@ interface DrawOptions {
   large?: boolean;
   noDensity?: boolean;
   oldReport?: boolean;
+  elapsedScale?: "linear" | "log";
+  minMs?: number;
+  maxMs?: number;
   fields?: Pick<TailRecord, "attributes" | "attributesOmitted">;
   fieldsByPoint?: readonly Pick<TailRecord, "attributes" | "attributesOmitted">[];
   signal?: Partial<TailSignal>;
@@ -69,7 +72,13 @@ const context: NonNullable<Parameters<SpanTailAnalysis["mount"]>[1]> = {
   scope: readScope(new URLSearchParams("api=1&data_dir=fixture")),
   view: { startNs: null, endNs: null, selectedUid: "request-uid", bandMinNs: null,
     bandMaxNs: null, attrFilters: [], maxFiles: null },
+  analysis: readTailView(new URLSearchParams()),
   headers: {}, onClearBand: () => {}, onBand: () => {},
+  onAnalysisChange: (next, clearBand) => {
+    context.analysis = next;
+    if (clearBand) context.view = { ...context.view, bandMinNs: null, bandMaxNs: null };
+    analysis.mount(reportHost, context);
+  },
 };
 function signal(options: DrawOptions = {}): TailSignal {
   const count = options.points ?? 3;
@@ -98,12 +107,13 @@ function draw(options: DrawOptions = {}) {
   const value = signal(options);
   root = render(html`${Array.from({ length: options.plots ?? 1 }, () => html`
     <section class="detail-panel">${options.large ? html`<dialog class="tail-plot-dialog">
-      ${plot(value, true)}</dialog>` : plot(value, false)}</section>`)}`, plots);
+      ${plot(value, true, options)}</dialog>` : plot(value, false, options)}</section>`)}`, plots);
   plots.querySelectorAll("dialog").forEach(dialog => { if (!dialog.open) dialog.showModal(); });
 }
-function plot(value: TailSignal, large: boolean) {
-  return renderNumericPlot(value, { signals: [value], boundaryMs: 10, percentile: 99,
-    minMs: null, maxMs: null, large, onJump: row => jumps.push(row) });
+function plot(value: TailSignal, large: boolean, options: DrawOptions) {
+  return renderNumericPlot(value, { signals: [value], boundaryMs: options.minMs ?? 10, percentile: 99,
+    minMs: options.minMs ?? null, maxMs: options.maxMs ?? null, large,
+    elapsedScale: options.elapsedScale ?? "log", onJump: row => jumps.push(row) });
 }
 function replaceReport() {
   previousReport = reportHost;
