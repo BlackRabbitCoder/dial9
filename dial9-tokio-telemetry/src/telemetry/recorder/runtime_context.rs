@@ -976,6 +976,7 @@ fn make_worker_unpark(ctx: &RuntimeContext) -> WorkerUnparkEvent {
 #[cfg(all(test, not(shuttle)))]
 mod tests {
     use super::*;
+    use crate::telemetry::TokioDetachOutcome;
 
     /// Push a named runtime context with a single resolved worker into `contexts`.
     fn push_named_runtime(contexts: &RuntimeContextRegistry, name: &str, worker_id: u64) {
@@ -1180,18 +1181,24 @@ mod tests {
 
         // Pausing is not shutting down: a paused recorder still detaches.
         handle.disable();
-        assert!(handle.detach_tokio_runtime(rt.handle()));
+        assert_eq!(
+            handle.detach_tokio_runtime(rt.handle()),
+            TokioDetachOutcome::Detached
+        );
         assert_eq!(tracked(handle, rt.handle()), (false, false));
         assert!(ctx.detached.load(Ordering::Relaxed));
         // Idempotent.
-        assert!(!handle.detach_tokio_runtime(rt.handle()));
+        assert_eq!(
+            handle.detach_tokio_runtime(rt.handle()),
+            TokioDetachOutcome::NotTracked
+        );
 
         drop(rt);
         rec.graceful_shutdown(Duration::from_secs(1));
     }
 
     #[test]
-    fn detach_unknown_runtime_returns_false() {
+    fn detach_unknown_runtime_is_not_tracked() {
         use crate::telemetry::{Dial9HandleTokioExt, TokioAttachOptions};
         let new_rec = || {
             dial9_core::recorder::recorder(
@@ -1204,13 +1211,19 @@ mod tests {
             .build()
             .unwrap();
         // No Tokio source installed yet, and detach must not install one.
-        assert!(!rec.handle().detach_tokio_runtime(unattached.handle()));
+        assert_eq!(
+            rec.handle().detach_tokio_runtime(unattached.handle()),
+            TokioDetachOutcome::NotTracked
+        );
         assert!(
             rec.handle()
                 .with_source(|_: &mut TokioRuntimesSource| ())
                 .is_none()
         );
-        assert!(!Dial9Handle::disabled().detach_tokio_runtime(unattached.handle()));
+        assert_eq!(
+            Dial9Handle::disabled().detach_tokio_runtime(unattached.handle()),
+            TokioDetachOutcome::NotTracked
+        );
 
         let attached = other
             .handle()
@@ -1220,8 +1233,14 @@ mod tests {
             )
             .unwrap();
         // Attached to `other`, not `rec`; `other` keeps tracking it.
-        assert!(!rec.handle().detach_tokio_runtime(attached.handle()));
-        assert!(!other.handle().detach_tokio_runtime(unattached.handle()));
+        assert_eq!(
+            rec.handle().detach_tokio_runtime(attached.handle()),
+            TokioDetachOutcome::NotTracked
+        );
+        assert_eq!(
+            other.handle().detach_tokio_runtime(unattached.handle()),
+            TokioDetachOutcome::NotTracked
+        );
         assert_eq!(tracked(other.handle(), attached.handle()), (true, true));
 
         let uninstrumented = other
@@ -1233,13 +1252,19 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        assert!(!other.handle().detach_tokio_runtime(uninstrumented.handle()));
+        assert_eq!(
+            other.handle().detach_tokio_runtime(uninstrumented.handle()),
+            TokioDetachOutcome::NotTracked
+        );
 
         // Shutdown drops the source, so there is nothing left to detach.
         let other_handle = other.handle().clone();
         rec.graceful_shutdown(Duration::from_secs(1));
         other.graceful_shutdown(Duration::from_secs(1));
-        assert!(!other_handle.detach_tokio_runtime(attached.handle()));
+        assert_eq!(
+            other_handle.detach_tokio_runtime(attached.handle()),
+            TokioDetachOutcome::NotTracked
+        );
         drop((attached, uninstrumented));
     }
 
@@ -1289,7 +1314,10 @@ mod tests {
                             .unwrap();
                     });
                     assert_eq!(tracked_counts(), (1, 1));
-                    assert!(handle.detach_tokio_runtime(rt.handle()));
+                    assert_eq!(
+                        handle.detach_tokio_runtime(rt.handle()),
+                        TokioDetachOutcome::Detached
+                    );
                 }
                 _ => {
                     let builder = if flavor == "multi_thread" {
@@ -1302,7 +1330,10 @@ mod tests {
                     let rt = handle.attach_tokio_runtime(builder, options()).unwrap();
                     crate::telemetry::block_on(&rt, work());
                     assert_eq!(tracked_counts(), (1, 1));
-                    assert!(handle.detach_tokio_runtime(rt.handle()));
+                    assert_eq!(
+                        handle.detach_tokio_runtime(rt.handle()),
+                        TokioDetachOutcome::Detached
+                    );
                 }
             }
             assert_eq!(tracked_counts(), (0, 0));
@@ -1461,7 +1492,7 @@ mod shuttle_tests {
     use super::super::recorder_tokio;
     use super::*;
     use crate::background_task::testutil::CapturingProcessor;
-    use crate::telemetry::{Dial9HandleTokioExt, TokioAttachOptions};
+    use crate::telemetry::{Dial9HandleTokioExt, TokioAttachOptions, TokioDetachOutcome};
     use dial9_core::shuttle_test;
 
     shuttle_test! {
@@ -1656,7 +1687,7 @@ mod shuttle_tests {
             let wins = detachers
                 .into_iter()
                 .map(|d| d.join().unwrap())
-                .filter(|&won| won)
+                .filter(|outcome| matches!(outcome, TokioDetachOutcome::Detached))
                 .count();
             let new = attacher.join().unwrap();
             assert_eq!(wins, 1, "exactly one concurrent detach releases the runtime");

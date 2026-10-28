@@ -25,6 +25,7 @@ pub use tokio_hooks::TokioHooks;
 pub use recorder_tokio::RecorderS3ClientExt;
 pub use recorder_tokio::{
     AttachedRuntime, Dial9HandleTokioExt, RecorderPipelineExt, TokioAttachOptions,
+    TokioDetachOutcome,
 };
 
 // Re-exports for internal test access
@@ -561,7 +562,10 @@ mod tests {
             crate::telemetry::spawn(async move {
                 let open = poll_span_open();
                 if detach {
-                    assert!(handle.detach_tokio_runtime(&tokio::runtime::Handle::current()));
+                    assert_eq!(
+                        handle.detach_tokio_runtime(&tokio::runtime::Handle::current()),
+                        TokioDetachOutcome::Detached
+                    );
                 } else {
                     handle.disable();
                 }

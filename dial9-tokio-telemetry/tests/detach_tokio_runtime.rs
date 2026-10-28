@@ -5,15 +5,14 @@
 
 mod common;
 
+use common::{capture_processor, decode_all, decode_file, fast_sealing_writer};
 use dial9_tokio_telemetry::telemetry::analysis_events::{Dial9Event, WorkerId};
 use dial9_tokio_telemetry::telemetry::{
-    Dial9Handle, Dial9HandleTokioExt, DiskBuffer, TokioAttachOptions, TokioHooks,
-    clock_monotonic_ns, recorder,
+    Dial9Handle, Dial9HandleTokioExt, DiskBuffer, RecorderPipelineExt, TokioAttachOptions,
+    TokioDetachOutcome, TokioHooks, clock_monotonic_ns, recorder,
 };
-use dial9_trace_format::decoder::Decoder;
 use rstest::rstest;
 use std::collections::BTreeSet;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -132,31 +131,6 @@ fn attach_with_sentinel(
     }
 }
 
-/// Decode every event in the trace files under `dir`, oldest segment first,
-/// including a live `.active` segment.
-fn read_events(dir: &Path) -> Vec<Dial9Event> {
-    let mut files: Vec<_> = std::fs::read_dir(dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.to_string_lossy().contains(".bin"))
-        .collect();
-    files.sort();
-    let mut events = Vec::new();
-    for path in files {
-        let data = std::fs::read(&path).expect("read trace file");
-        let Some(mut dec) = Decoder::new(&data) else {
-            continue;
-        };
-        // An `.active` segment may end in a partially written event.
-        let _ = dec.for_each_event(|raw| {
-            if let Ok(ev) = raw.deserialize::<Dial9Event>() {
-                events.push(ev);
-            }
-        });
-    }
-    events
-}
-
 /// Worker ids of the poll and park events in `events` recorded in `range`.
 fn worker_ids_in(events: &[Dial9Event], range: impl Fn(u64) -> bool) -> BTreeSet<u64> {
     events
@@ -206,7 +180,10 @@ fn restart_loop_releases_runtimes(#[case] flavor: Flavor) {
             Arc::strong_count(&alive) >= 2,
             "restart {i}: the sentinel must observe the live runtime"
         );
-        assert!(handle.detach_tokio_runtime(rt.handle()));
+        assert_eq!(
+            handle.detach_tokio_runtime(rt.handle()),
+            TokioDetachOutcome::Detached
+        );
         drop(rt);
         assert_eq!(
             Arc::strong_count(&alive),
@@ -250,8 +227,15 @@ fn detach_after_drop_via_handle_clone() {
     let saved = rt.handle().clone();
     drop(rt);
 
-    assert!(handle.detach_tokio_runtime(&saved));
-    assert!(!handle.detach_tokio_runtime(&saved), "second detach");
+    assert_eq!(
+        handle.detach_tokio_runtime(&saved),
+        TokioDetachOutcome::Detached
+    );
+    assert_eq!(
+        handle.detach_tokio_runtime(&saved),
+        TokioDetachOutcome::NotTracked,
+        "second detach"
+    );
     assert!(
         Arc::strong_count(&alive) >= 2,
         "the saved clone still keeps the runtime alive"
@@ -281,7 +265,7 @@ fn cross_thread_detach_released_when_thread_drives_another_runtime() {
     let saved = old.handle().clone();
     std::thread::scope(|s| {
         let detached = s.spawn(|| handle.detach_tokio_runtime(&saved)).join();
-        assert!(detached.unwrap());
+        assert_eq!(detached.unwrap(), TokioDetachOutcome::Detached);
     });
     drop(saved);
     drop(old);
@@ -293,7 +277,10 @@ fn cross_thread_detach_released_when_thread_drives_another_runtime() {
 
     let new = attach(handle, Flavor::CurrentThread, "new");
     new.run_tasks();
-    assert!(handle.detach_tokio_runtime(new.handle()));
+    assert_eq!(
+        handle.detach_tokio_runtime(new.handle()),
+        TokioDetachOutcome::Detached
+    );
     drop(new);
     assert_eq!(
         Arc::strong_count(&alive),
@@ -309,15 +296,18 @@ fn cross_thread_detach_released_when_thread_drives_another_runtime() {
 fn same_name_restart_metadata_lists_live_workers() {
     const SEAL_WAIT: Duration = Duration::from_secs(30);
     let dir = tempfile::tempdir().unwrap();
-    let writer = DiskBuffer::single_file(dir.path().join("trace.bin")).unwrap();
-    let recorder = recorder(writer).build();
+    let (capture, batches) = capture_processor();
+    let recorder = recorder(fast_sealing_writer(dir.path()))
+        .with_custom_pipeline(|pipeline| pipeline.pipe(capture))
+        .build();
     let handle = recorder.handle();
 
     let old = attach(handle, Flavor::MultiThread, "svc");
-    // Wait until the flush thread has published the old runtime's workers, so
-    // the new runtime must replace an entry the writer already holds.
+    // Wait for a sealed segment containing the old runtime's workers, so the
+    // new runtime must replace an entry the writer already holds. The shared
+    // decoder only reads completed segments.
     let deadline = Instant::now() + SEAL_WAIT;
-    while last_runtime_metadata(&read_events(dir.path()), "svc").is_none() {
+    while last_runtime_metadata(&decode_all(&batches.lock().unwrap()), "svc").is_none() {
         assert!(
             Instant::now() < deadline,
             "old runtime's metadata never reached the trace"
@@ -328,7 +318,10 @@ fn same_name_restart_metadata_lists_live_workers() {
         };
         rt.block_on(async { tokio::time::sleep(Duration::from_millis(20)).await });
     }
-    assert!(handle.detach_tokio_runtime(old.handle()));
+    assert_eq!(
+        handle.detach_tokio_runtime(old.handle()),
+        TokioDetachOutcome::Detached
+    );
     drop(old);
     let detached_at = clock_monotonic_ns();
 
@@ -337,7 +330,7 @@ fn same_name_restart_metadata_lists_live_workers() {
     drop(new);
     recorder.graceful_shutdown(Duration::from_secs(5));
 
-    let events = read_events(dir.path());
+    let events = decode_all(&batches.lock().unwrap());
     let old_ids = worker_ids_in(&events, |ts| ts < detached_at);
     let new_ids = worker_ids_in(&events, |ts| ts >= detached_at);
     let listed = last_runtime_metadata(&events, "svc").expect("runtime.svc metadata");
@@ -385,13 +378,19 @@ fn running_runtime_records_nothing_after_detach(#[case] flavor: Flavor) {
         AnyRuntime::Runtime(inner) if matches!(flavor, Flavor::OneWorker) => {
             let handle = handle.clone();
             dial9_tokio_telemetry::block_on(inner, async move {
-                assert!(handle.detach_tokio_runtime(&tokio::runtime::Handle::current()));
+                assert_eq!(
+                    handle.detach_tokio_runtime(&tokio::runtime::Handle::current()),
+                    TokioDetachOutcome::Detached
+                );
                 clock_monotonic_ns()
             })
         }
         // Nothing drives a current-thread runtime between `block_on` calls.
         _ => {
-            assert!(handle.detach_tokio_runtime(rt.handle()));
+            assert_eq!(
+                handle.detach_tokio_runtime(rt.handle()),
+                TokioDetachOutcome::Detached
+            );
             clock_monotonic_ns()
         }
     };
@@ -410,7 +409,7 @@ fn running_runtime_records_nothing_after_detach(#[case] flavor: Flavor) {
     );
     recorder.graceful_shutdown(Duration::from_secs(5));
 
-    let events = read_events(dir.path());
+    let events: Vec<Dial9Event> = decode_file(&dir.path().join("trace.0.bin"));
     let polls_before = events
         .iter()
         .filter(|e| matches!(e, Dial9Event::PollStartEvent(p) if p.timestamp_ns < detached_at))

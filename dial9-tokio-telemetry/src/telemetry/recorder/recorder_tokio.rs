@@ -331,6 +331,18 @@ impl std::fmt::Debug for TokioAttachOptions {
 /// ```
 pub type AttachedRuntime = (Recorder, tokio::runtime::Runtime);
 
+/// The outcome of [`Dial9HandleTokioExt::detach_tokio_runtime`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokioDetachOutcome {
+    /// The recorder removed this runtime's tracking state.
+    Detached,
+    /// No runtime tracking state was removed.
+    ///
+    /// Includes an untracked runtime, a repeated detach, a disabled handle,
+    /// or a recorder whose tracking source is unavailable.
+    NotTracked,
+}
+
 /// Tokio instrumentation for [`Dial9Handle`].
 pub trait Dial9HandleTokioExt: dial9_handle_tokio_ext_sealed::Sealed {
     /// Instrument a builder you configured, build it, and return the runtime.
@@ -473,8 +485,9 @@ pub trait Dial9HandleTokioExt: dial9_handle_tokio_ext_sealed::Sealed {
 
     /// Stop tracking `runtime` and release dial9's references to it.
     ///
-    /// Returns `false` if this recorder tracks nothing for `runtime`: it was
-    /// never attached here, was attached with
+    /// Returns [`TokioDetachOutcome::Detached`] when tracking state is removed.
+    /// Returns [`TokioDetachOutcome::NotTracked`] if nothing is removed: the
+    /// runtime was never attached here, was attached with
     /// [`tokio_instrumentation_enabled(false)`](TokioAttachOptions), is already
     /// detached, the handle is [`Dial9Handle::disabled`], or the recorder has
     /// shut down. A paused recorder still detaches. Idempotent.
@@ -506,7 +519,9 @@ pub trait Dial9HandleTokioExt: dial9_handle_tokio_ext_sealed::Sealed {
     /// ```no_run
     /// use dial9_core::buffer::MemoryBuffer;
     /// use dial9_core::recorder::recorder;
-    /// use dial9_tokio_telemetry::telemetry::{Dial9HandleTokioExt, TokioAttachOptions};
+    /// use dial9_tokio_telemetry::telemetry::{
+    ///     Dial9HandleTokioExt, TokioAttachOptions, TokioDetachOutcome,
+    /// };
     ///
     /// # fn main() -> std::io::Result<()> {
     /// let recorder = recorder(MemoryBuffer::new(1 << 20)?).build();
@@ -516,12 +531,15 @@ pub trait Dial9HandleTokioExt: dial9_handle_tokio_ext_sealed::Sealed {
     /// builder.enable_all();
     /// let rt = d9.attach_tokio_runtime(builder, TokioAttachOptions::default())?;
     /// // ... serve until reload ...
-    /// d9.detach_tokio_runtime(rt.handle());
+    /// match d9.detach_tokio_runtime(rt.handle()) {
+    ///     TokioDetachOutcome::Detached => {}
+    ///     TokioDetachOutcome::NotTracked => {}
+    /// }
     /// drop(rt);
     /// # Ok(())
     /// # }
     /// ```
-    fn detach_tokio_runtime(&self, runtime: &tokio::runtime::Handle) -> bool;
+    fn detach_tokio_runtime(&self, runtime: &tokio::runtime::Handle) -> TokioDetachOutcome;
 }
 
 mod dial9_handle_tokio_ext_sealed {
@@ -548,7 +566,7 @@ impl Dial9HandleTokioExt for Dial9Handle {
         attach_built_runtime(self, builder, options, build_local_runtime)
     }
 
-    fn detach_tokio_runtime(&self, runtime: &tokio::runtime::Handle) -> bool {
+    fn detach_tokio_runtime(&self, runtime: &tokio::runtime::Handle) -> TokioDetachOutcome {
         // `with_source`, not `tokio_attach_state`: detach must not install a
         // source. The removed state drops on return, after the source lock.
         let detached = self
@@ -558,8 +576,10 @@ impl Dial9HandleTokioExt for Dial9Handle {
             // A `current_thread` or `LocalRuntime` is usually detached on the
             // thread that drives it.
             detached.release_thread_cache();
+            TokioDetachOutcome::Detached
+        } else {
+            TokioDetachOutcome::NotTracked
         }
-        detached.is_some()
     }
 }
 
