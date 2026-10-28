@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{capture_processor, decode_all, decode_file, fast_sealing_writer};
+use common::{capture_processor, decode_all, decode_file};
 use dial9_tokio_telemetry::telemetry::analysis_events::{Dial9Event, WorkerId};
 use dial9_tokio_telemetry::telemetry::{
     Dial9Handle, Dial9HandleTokioExt, DiskBuffer, RecorderPipelineExt, TokioAttachOptions,
@@ -297,7 +297,16 @@ fn same_name_restart_metadata_lists_live_workers() {
     const SEAL_WAIT: Duration = Duration::from_secs(30);
     let dir = tempfile::tempdir().unwrap();
     let (capture, batches) = capture_processor();
-    let recorder = recorder(fast_sealing_writer(dir.path()))
+    // Retain the whole trace: a bounded ring can evict worker events before
+    // the background capture reads them on a slow runner.
+    let writer = DiskBuffer::builder()
+        .base_path(dir.path())
+        .max_file_size(64)
+        .max_total_size(u64::MAX)
+        .rotation_period(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    let recorder = recorder(writer)
         .with_custom_pipeline(|pipeline| pipeline.pipe(capture))
         .build();
     let handle = recorder.handle();
@@ -334,7 +343,10 @@ fn same_name_restart_metadata_lists_live_workers() {
     let old_ids = worker_ids_in(&events, |ts| ts < detached_at);
     let new_ids = worker_ids_in(&events, |ts| ts >= detached_at);
     let listed = last_runtime_metadata(&events, "svc").expect("runtime.svc metadata");
-    assert!(!old_ids.is_empty() && !new_ids.is_empty());
+    assert!(
+        !old_ids.is_empty() && !new_ids.is_empty(),
+        "expected worker events from both runtimes, got old {old_ids:?}, new {new_ids:?}"
+    );
     assert!(
         old_ids.is_disjoint(&new_ids),
         "worker ids are never reused: old {old_ids:?}, new {new_ids:?}"
