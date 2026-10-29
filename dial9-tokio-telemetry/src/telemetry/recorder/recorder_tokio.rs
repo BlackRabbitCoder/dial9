@@ -53,7 +53,9 @@
 //! An attached runtime stays registered until
 //! [`Dial9HandleTokioExt::detach_tokio_runtime`] or recorder teardown. A
 //! service that replaces runtimes while the recorder lives on should detach
-//! each one before dropping it.
+//! each one before dropping it. Use
+//! [`Dial9HandleTokioExt::detach_tokio_runtime_on_drop`] for automatic cleanup
+//! at the end of a runtime's scope, including unwinding.
 
 use super::runtime_context::{
     RuntimeContext, RuntimeContextRegistry, TokioRuntimesSource, WorkerIdCounter,
@@ -71,6 +73,8 @@ use dial9_core::recording::Recorder;
 #[cfg(feature = "worker-s3")]
 use dial9_destinations_s3::S3Config;
 use std::io;
+use std::marker::PhantomData;
+use std::rc::Rc;
 #[cfg(feature = "worker-s3")]
 use std::{future::Future, pin::Pin};
 
@@ -343,6 +347,50 @@ pub enum TokioDetachOutcome {
     NotTracked,
 }
 
+/// Detaches a Tokio runtime from its recorder when this guard drops.
+///
+/// Created by [`Dial9HandleTokioExt::detach_tokio_runtime_on_drop`]. Keep one
+/// guard alive for the runtime's scope. Dropping any guard detaches that runtime
+/// for its recorder; an earlier explicit detach is harmless.
+///
+/// The guard owns cloned Dial9 and Tokio handles, so it can be stored alongside
+/// the runtime without borrowing it. Its Tokio handle keeps the runtime's
+/// drivers allocated until the guard drops, even if the runtime dropped first.
+///
+/// The guard stays on its creation thread. Create it on the thread that drives
+/// a `current_thread` runtime or [`LocalRuntime`](tokio::runtime::LocalRuntime)
+/// so detach can clear that thread's cached runtime state.
+///
+/// ```compile_fail,E0277
+/// use dial9_tokio_telemetry::telemetry::TokioDetachGuard;
+///
+/// fn require_send<T: Send>() {}
+/// require_send::<TokioDetachGuard>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use dial9_tokio_telemetry::telemetry::TokioDetachGuard;
+///
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<TokioDetachGuard>();
+/// ```
+#[must_use = "keep the guard alive until the runtime should be detached"]
+#[derive(Debug)]
+pub struct TokioDetachGuard {
+    recorder: Dial9Handle,
+    runtime: tokio::runtime::Handle,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl Drop for TokioDetachGuard {
+    fn drop(&mut self) {
+        // Both outcomes are valid during scope cleanup.
+        match self.recorder.detach_tokio_runtime(&self.runtime) {
+            TokioDetachOutcome::Detached | TokioDetachOutcome::NotTracked => {}
+        }
+    }
+}
+
 /// Tokio instrumentation for [`Dial9Handle`].
 pub trait Dial9HandleTokioExt: dial9_handle_tokio_ext_sealed::Sealed {
     /// Instrument a builder you configured, build it, and return the runtime.
@@ -378,8 +426,8 @@ pub trait Dial9HandleTokioExt: dial9_handle_tokio_ext_sealed::Sealed {
     /// drive it.
     ///
     /// The runtime stays registered, even after it drops, until
-    /// [`detach_tokio_runtime`](Self::detach_tokio_runtime) or recorder
-    /// teardown.
+    /// [`detach_tokio_runtime`](Self::detach_tokio_runtime), a
+    /// [`TokioDetachGuard`] drop, or recorder teardown.
     ///
     /// # Errors
     ///
@@ -483,6 +531,46 @@ pub trait Dial9HandleTokioExt: dial9_handle_tokio_ext_sealed::Sealed {
         options: TokioAttachOptions,
     ) -> io::Result<tokio::runtime::LocalRuntime>;
 
+    /// Detach `runtime` when the returned guard leaves scope or unwinds.
+    ///
+    /// Declare the guard after the runtime so it detaches before the runtime
+    /// drops on normal return, early return through `?`, and panic unwinding.
+    /// It also supports dropping the runtime first: the guard's owned Tokio
+    /// handle retains its drivers until the guard drops.
+    ///
+    /// Create the guard on the thread that drives a `current_thread` runtime or
+    /// [`LocalRuntime`](tokio::runtime::LocalRuntime). The guard cannot move to
+    /// another thread, but it does not establish which thread drives a runtime.
+    ///
+    /// This schedules cleanup without attaching a runtime or checking whether
+    /// it is tracked. A paused recorder still detaches; an untracked runtime,
+    /// disabled handle, stopped recorder, or earlier explicit detach is
+    /// harmless. Detach has the same recording behavior and limitations as
+    /// [`detach_tokio_runtime`](Self::detach_tokio_runtime).
+    ///
+    /// ```no_run
+    /// use dial9_core::buffer::MemoryBuffer;
+    /// use dial9_core::recorder::recorder;
+    /// use dial9_tokio_telemetry::telemetry::{
+    ///     Dial9HandleTokioExt, TokioAttachOptions, TokioDetachGuard,
+    /// };
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let recorder = recorder(MemoryBuffer::new(1 << 20)?).build();
+    /// let d9 = recorder.handle();
+    /// {
+    ///     let mut builder = tokio::runtime::Builder::new_current_thread();
+    ///     builder.enable_all();
+    ///     let rt = d9.attach_tokio_runtime(builder, TokioAttachOptions::default())?;
+    ///     let _guard: TokioDetachGuard = d9.detach_tokio_runtime_on_drop(rt.handle());
+    ///     dial9_tokio_telemetry::block_on(&rt, async { /* serve */ });
+    /// }
+    /// recorder.graceful_shutdown(std::time::Duration::from_secs(1));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn detach_tokio_runtime_on_drop(&self, runtime: &tokio::runtime::Handle) -> TokioDetachGuard;
+
     /// Stop tracking `runtime` and release dial9's references to it.
     ///
     /// Returns [`TokioDetachOutcome::Detached`] when tracking state is removed.
@@ -564,6 +652,14 @@ impl Dial9HandleTokioExt for Dial9Handle {
         options: TokioAttachOptions,
     ) -> io::Result<tokio::runtime::LocalRuntime> {
         attach_built_runtime(self, builder, options, build_local_runtime)
+    }
+
+    fn detach_tokio_runtime_on_drop(&self, runtime: &tokio::runtime::Handle) -> TokioDetachGuard {
+        TokioDetachGuard {
+            recorder: self.clone(),
+            runtime: runtime.clone(),
+            _thread_bound: PhantomData,
+        }
     }
 
     fn detach_tokio_runtime(&self, runtime: &tokio::runtime::Handle) -> TokioDetachOutcome {

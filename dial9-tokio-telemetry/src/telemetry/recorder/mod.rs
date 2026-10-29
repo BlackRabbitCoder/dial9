@@ -25,7 +25,7 @@ pub use tokio_hooks::TokioHooks;
 pub use recorder_tokio::RecorderS3ClientExt;
 pub use recorder_tokio::{
     AttachedRuntime, Dial9HandleTokioExt, RecorderPipelineExt, TokioAttachOptions,
-    TokioDetachOutcome,
+    TokioDetachGuard, TokioDetachOutcome,
 };
 
 // Re-exports for internal test access

@@ -13,6 +13,7 @@ use dial9_tokio_telemetry::telemetry::{
 };
 use rstest::rstest;
 use std::collections::BTreeSet;
+use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -212,6 +213,170 @@ fn undetached_runtime_stays_alive(#[case] flavor: Flavor) {
         "an attached runtime stays registered after it drops"
     );
     recorder.graceful_shutdown(Duration::from_secs(1));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScopeExit {
+    Normal,
+    EarlyReturn,
+    Unwind,
+}
+
+/// The guard releases the runtime on each way out of its scope, including the
+/// driving thread's metrics cache for current-thread and local runtimes.
+#[rstest]
+#[case::multi_normal(Flavor::MultiThread, ScopeExit::Normal)]
+#[case::multi_early_return(Flavor::MultiThread, ScopeExit::EarlyReturn)]
+#[case::multi_unwind(Flavor::MultiThread, ScopeExit::Unwind)]
+#[case::current_normal(Flavor::CurrentThread, ScopeExit::Normal)]
+#[case::current_early_return(Flavor::CurrentThread, ScopeExit::EarlyReturn)]
+#[case::current_unwind(Flavor::CurrentThread, ScopeExit::Unwind)]
+#[case::local_normal(Flavor::Local, ScopeExit::Normal)]
+#[case::local_early_return(Flavor::Local, ScopeExit::EarlyReturn)]
+#[case::local_unwind(Flavor::Local, ScopeExit::Unwind)]
+fn guard_releases_runtime_on_scope_exit(#[case] flavor: Flavor, #[case] exit: ScopeExit) {
+    let recorder = recorder(common::small_mem_writer()).build();
+    let handle = recorder.handle();
+    let alive = Arc::new(());
+
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), &'static str> {
+        let rt = attach_with_sentinel(handle, flavor, "guarded", &alive);
+        let _guard = handle.detach_tokio_runtime_on_drop(rt.handle());
+        rt.run_tasks();
+        match exit {
+            ScopeExit::Normal => {}
+            ScopeExit::EarlyReturn => Err("intentional early return")?,
+            ScopeExit::Unwind => panic_any("intentional guard unwind"),
+        }
+        Ok(())
+    }));
+    match exit {
+        ScopeExit::Normal => {
+            assert_eq!(result.expect("normal exit must not unwind"), Ok(()));
+        }
+        ScopeExit::EarlyReturn => {
+            assert_eq!(
+                result.expect("early return must not unwind"),
+                Err("intentional early return")
+            );
+        }
+        ScopeExit::Unwind => {
+            let payload = result.expect_err("the guarded scope must unwind");
+            assert_eq!(
+                payload.downcast_ref::<&str>(),
+                Some(&"intentional guard unwind")
+            );
+        }
+    }
+    assert_eq!(
+        Arc::strong_count(&alive),
+        1,
+        "guard cleanup must release the runtime after {exit:?}"
+    );
+    recorder.graceful_shutdown(Duration::from_secs(1));
+}
+
+/// An owning guard can outlive the runtime value and still release its drivers.
+#[rstest]
+#[case::multi_thread(Flavor::MultiThread)]
+#[case::current_thread(Flavor::CurrentThread)]
+#[case::local(Flavor::Local)]
+fn guard_releases_runtime_dropped_first(#[case] flavor: Flavor) {
+    let recorder = recorder(common::small_mem_writer()).build();
+    let handle = recorder.handle();
+    let alive = Arc::new(());
+    let rt = attach_with_sentinel(handle, flavor, "guarded", &alive);
+    let guard = handle.detach_tokio_runtime_on_drop(rt.handle());
+    rt.run_tasks();
+    drop(rt);
+    assert!(
+        Arc::strong_count(&alive) >= 2,
+        "the guard's handle must retain the runtime until cleanup"
+    );
+    drop(guard);
+    assert_eq!(
+        Arc::strong_count(&alive),
+        1,
+        "guard cleanup must release the runtime and its owned handle"
+    );
+    recorder.graceful_shutdown(Duration::from_secs(1));
+}
+
+#[rstest]
+#[case::paused(false)]
+#[case::manually_detached(true)]
+fn guard_detaches_while_paused_or_already_detached(#[case] manually_detach: bool) {
+    let recorder = recorder(common::small_mem_writer()).build();
+    let handle = recorder.handle();
+    let alive = Arc::new(());
+    let rt = attach_with_sentinel(handle, Flavor::CurrentThread, "guarded", &alive);
+    rt.run_tasks();
+    {
+        let _guard = handle.detach_tokio_runtime_on_drop(rt.handle());
+        if manually_detach {
+            assert_eq!(
+                handle.detach_tokio_runtime(rt.handle()),
+                TokioDetachOutcome::Detached
+            );
+        } else {
+            handle.disable();
+        }
+    }
+    assert_eq!(
+        handle.detach_tokio_runtime(rt.handle()),
+        TokioDetachOutcome::NotTracked,
+        "the guard must have removed tracking state"
+    );
+    drop(rt);
+    assert_eq!(Arc::strong_count(&alive), 1, "the runtime must be released");
+    recorder.graceful_shutdown(Duration::from_secs(1));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GuardTrackingState {
+    Untracked,
+    InstrumentationDisabled,
+    DisabledHandle,
+    RecorderStopped,
+}
+
+#[rstest]
+#[case::untracked(GuardTrackingState::Untracked)]
+#[case::instrumentation_disabled(GuardTrackingState::InstrumentationDisabled)]
+#[case::disabled_handle(GuardTrackingState::DisabledHandle)]
+#[case::recorder_stopped(GuardTrackingState::RecorderStopped)]
+fn guard_tolerates_untracked_or_stopped_recorder(#[case] state: GuardTrackingState) {
+    let recorder = recorder(common::small_mem_writer()).build();
+    let handle = recorder.handle().clone();
+    let guard_handle = if matches!(state, GuardTrackingState::DisabledHandle) {
+        Dial9Handle::disabled()
+    } else {
+        handle.clone()
+    };
+    let rt = if matches!(state, GuardTrackingState::Untracked) {
+        builder(Flavor::CurrentThread).build().unwrap()
+    } else {
+        guard_handle
+            .attach_tokio_runtime(
+                builder(Flavor::CurrentThread),
+                TokioAttachOptions::builder()
+                    .tokio_instrumentation_enabled(!matches!(
+                        state,
+                        GuardTrackingState::InstrumentationDisabled
+                    ))
+                    .build(),
+            )
+            .unwrap()
+    };
+    let guard = guard_handle.detach_tokio_runtime_on_drop(rt.handle());
+    if matches!(state, GuardTrackingState::RecorderStopped) {
+        recorder.graceful_shutdown(Duration::from_secs(1));
+    }
+    drop(guard);
+    assert_eq!(
+        guard_handle.detach_tokio_runtime(rt.handle()),
+        TokioDetachOutcome::NotTracked
+    );
 }
 
 /// Detaching after the runtime dropped, through a saved `Handle` clone, still
